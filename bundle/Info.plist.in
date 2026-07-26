@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: the Makefile substitutes __APP_NAME__ / __BUNDLE_ID__ / __EXEC__ when it builds the
+     bundle, so the development build gets an identity distinct from the shipped app. -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>              <string>__APP_NAME__</string>
+    <key>CFBundleDisplayName</key>       <string>__APP_NAME__</string>
+    <key>CFBundleIdentifier</key>        <string>__BUNDLE_ID__</string>
+    <key>CFBundleExecutable</key>        <string>__EXEC__</string>
+    <key>CFBundleIconFile</key>          <string>AppIcon</string>
+    <key>CFBundlePackageType</key>       <string>APPL</string>
+    <key>CFBundleVersion</key>           <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>LSMinimumSystemVersion</key>    <string>12.0</string>
+    <key>NSHighResolutionCapable</key>   <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
+</dict>
+</plist>
