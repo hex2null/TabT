@@ -31,7 +31,7 @@ sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT
 Requires macOS and a Rust toolchain (`rustup.rs`).
 
 ```sh
-git clone <repo-url> tabt && cd tabt/src
+git clone https://github.com/hex2null/TabT.git tabt && cd tabt
 make run
 ```
 
