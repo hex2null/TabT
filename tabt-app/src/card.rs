@@ -2,8 +2,8 @@
 //!
 //! The card is a plain layer-backed `NSView` whose layer carries the whole look — fill, hairline
 //! border, corner radius, drop shadow — so `SidebarView` can go on painting only its rows. The fill
-//! tracks the theme (see [`crate::theme::Theme::sidebar_bg`]): it has to read as the same surface
-//! family as the terminal beside it, with the separation coming from the border and the shadow.
+//! is the theme's plain background, the same color the terminal draws on, so the window reads as one
+//! continuous surface; the card is told apart by its border and shadow alone, not by a lighter tint.
 //!
 //! The layer deliberately does **not** mask to its bounds — masking would clip the shadow away.
 //! Nothing the sidebar draws reaches the rounded corners (rows and boxes are inset by `HPAD`, and
@@ -58,7 +58,7 @@ pub fn apply_theme(card: &NSView) {
         }
         let _: () = msg_send![layer, setCornerRadius: CARD_RADIUS];
         let _: () = msg_send![layer, setMasksToBounds: false];
-        let _: () = msg_send![layer, setBackgroundColor: cg(&ns_color(t.sidebar_bg()))];
+        let _: () = msg_send![layer, setBackgroundColor: cg(&ns_color(t.bg))];
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
         let _: () = msg_send![layer, setBorderColor: cg(&ns_color(t.card_border()))];
         // A soft ambient shadow on all four sides: no offset, so it reads as the card lifted off

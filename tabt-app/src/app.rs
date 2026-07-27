@@ -419,6 +419,11 @@ impl AppController {
             .map(|t| t.title.clone())
             .unwrap_or_else(|| crate::branding::APP_NAME.to_string());
         self.window.setTitle(&NSString::from_str(&title));
+        // `setTitle:` relays out the title bar and puts the traffic lights back where AppKit wants
+        // them, synchronously and right here. Re-center them before returning: the correction then
+        // lands in the same run loop turn, ahead of the window's flush, so nothing is ever drawn
+        // with the buttons in the default spot. Deferring it — as this used to — showed the jump.
+        self.reposition_traffic_lights();
         self.header.set_title(&title);
     }
 
@@ -562,8 +567,7 @@ impl AppController {
         // type into, and a detached TermView must not keep receiving keyDown.
         self.window.makeFirstResponder(None);
         self.refresh_sidebar();
-        self.update_title();
-        self.defer_reposition_traffic_lights(); // makeFirstResponder relays out the titlebar
+        self.update_title(); // also re-centers the traffic lights, which setTitle: resets
     }
 
     /// Mount the active tab's view into the host (remove the others), and make it the keyboard first responder.
@@ -595,11 +599,6 @@ impl AppController {
                 tab.view.setNeedsDisplay(true);
             }
         }
-        drop(m);
-        // makeFirstResponder makes AppKit relay out the titlebar and reset the traffic lights to
-        // their default position — and that relayout runs *after* this call, so re-centering
-        // synchronously here would be overwritten. Defer it to the next main-queue turn.
-        self.defer_reposition_traffic_lights();
     }
 
     /// Mount the empty-state placeholder in the terminal area (no sessions left).
@@ -613,14 +612,6 @@ impl AppController {
             self.placeholder.setFrame(frame);
             self.host.addSubview(&self.placeholder);
             self.placeholder.setNeedsDisplay(true);
-        }
-    }
-
-    /// Re-center the traffic lights on the next runloop turn (after AppKit's own titlebar layout).
-    fn defer_reposition_traffic_lights(&self) {
-        let q: view::dispatch::Queue = unsafe { &view::dispatch::_dispatch_main_q as *const _ as *mut _ };
-        unsafe {
-            view::dispatch::dispatch_async_f(q, self as *const AppController as *mut c_void, reposition_trampoline);
         }
     }
 
@@ -1344,8 +1335,3 @@ fn toggle_cb(ctx: *const c_void) {
     ctrl.toggle_sidebar();
 }
 
-/// Deferred (next main-queue turn) traffic-light re-center; `p` is a `*const AppController`.
-extern "C" fn reposition_trampoline(p: *mut c_void) {
-    let ctrl = unsafe { &*(p as *const AppController) };
-    ctrl.reposition_traffic_lights();
-}

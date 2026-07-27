@@ -24,21 +24,16 @@ impl Theme {
         luminance(self.bg) <= 0.5
     }
 
-    /// Sidebar card fill. Tracks the terminal background so the two panes read as one surface
-    /// family, lifted just enough to tell them apart where the shadow is weak.
+    /// Hairline around the sidebar card. The card is filled with the plain body background, so the
+    /// window reads as one surface and this edge — with the shadow — is the only thing separating
+    /// the two panes; it has to hold on themes where the shadow has little to work with.
     ///
-    /// The lift is solved for a fixed *perceived* separation rather than being a constant fraction,
+    /// The step is solved for a fixed *perceived* separation rather than being a constant fraction,
     /// because a constant one leaves low-contrast themes (Solarized Light, whose base00 text sits
-    /// close to its base3 background) with a card indistinguishable from the body. Blending toward
+    /// close to its base3 background) with an edge indistinguishable from the body. Blending toward
     /// the foreground — rather than adding a flat gray offset — lightens dark themes and darkens
-    /// light ones with one rule, and keeps the panel inside the theme's own hue family, so an amber
-    /// CRT gets a warm panel instead of a gray-brown smudge.
-    pub fn sidebar_bg(&self) -> Rgb {
-        mix(self.bg, self.fg, self.blend_for(0.022))
-    }
-
-    /// Hairline around the sidebar card: stronger than the fill's lift, so the card keeps a
-    /// defined edge on themes where the shadow has little to work with.
+    /// light ones with one rule, and keeps the line inside the theme's own hue family, so an amber
+    /// CRT gets a warm rim instead of a gray-brown smudge.
     pub fn card_border(&self) -> Rgb {
         mix(self.bg, self.fg, self.blend_for(0.075))
     }
@@ -57,9 +52,9 @@ impl Theme {
         mix(self.bg, self.fg, 0.10)
     }
 
-    /// Separator drawn on the sidebar panel. That panel is already lifted off the body background
-    /// by [`Theme::sidebar_bg`], so the shared [`Theme::border`] would sink into it — this is one
-    /// step stronger, enough for the edge to read as a rim.
+    /// Separator drawn on the sidebar panel. The panel carries the theme background at full
+    /// strength and its content is quieter than the terminal's, so the shared [`Theme::border`]
+    /// sinks into it — this is one step stronger, enough for the edge to read as a rim.
     pub fn sidebar_border(&self) -> Rgb {
         mix(self.bg, self.fg, 0.20)
     }

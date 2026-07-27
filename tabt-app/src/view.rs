@@ -1061,6 +1061,5 @@ pub(crate) mod dispatch {
         pub fn dispatch_source_set_event_handler_f(source: Source, handler: FunctionT);
         pub fn dispatch_resume(object: Source);
         pub fn dispatch_source_cancel(source: Source);
-        pub fn dispatch_async_f(queue: Queue, context: *mut c_void, work: FunctionT);
     }
 }
