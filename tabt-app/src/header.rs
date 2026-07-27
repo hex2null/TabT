@@ -16,7 +16,9 @@ use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSt
 use crate::theme;
 use crate::view::{make_attrs, ns_color, rect};
 
-pub const HEADER_H: f64 = 40.0; // taller title bar; traffic lights are centered to match
+pub const HEADER_H: f64 = 44.0; // toolbar band height; the top strip (traffic lights, collapse
+                                // toggle, title) is centered in the part of it the card covers,
+                                // i.e. on (CARD_INSET + HEADER_H) / 2
 
 pub struct HeaderIvars {
     title: RefCell<String>,
@@ -25,6 +27,10 @@ pub struct HeaderIvars {
     // Left inset for the title. When the sidebar is collapsed the traffic lights + toggle
     // sit at the window's top-left over this pane, so the title must clear them.
     left_inset: Cell<f64>,
+    // Centerline the title sits on, measured down from this view's top. The controller sets it to
+    // the same value the traffic lights and the collapse toggle use, so the top strip reads as one
+    // line — it shifts with the sidebar card, which is inset from the window's top edge.
+    center_y: Cell<f64>,
 }
 
 declare_class!(
@@ -81,6 +87,7 @@ impl HeaderView {
             font,
             font_sub,
             left_inset: Cell::new(16.0),
+            center_y: Cell::new(HEADER_H / 2.0),
         });
         unsafe { msg_send_id![super(this), initWithFrame: frame] }
     }
@@ -96,6 +103,15 @@ impl HeaderView {
     pub fn set_left_inset(&self, x: f64) {
         if self.ivars().left_inset.get() != x {
             self.ivars().left_inset.set(x);
+            unsafe { self.setNeedsDisplay(true) };
+        }
+    }
+
+    /// Put the title on `y` (measured down from this view's top) — the centerline shared with the
+    /// traffic lights and the collapse toggle.
+    pub fn set_center_y(&self, y: f64) {
+        if self.ivars().center_y.get() != y {
+            self.ivars().center_y.set(y);
             unsafe { self.setNeedsDisplay(true) };
         }
     }
@@ -120,13 +136,13 @@ impl HeaderView {
         // Session name (theme foreground).
         let name_attrs = make_attrs(&self.ivars().font, Some(&ns_color(t.fg)));
         let name = NSString::from_str(&title);
-        let ny = (h - 16.0) / 2.0;
-        unsafe { name.drawAtPoint_withAttributes(NSPoint::new(lx, ny), Some(&name_attrs)) };
+        let cy = self.ivars().center_y.get();
+        unsafe { name.drawAtPoint_withAttributes(NSPoint::new(lx, cy - 8.0), Some(&name_attrs)) };
         let name_w = unsafe { name.sizeWithAttributes(Some(&name_attrs)).width };
 
         // Meta string (`~ · zsh`) after the name (dimmed toward the background).
         let meta_attrs = make_attrs(&self.ivars().font_sub, Some(&ns_color(theme::mix(t.fg, t.bg, 0.50))));
         let meta = NSString::from_str("~ · zsh");
-        unsafe { meta.drawAtPoint_withAttributes(NSPoint::new(lx + name_w + 10.0, (h - 15.0) / 2.0), Some(&meta_attrs)) };
+        unsafe { meta.drawAtPoint_withAttributes(NSPoint::new(lx + name_w + 10.0, cy - 7.5), Some(&meta_attrs)) };
     }
 }

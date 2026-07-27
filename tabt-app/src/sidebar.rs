@@ -14,24 +14,32 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSBezierPath, NSColor, NSEvent, NSEventModifierFlags, NSFont, NSGraphicsContext, NSImage,
-    NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSRectClip, NSRectFill,
-    NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSBezierPath, NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightSemibold,
+    NSGraphicsContext, NSImage, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
+    NSRectClip, NSRectFill, NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 use crate::app::{AppController, Snapshot};
+use crate::card::CARD_INSET;
+use crate::header::HEADER_H;
 use crate::settings;
 use crate::theme;
 use crate::view::{draw_symbol, draw_truncated, make_attrs, ns_color, rect};
 
-pub const SIDEBAR_W: f64 = 232.0;
+/// Default sidebar width; `MIN_SIDEBAR_W`..`MAX_SIDEBAR_W` bound the divider drag. These mirror the
+/// system sidebar metrics a `NavigationSplitView` asks for (`columnWidth(min: 200, ideal: 240)`).
+pub const SIDEBAR_W: f64 = 240.0;
+pub const MIN_SIDEBAR_W: f64 = 200.0;
+pub const MAX_SIDEBAR_W: f64 = 480.0;
 const ROW_H: f64 = 32.0; // session/settings row (per design spec)
 const SECTION_H: f64 = 24.0; // "Sessions" section label row above the ungrouped tabs
 const BTN_H: f64 = 26.0; // action button row (tighter top/bottom padding)
 const SEARCH_H: f64 = 28.0;
 const PAD: f64 = 14.0; // content left inset
-const TOP_INSET: f64 = 40.0; // top title-bar zone (traffic lights + toggle); matches HEADER_H
+/// Top strip of the card, holding the traffic lights and the collapse toggle. The card's top
+/// edge already sits CARD_INSET below the window's, so this is that much shorter than HEADER_H.
+const TOP_INSET: f64 = HEADER_H - CARD_INSET;
 const HPAD: f64 = 10.0; // row background (selected/hover/search box) inset from the sidebar's left and right edges
 const GAP: f64 = 10.0;
 const FROW_H: f64 = 32.0; // bottom settings row (same height as session rows)
@@ -116,7 +124,8 @@ struct Row {
 pub struct SidebarIvars {
     controller: Cell<*const AppController>,
     font: Retained<NSFont>,
-    font_small: Retained<NSFont>, // small font used for group section labels
+    font_small: Retained<NSFont>,   // small font used for the ⌘F / ⌘, shortcut hints
+    font_section: Retained<NSFont>, // semibold label font of the "Sessions" / group section rows
     press: Cell<Press>,
     start_y: Cell<f64>,
     cur_x: Cell<f64>, // x of the most recent press (used to pop up menus at the mouse)
@@ -351,13 +360,16 @@ declare_class!(
 
 impl SidebarView {
     pub fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
-        let font = unsafe { NSFont::systemFontOfSize(12.0) };
+        // 13pt is the macOS sidebar item size; section labels are 11pt semibold beside it.
+        let font = unsafe { NSFont::systemFontOfSize(13.0) };
         let font_small = unsafe { NSFont::systemFontOfSize(10.5) };
+        let font_section = unsafe { NSFont::systemFontOfSize_weight(11.0, NSFontWeightSemibold) };
         let this = mtm.alloc();
         let this = this.set_ivars(SidebarIvars {
             controller: Cell::new(std::ptr::null()),
             font,
             font_small,
+            font_section,
             press: Cell::new(Press::None),
             start_y: Cell::new(0.0),
             cur_x: Cell::new(0.0),
@@ -535,8 +547,7 @@ impl SidebarView {
         let query = self.ivars().query.borrow().clone();
         let searching = self.ivars().searching.get();
         let editing = self.ivars().editing.get();
-        let bounds = self.bounds();
-        let (w, h) = (bounds.size.width, bounds.size.height);
+        let (w, h) = (self.bounds().size.width, self.bounds().size.height);
         let footer_top = h - Self::footer_height();
         let list_top = Self::list_top();
 
@@ -556,21 +567,12 @@ impl SidebarView {
         }
         rows.extend(Self::footer_rows(&snap, h));
 
-        unsafe {
-            // Sidebar background + separators derive from the active theme (they change with it).
-            let t = theme::current();
-            ns_color(t.sidebar_bg()).set();
-            NSRectFill(bounds);
-            // Separators are optional (Settings → Border) and derive from the theme.
-            if settings::show_border() {
-                // Edge 1px separator on the side facing the terminal: left edge when the sidebar is
-                // docked on the right, right edge otherwise.
-                let on_right = self.controller().map(|c| c.sidebar_on_right()).unwrap_or(false);
-                let edge_x = if on_right { 0.0 } else { w - 1.0 };
-                ns_color(t.border()).set();
-                NSRectFill(rect(edge_x, 0.0, 1.0, h));
-                // Separator line above the bottom settings area
-                ns_color(t.border()).set();
+        // No background fill: this view is mounted inside the card (see `card.rs`), whose layer
+        // paints the fill, border and shadow. The only separator left is the one above the settings
+        // row — the card's own rounded edge replaces the line that marked the seam.
+        if settings::show_border() {
+            unsafe {
+                ns_color(theme::current().sidebar_border()).set();
                 NSRectFill(rect(0.0, footer_top - 1.0, w, 1.0));
             }
         }
@@ -645,9 +647,11 @@ impl SidebarView {
         let inset = rect(HPAD, row.top + 1.0, w - 2.0 * HPAD, row.h - 2.0);
         let vmid = |ih: f64| row.top + (row.h - ih) / 2.0; // vertically center icon/text
 
-        // ---- "Sessions" session-list label (mirrors the GROUP labels, no folder icon) ----
+        // ---- "Sessions" session-list label (mirrors the group labels, no folder icon) ----
+        // Sentence case, not uppercase micro-caps: macOS 13+ sidebar sections read "Favorites",
+        // not "FAVORITES".
         if let Press::TabsLabel = row.kind {
-            draw_truncated(&row.label.to_uppercase(), rect(row.indent, vmid(13.0), (w - 2.0 * PAD).max(0.0), 15.0), &self.ivars().font_small, text_weakest());
+            draw_truncated(&row.label, rect(row.indent, vmid(13.0), (w - 2.0 * PAD).max(0.0), 15.0), &self.ivars().font_section, text_placeholder());
             return;
         }
 
@@ -657,9 +661,9 @@ impl SidebarView {
                 round_fill(inset, 7.0, &overlay(0.06));
             }
             let folder = if row.collapsed { "folder.fill" } else { "folder" };
-            draw_symbol(folder, rect(row.indent, vmid(12.0), 14.0, 12.0), text_weakest());
+            draw_symbol(folder, rect(row.indent, vmid(12.0), 14.0, 12.0), text_placeholder());
             let label_x = row.indent + 20.0;
-            draw_truncated(&row.label, rect(label_x, vmid(13.0), (w - 34.0 - label_x).max(0.0), 15.0), &self.ivars().font_small, text_weakest());
+            draw_truncated(&row.label, rect(label_x, vmid(13.0), (w - 34.0 - label_x).max(0.0), 15.0), &self.ivars().font_section, text_placeholder());
             if hovered {
                 draw_symbol("ellipsis", rect(w - 28.0, vmid(11.0), 16.0, 11.0), text_placeholder());
             }

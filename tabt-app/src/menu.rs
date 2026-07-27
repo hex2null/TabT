@@ -37,6 +37,23 @@ declare_class!(
     unsafe impl NSObjectProtocol for MenuTarget {}
 
     unsafe impl MenuTarget {
+        // NSMenuDelegate. Recent macOS decorates menu items whose action is a standard selector
+        // (Copy, Paste, Select All, About, Quit …) with an SF Symbol, and injects its own
+        // AutoFill / Dictation / Emoji items into any menu titled "Edit" — all of them carrying
+        // icons. Our menus are short and keyboard-driven, so only some items get one and the icon
+        // column lands half-filled and ragged.
+        //
+        // The images are applied when the menu is about to be shown, so clearing them at build
+        // time does not stick; this hook runs late enough to win, and runs again on every display.
+        #[method(menuNeedsUpdate:)]
+        fn menu_needs_update(&self, menu: &NSMenu) {
+            unsafe {
+                for i in 0..menu.numberOfItems() {
+                    menu.itemAtIndex(i).map(|item| item.setImage(None));
+                }
+            }
+        }
+
         #[method(newTerminal:)]
         fn new_terminal(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.add_tab_default());
@@ -183,15 +200,24 @@ fn add_mods(
     if let Some(m) = mods {
         item.setKeyEquivalentModifierMask(m);
     }
+    // Recent macOS decorates items whose action is a standard selector (About, Quit, Copy, Paste,
+    // Select All, …) with an SF Symbol of its own choosing. Ours is a keyboard-driven terminal
+    // menu where only some items would get one, so the column of icons lands half-filled and
+    // ragged; clearing it keeps every menu a plain list of titles.
+    unsafe { item.setImage(None) };
     menu.addItem(&item);
 }
 
 /// Creates a top-level submenu and attaches it to the menu bar, returning the submenu so more items can be added.
-fn submenu(mtm: MainThreadMarker, menubar: &NSMenu, title: &str) -> Retained<NSMenu> {
+fn submenu(mtm: MainThreadMarker, menubar: &NSMenu, title: &str, target: &MenuTarget) -> Retained<NSMenu> {
     let item = NSMenuItem::new(mtm);
     menubar.addItem(&item);
     let menu = NSMenu::new(mtm);
     unsafe { menu.setTitle(&NSString::from_str(title)) };
+    // See `menuNeedsUpdate:` — the delegate strips the system's automatic item icons.
+    unsafe {
+        let _: () = msg_send![&menu, setDelegate: target];
+    }
     item.setSubmenu(Some(&menu));
     menu
 }
@@ -202,7 +228,7 @@ pub fn build_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarge
 
     // ---- App menu (the title is shown by the system as the app name) ----
     let name = crate::branding::APP_NAME;
-    let app_menu = submenu(mtm, &menubar, name);
+    let app_menu = submenu(mtm, &menubar, name, target);
     add(mtm, &app_menu, &format!("About {name}"), Some(sel!(orderFrontStandardAboutPanel:)), None, "", false);
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     add(mtm, &app_menu, "Settings…", Some(sel!(openSettings:)), Some(target), ",", false);
@@ -210,7 +236,7 @@ pub fn build_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarge
     add(mtm, &app_menu, &format!("Quit {name}"), Some(sel!(terminate:)), None, "q", false);
 
     // ---- Shell ----
-    let shell = submenu(mtm, &menubar, "Shell");
+    let shell = submenu(mtm, &menubar, "Shell", target);
     add(mtm, &shell, "New Terminal", Some(sel!(newTerminal:)), Some(target), "t", false);
     add(mtm, &shell, "New Group", Some(sel!(newGroup:)), Some(target), "n", true);
     shell.addItem(&NSMenuItem::separatorItem(mtm));
@@ -219,7 +245,7 @@ pub fn build_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarge
     add(mtm, &shell, "Close Tab", Some(sel!(closeTab:)), Some(target), "w", false);
 
     // ---- Edit (target=nil → first responder TermView) ----
-    let edit = submenu(mtm, &menubar, "Edit");
+    let edit = submenu(mtm, &menubar, "Edit", target);
     add(mtm, &edit, "Copy", Some(sel!(copy:)), None, "c", false);
     add(mtm, &edit, "Paste", Some(sel!(paste:)), None, "v", false);
     add(mtm, &edit, "Select All", Some(sel!(selectAll:)), None, "a", false);
@@ -227,7 +253,7 @@ pub fn build_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarge
     add(mtm, &edit, "Find", Some(sel!(findSession:)), Some(target), "f", false);
 
     // ---- View (color/font and other settings have been merged into the sidebar's bottom "Settings"; only zoom shortcuts remain here) ----
-    let view = submenu(mtm, &menubar, "View");
+    let view = submenu(mtm, &menubar, "View", target);
     add(mtm, &view, "Toggle Sidebar", Some(sel!(toggleSidebar:)), Some(target), "b", false);
     // ⌃↩ — opens the context menu of the hovered sidebar row, else the active tab's.
     add_mods(

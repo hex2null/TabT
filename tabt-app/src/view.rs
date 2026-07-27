@@ -67,7 +67,10 @@ pub struct TermViewIvars {
     // The shell exited (EOF/read error) and hasn't been restarted yet: input is ignored except
     // Enter, which triggers `restart_fn`. See `mark_ended`/`restart`.
     ended: Cell<bool>,
-    // Mouse selection: anchor + current drag point (cell coordinates (col,row)); equal = empty selection.
+    // Mouse selection: anchor + current drag point, as (col, virtual-buffer row) — NOT viewport
+    // rows, so the highlight stays on the selected text while the scrollback viewport moves. The
+    // top viewport row is buffer row `history_len - view_offset`; see `Grid::buf_cell`.
+    // Equal anchor/head = empty selection.
     sel_anchor: Cell<Option<(usize, usize)>>,
     sel_head: Cell<Option<(usize, usize)>>,
     // IME composition (preedit): the in-progress marked text drawn inline at the cursor.
@@ -226,7 +229,20 @@ declare_class!(
                 self.ivars().scroll_accum.set(0.0);
                 dy.round() as isize
             };
-            if lines != 0 && self.ivars().grid.borrow_mut().scroll_view(lines) {
+            if lines == 0 {
+                return;
+            }
+            // A full-screen application (less, vim, a TUI) owns the whole screen and has no
+            // scrollback for the viewport to move through, so the wheel is translated into cursor
+            // keys and the application scrolls itself — see `Grid::alt_scroll_keys`, which returns
+            // None whenever that translation must not happen.
+            if let Some(keys) = self.ivars().grid.borrow().alt_scroll_keys(lines) {
+                if !self.ivars().ended.get() {
+                    unsafe { write_all(self.ivars().master_fd.get(), &keys) };
+                }
+                return;
+            }
+            if self.ivars().grid.borrow_mut().scroll_view(lines) {
                 unsafe { self.setNeedsDisplay(true) };
             }
         }
@@ -273,10 +289,13 @@ declare_class!(
         #[method(selectAll:)]
         fn select_all_action(&self, _sender: Option<&AnyObject>) {
             let grid = self.ivars().grid.borrow();
+            // The visible screen, in virtual-buffer rows (⌘A takes what is on screen, not the
+            // whole scrollback).
             let (cols, rows) = (grid.cols, grid.rows);
+            let base = grid.history_len() - grid.view_offset();
             drop(grid);
-            self.ivars().sel_anchor.set(Some((0, 0)));
-            self.ivars().sel_head.set(Some((cols - 1, rows - 1)));
+            self.ivars().sel_anchor.set(Some((0, base)));
+            self.ivars().sel_head.set(Some((cols - 1, base + rows - 1)));
             unsafe { self.setNeedsDisplay(true) };
         }
     }
@@ -607,7 +626,7 @@ impl TermView {
         }
     }
 
-    /// Mouse point → cell coordinates (col,row).
+    /// Mouse point → selection coordinates (col, virtual-buffer row).
     fn cell_at(&self, event: &NSEvent) -> (usize, usize) {
         let p = unsafe { event.locationInWindow() };
         let lp = self.convertPoint_fromView(p, None);
@@ -616,7 +635,7 @@ impl TermView {
         let (cols, rows) = (grid.cols as i64, grid.rows as i64);
         let col = (((lp.x - PAD) / settings::cell_w()).floor() as i64).clamp(0, cols - 1);
         let row = (((lp.y - PAD) / settings::line_h()).floor() as i64).clamp(0, rows - 1);
-        (col as usize, row as usize)
+        (col as usize, grid.history_len() - grid.view_offset() + row as usize)
     }
 
     /// The normalized selection ((start, end), inclusive of both ends); returns None for an empty selection.
@@ -639,11 +658,12 @@ impl TermView {
         let cols = grid.cols;
         let mut out = String::new();
         for r in sr..=er {
-            let c0 = if r == sr { sc } else { 0 };
-            let c1 = if r == er { ec } else { cols - 1 };
+            let c0 = (if r == sr { sc } else { 0 }).min(cols - 1);
+            let c1 = (if r == er { ec } else { cols - 1 }).min(cols - 1);
             let mut line = String::new();
             for c in c0..=c1 {
-                let ch = grid.view_cell(c, r).ch;
+                // Buffer coordinates, so this reads scrolled-away rows too (blank past the end).
+                let ch = grid.buf_cell(c, r).ch;
                 if ch != '\0' {
                     line.push(ch); // skip wide-char trailer placeholders
                 }
@@ -677,16 +697,22 @@ impl TermView {
 
         // Selection highlight: drawn as a background BEFORE the glyphs so the text stays fully
         // opaque (and readable) on top, rather than being dimmed by an overlay.
+        // Selection rows are virtual-buffer rows: shift them by the viewport's top row and clip to
+        // the visible band, so the highlight rides the text as the scrollback viewport moves.
         if let Some(((sc, sr), (ec, er))) = self.selection_range() {
             unsafe {
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.30, 0.45, 0.75, 0.45).set();
             }
-            for r in sr..=er {
-                let c0 = if r == sr { sc } else { 0 };
-                let c1 = if r == er { ec } else { cols - 1 };
+            let base = grid.history_len() - grid.view_offset();
+            for r in sr.max(base)..=er.min(base + rows - 1) {
+                let c0 = (if r == sr { sc } else { 0 }).min(cols - 1);
+                let c1 = (if r == er { ec } else { cols - 1 }).min(cols - 1);
+                if c0 > c1 {
+                    continue;
+                }
                 let x = PAD + c0 as f64 * cw;
                 let width = (c1 - c0 + 1) as f64 * cw;
-                unsafe { NSRectFill(rect(x, PAD + r as f64 * lh, width, lh)) };
+                unsafe { NSRectFill(rect(x, PAD + (r - base) as f64 * lh, width, lh)) };
             }
         }
 

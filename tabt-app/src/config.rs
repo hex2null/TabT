@@ -93,7 +93,7 @@ pub fn load() -> Layout {
     let mut style = "Default".to_string();
     let mut font_family = crate::settings::DEFAULT_FAMILY.to_string();
     let mut font_size = crate::settings::DEFAULT_SIZE;
-    let mut sidebar_w = 232.0;
+    let mut sidebar_w = crate::sidebar::SIDEBAR_W;
     let mut sidebar_right = false;
     let mut show_border = false;
     let mut window_w = 0.0;

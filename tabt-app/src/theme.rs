@@ -18,26 +18,50 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Sidebar background: tracks the theme so it stays coherent when the theme changes.
-    /// Nudged very slightly off the body background to hint a panel edge on both dark and light themes.
+    /// Whether the theme's body background is a dark one (decides which way the panel and text
+    /// tiers derived from it have to move).
     pub fn is_dark(&self) -> bool {
         luminance(self.bg) <= 0.5
     }
 
+    /// Sidebar card fill. Tracks the terminal background so the two panes read as one surface
+    /// family, lifted just enough to tell them apart where the shadow is weak.
+    ///
+    /// The lift is solved for a fixed *perceived* separation rather than being a constant fraction,
+    /// because a constant one leaves low-contrast themes (Solarized Light, whose base00 text sits
+    /// close to its base3 background) with a card indistinguishable from the body. Blending toward
+    /// the foreground — rather than adding a flat gray offset — lightens dark themes and darkens
+    /// light ones with one rule, and keeps the panel inside the theme's own hue family, so an amber
+    /// CRT gets a warm panel instead of a gray-brown smudge.
     pub fn sidebar_bg(&self) -> Rgb {
-        // Dark themes: a touch lighter; light themes: a touch darker.
-        let d = if self.is_dark() { 0.02 } else { -0.02 };
-        (
-            (self.bg.0 + d).clamp(0.0, 1.0),
-            (self.bg.1 + d).clamp(0.0, 1.0),
-            (self.bg.2 + d).clamp(0.0, 1.0),
-        )
+        mix(self.bg, self.fg, self.blend_for(0.022))
+    }
+
+    /// Hairline around the sidebar card: stronger than the fill's lift, so the card keeps a
+    /// defined edge on themes where the shadow has little to work with.
+    pub fn card_border(&self) -> Rgb {
+        mix(self.bg, self.fg, self.blend_for(0.075))
+    }
+
+    /// The blend fraction toward `fg` that shifts `bg`'s luminance by `target`. Capped, because on
+    /// a theme whose fg and bg nearly coincide no blend reaches the target and an uncapped one
+    /// would wash the surface out entirely.
+    fn blend_for(&self, target: f64) -> f64 {
+        let contrast = (luminance(self.fg) - luminance(self.bg)).abs().max(1e-3);
+        (target / contrast).min(0.20)
     }
 
     /// Subtle separator/border line color derived from the theme (background nudged toward the
     /// foreground), so borders read correctly on dark and light themes alike.
     pub fn border(&self) -> Rgb {
         mix(self.bg, self.fg, 0.10)
+    }
+
+    /// Separator drawn on the sidebar panel. That panel is already lifted off the body background
+    /// by [`Theme::sidebar_bg`], so the shared [`Theme::border`] would sink into it — this is one
+    /// step stronger, enough for the edge to read as a rim.
+    pub fn sidebar_border(&self) -> Rgb {
+        mix(self.bg, self.fg, 0.20)
     }
 }
 

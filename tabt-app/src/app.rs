@@ -12,13 +12,15 @@ use std::os::unix::io::RawFd;
 use std::rc::Rc;
 
 use objc2::rc::Retained;
-use objc2::msg_send;
+use objc2::runtime::AnyObject;
+use objc2::{msg_send, msg_send_id};
 use objc2_app_kit::{
     NSAlert, NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
-    NSAutoresizingMaskOptions, NSView, NSWindow, NSWindowButton,
+    NSAnimationContext, NSAutoresizingMaskOptions, NSView, NSWindow, NSWindowButton,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
+use crate::card::{self, CARD_GAP, CARD_INSET};
 use crate::config;
 use crate::divider::{Divider, DIVIDER_W};
 use crate::header::{HeaderView, HEADER_H};
@@ -26,10 +28,14 @@ use crate::placeholder::PlaceholderView;
 use crate::pty;
 use crate::settings;
 use crate::settings_dialog::SettingsDialog;
-use crate::sidebar::{SidebarView, SIDEBAR_W};
+use crate::sidebar::{SidebarView, MAX_SIDEBAR_W, MIN_SIDEBAR_W, SIDEBAR_W};
 use crate::theme;
 use crate::toggle::{ToggleButton, TOGGLE_W};
 use crate::view::{self, ns_color, TermView};
+
+/// Duration of the sidebar collapse/expand slide. Matches the pace of the system's own sidebar
+/// animations — long enough to read as motion, short enough not to sit in the way.
+const SIDEBAR_ANIM: f64 = 0.22;
 
 struct Tab {
     id: u64,
@@ -76,6 +82,7 @@ pub struct AppController {
     model: RefCell<Model>,
     window: Retained<NSWindow>,
     sidebar: Retained<SidebarView>,
+    card: Retained<NSView>, // floating rounded panel the sidebar is mounted in (see card.rs)
     host: Retained<NSView>,
     toggle_btn: Retained<ToggleButton>,
     divider: Retained<Divider>,
@@ -85,6 +92,12 @@ pub struct AppController {
     collapsed: Cell<bool>,     // whether the sidebar is collapsed/hidden
     sidebar_w: Cell<f64>,      // current sidebar width (draggable)
     sidebar_right: Cell<bool>, // whether the sidebar is docked on the right
+    // AppKit's own default x for the three traffic lights, captured the first time they are laid
+    // out. `reposition_traffic_lights` shifts them right when the card is under them, and it can
+    // run when AppKit has *not* reset the frames — offsetting the live x would then accumulate and
+    // walk the buttons across the title bar, so they are always placed from this baseline.
+    light_x0: Cell<Option<[f64; 3]>>,
+    animating: Cell<bool>, // a collapse/expand is in flight: frame changes animate instead of snapping
     settings_dialog: RefCell<Option<Retained<SettingsDialog>>>, // lazily built settings panel
     mtm: MainThreadMarker,
 }
@@ -94,11 +107,14 @@ impl AppController {
         mtm: MainThreadMarker,
         window: Retained<NSWindow>,
         sidebar: Retained<SidebarView>,
+        card: Retained<NSView>,
         host: Retained<NSView>,
         toggle_btn: Retained<ToggleButton>,
         divider: Retained<Divider>,
     ) -> Rc<Self> {
-        // Terminal-pane header bar: pinned to the top of host, full width.
+        // Terminal-pane header bar: pinned to the top of host, full width. It spans the terminal
+        // rather than the window, so the title starts at the terminal's own left edge — the
+        // sidebar's top strip belongs to the sidebar, and holds the traffic lights and the toggle.
         let hb = host.bounds();
         let header = HeaderView::new(
             mtm,
@@ -124,6 +140,7 @@ impl AppController {
             model: RefCell::new(Model { ungrouped: Vec::new(), groups: Vec::new(), tabs: Vec::new(), active: None, next_id: 1 }),
             window,
             sidebar,
+            card,
             host,
             toggle_btn,
             divider,
@@ -133,6 +150,8 @@ impl AppController {
             collapsed: Cell::new(false),
             sidebar_w: Cell::new(SIDEBAR_W),
             sidebar_right: Cell::new(false),
+            light_x0: Cell::new(None),
+            animating: Cell::new(false),
             settings_dialog: RefCell::new(None),
             mtm,
         });
@@ -148,18 +167,24 @@ impl AppController {
         if self.collapsed.get() {
             return;
         }
-        self.sidebar_w.set(w.clamp(190.0, 480.0));
+        self.sidebar_w.set(w.clamp(MIN_SIDEBAR_W, MAX_SIDEBAR_W));
         self.relayout();
     }
 
-    /// Divider drag: window coordinate x -> sidebar width (for a right-side bar, width = content width - x).
+    /// Divider drag: window coordinate x -> sidebar card width. The cursor tracks the middle of the
+    /// gutter between card and terminal, so the card's far edge is half a gutter away from it, and
+    /// its near edge is CARD_INSET in from the window edge.
     pub fn drag_sidebar_width(&self, window_x: f64) {
         let fw = self
             .window
             .contentView()
             .map(|c| c.bounds().size.width)
             .unwrap_or(0.0);
-        let w = if self.sidebar_right.get() { fw - window_x } else { window_x };
+        let w = if self.sidebar_right.get() {
+            fw - CARD_INSET - (window_x + CARD_GAP / 2.0)
+        } else {
+            window_x - CARD_GAP / 2.0 - CARD_INSET
+        };
         self.set_sidebar_width(w);
     }
 
@@ -182,25 +207,68 @@ impl AppController {
         self.sidebar_right.get()
     }
 
-    /// Move the traffic-light buttons down so they vertically center in the taller title-bar
-    /// zone (HEADER_H). macOS resets them on resize, so this is re-applied from windowDidResize.
+    /// Distance from the window's top edge to the centerline the traffic lights (and the collapse
+    /// Centerline the top strip sits on — traffic lights, collapse toggle, and header title all
+    /// share it, so the row reads as one line.
+    ///
+    /// Measured for the card, which starts CARD_INSET below the window's top edge: this centers
+    /// the cluster in the part of the band the card actually covers, instead of letting it ride
+    /// the card's rounded top edge. It is deliberately **not** conditional on whether the card is
+    /// currently showing — see [`Self::reposition_traffic_lights`].
+    fn titlebar_center_y(&self) -> f64 {
+        (CARD_INSET + HEADER_H) / 2.0
+    }
+
+    /// Move the traffic-light buttons onto [`Self::titlebar_center_y`], shifted right by the
+    /// card's inset.
+    ///
+    /// The card's top-left corner is CARD_INSET in from the window's on both axes, and AppKit
+    /// positions these buttons against the *window*. Left alone they end up hard against the
+    /// card's rounded corner; translating by the same inset restores the standard corner spacing,
+    /// measured from the edge the user actually sees.
+    ///
+    /// The shift is unconditional — the same offset whether the sidebar is showing or collapsed —
+    /// so the buttons never move. Making it depend on the card being visible would look right in
+    /// each state on its own, but every collapse would nudge them and every expand would nudge
+    /// them back.
+    ///
+    /// macOS resets the buttons on resize, so this is re-applied from windowDidResize. The frame
+    /// it reads back is therefore AppKit's default one — but not reliably so on every call, which
+    /// is why the baseline x is captured once rather than offset in place each time.
     pub fn reposition_traffic_lights(&self) {
-        for b in [
+        let buttons = [
             NSWindowButton::NSWindowCloseButton,
             NSWindowButton::NSWindowMiniaturizeButton,
             NSWindowButton::NSWindowZoomButton,
-        ] {
-            if let Some(btn) = self.window.standardWindowButton(b) {
+        ];
+        if self.light_x0.get().is_none() {
+            let mut xs = [0.0f64; 3];
+            for (i, b) in buttons.iter().enumerate() {
+                match self.window.standardWindowButton(*b) {
+                    Some(btn) => xs[i] = btn.frame().origin.x,
+                    None => return, // not laid out yet — the next call will capture them
+                }
+            }
+            self.light_x0.set(Some(xs));
+        }
+        let x0 = match self.light_x0.get() {
+            Some(x) => x,
+            None => return,
+        };
+        let dx = CARD_INSET;
+        for (i, b) in buttons.iter().enumerate() {
+            if let Some(btn) = self.window.standardWindowButton(*b) {
                 // The buttons live in the (non-flipped) titlebar container that spans the full
-                // window height, so its top edge is at `super_h`. Center each button in the
-                // HEADER_H band pinned to that top edge.
+                // window height, so its top edge is at `super_h`; measure the centerline down
+                // from there.
                 let super_h = unsafe { btn.superview() }.map(|s| s.frame().size.height).unwrap_or(0.0);
                 if super_h <= 0.0 {
                     continue;
                 }
                 let bh = btn.frame().size.height;
                 let mut o = btn.frame().origin;
-                o.y = super_h - HEADER_H / 2.0 - bh / 2.0; // down = smaller y
+                o.x = x0[i] + dx;
+                o.y = super_h - self.titlebar_center_y() - bh / 2.0; // down = smaller y
                 unsafe { btn.setFrameOrigin(o) };
             }
         }
@@ -230,6 +298,29 @@ impl AppController {
         if let Some(ap) = NSAppearance::appearanceNamed(name) {
             let _: () = unsafe { msg_send![&*self.window, setAppearance: &*ap] };
         }
+        // The card's fill/border/shadow live on a layer, so they hold concrete colors and have to
+        // be repainted here rather than re-read during a `drawRect:`.
+        card::apply_theme(&self.card);
+    }
+
+    /// Set `view`'s frame — animated while a sidebar collapse/expand is in flight, instant
+    /// otherwise (a divider drag or a window resize must track the mouse frame for frame).
+    fn set_frame_maybe_animated(&self, view: &NSView, frame: NSRect) {
+        if !self.animating.get() {
+            unsafe { view.setFrame(frame) };
+            return;
+        }
+        unsafe {
+            NSAnimationContext::beginGrouping();
+            NSAnimationContext::currentContext().setDuration(SIDEBAR_ANIM);
+            let anim: Retained<AnyObject> = msg_send_id![view, animator];
+            let _: () = msg_send![&*anim, setFrame: frame];
+            NSAnimationContext::endGrouping();
+        }
+    }
+
+    fn set_card_frame(&self, frame: NSRect) {
+        self.set_frame_maybe_animated(&self.card, frame);
     }
 
     /// Re-lay out the sidebar, divider, and terminal host per the current width / side / collapsed state,
@@ -244,41 +335,51 @@ impl AppController {
         let (fw, fh) = (full.size.width, full.size.height);
         let w = self.sidebar_w.get();
         let right = self.sidebar_right.get();
+        // Everything below the toolbar band shares this height; the band itself spans the window.
         let mk = |x: f64, width: f64| NSRect::new(NSPoint::new(x, 0.0), NSSize::new(width, fh));
+        // The card floats: inset from the window edges on its three outer sides, and separated from
+        // the terminal by CARD_GAP. The terminal itself still runs to the window edge.
+        let card = NSRect::new(
+            NSPoint::new(if right { fw - CARD_INSET - w } else { CARD_INSET }, CARD_INSET),
+            NSSize::new(w, (fh - 2.0 * CARD_INSET).max(0.0)),
+        );
+        // Collapsed, the card is parked just past the window edge it docks to rather than hidden:
+        // an off-screen frame is what `toggle_sidebar` slides it to and from, and the window clips
+        // it there just as effectively as `setHidden:` would.
+        let parked = NSRect::new(
+            NSPoint::new(if right { fw + CARD_INSET } else { -(w + CARD_INSET) }, card.origin.y),
+            card.size,
+        );
         unsafe {
             if self.collapsed.get() {
-                self.sidebar.setHidden(true);
+                self.set_card_frame(parked);
                 self.divider.setHidden(true);
                 self.host.setFrame(mk(0.0, fw));
                 self.host.setAutoresizingMask(M::NSViewWidthSizable | M::NSViewHeightSizable);
             } else {
-                self.sidebar.setHidden(false);
                 self.divider.setHidden(false);
+                self.set_card_frame(card);
                 self.host.setAutoresizingMask(M::NSViewWidthSizable | M::NSViewHeightSizable);
+                // Seam = the middle of the gutter between the card and the terminal.
+                let seam = if right { card.origin.x - CARD_GAP / 2.0 } else { card.origin.x + w + CARD_GAP / 2.0 };
                 if right {
-                    let sx = fw - w;
-                    self.sidebar.setFrame(mk(sx, w));
-                    self.sidebar.setAutoresizingMask(M::NSViewHeightSizable | M::NSViewMinXMargin);
-                    self.host.setFrame(mk(0.0, sx));
-                    self.divider.setFrame(NSRect::new(
-                        NSPoint::new(sx - DIVIDER_W / 2.0, 0.0),
-                        NSSize::new(DIVIDER_W, fh),
-                    ));
+                    self.card.setAutoresizingMask(M::NSViewHeightSizable | M::NSViewMinXMargin);
+                    self.host.setFrame(mk(0.0, seam - CARD_GAP / 2.0));
                     self.divider.setAutoresizingMask(M::NSViewHeightSizable | M::NSViewMinXMargin);
                 } else {
-                    self.sidebar.setFrame(mk(0.0, w));
-                    self.sidebar.setAutoresizingMask(M::NSViewHeightSizable | M::NSViewMaxXMargin);
-                    self.host.setFrame(mk(w, fw - w));
-                    self.divider.setFrame(NSRect::new(
-                        NSPoint::new(w - DIVIDER_W / 2.0, 0.0),
-                        NSSize::new(DIVIDER_W, fh),
-                    ));
+                    self.card.setAutoresizingMask(M::NSViewHeightSizable | M::NSViewMaxXMargin);
+                    self.host.setFrame(mk(seam + CARD_GAP / 2.0, fw - seam - CARD_GAP / 2.0));
                     self.divider.setAutoresizingMask(M::NSViewHeightSizable | M::NSViewMaxXMargin);
                 }
+                self.divider.setFrame(NSRect::new(
+                    NSPoint::new(seam - DIVIDER_W / 2.0, 0.0),
+                    NSSize::new(DIVIDER_W, fh),
+                ));
             }
-            // Toggle button lives in the top title-bar zone (container is non-flipped, so top = high y).
-            // Expanded: at the sidebar edge nearest the terminal. Collapsed: right after the traffic
-            // lights, with even gaps, and the header title follows.
+            // Top strip, arranged the way the system's sidebar apps do it: traffic lights at the
+            // sidebar's top-left, collapse toggle at its top-right, and the terminal's title at the
+            // terminal's own left edge. Collapsed, the sidebar is gone, so the toggle joins the
+            // lights at the window's top-left and the title moves clear of both.
             let (tw, th) = (TOGGLE_W + 12.0, TOGGLE_W);
             let icon = 17.0; // toggle glyph size (see toggle.rs); centered within the button
             let icon_pad = (tw - icon) / 2.0;
@@ -287,20 +388,26 @@ impl AppController {
                 let icon_left = 72.0 + gap; // 72 ≈ right edge of the traffic lights
                 (icon_left - icon_pad, icon_left + icon + gap)
             } else if right {
-                // Sidebar docked right: the terminal pane is on the left, so the traffic lights
-                // sit at the window's top-left over the header — the title must clear them.
-                (fw - w + 8.0, 72.0 + 14.0)
+                // Sidebar docked right: the terminal is on the left, so the traffic lights sit at
+                // the window's top-left over the header — the title must clear them.
+                (card.origin.x + 8.0, 72.0 + 14.0)
             } else {
-                (w - tw - 8.0, 16.0)
+                (card.origin.x + w - tw - 8.0, 16.0)
             };
-            self.toggle_btn.setFrame(NSRect::new(
-                NSPoint::new(tx, fh - th - 9.0),
-                NSSize::new(tw, th),
-            ));
+            let cy = self.titlebar_center_y();
+            self.set_frame_maybe_animated(
+                &self.toggle_btn,
+                NSRect::new(NSPoint::new(tx, fh - cy - th / 2.0), NSSize::new(tw, th)),
+            );
             self.header.set_left_inset(title_inset);
+            self.header.set_center_y(cy);
+            self.card.setNeedsDisplay(true);
             self.sidebar.setNeedsDisplay(true);
             self.toggle_btn.setNeedsDisplay(true);
         }
+        // The lights share that centerline, and shift with the card, so any layout change can
+        // invalidate their position.
+        self.reposition_traffic_lights();
     }
 
     /// The title bar always shows the current active tab's name; falls back to "TabT" when there is no active tab.
@@ -325,7 +432,7 @@ impl AppController {
         self.sync_window_chrome();
         settings::set(&layout.font_family, layout.font_size);
         // The sidebar width/position must be set before spawning tabs and computing host dimensions.
-        self.sidebar_w.set(layout.sidebar_w.clamp(190.0, 480.0));
+        self.sidebar_w.set(layout.sidebar_w.clamp(MIN_SIDEBAR_W, MAX_SIDEBAR_W));
         self.sidebar_right.set(layout.sidebar_right);
         settings::set_show_border(layout.show_border);
         // Restore the saved window size (clamped to a sane range) before laying out / spawning
@@ -530,13 +637,9 @@ impl AppController {
                     let live = t.view.cwd();
                     if live.is_empty() { t.spawn_cwd.clone() } else { live }
                 })?;
-                // If the active tab's group is collapsed, the new tab would be created hidden inside
-                // it. Place it at the top level (ungrouped) instead so it's visible.
-                let group = m
-                    .groups
-                    .iter()
-                    .position(|g| g.tabs.contains(&a))
-                    .filter(|&gi| !m.groups[gi].collapsed);
+                // The new tab stays in the active tab's group even when that group is collapsed —
+                // it is expanded below, so the tab is never created hidden.
+                let group = m.groups.iter().position(|g| g.tabs.contains(&a));
                 Some((a, group, cwd))
             })
         };
@@ -549,6 +652,13 @@ impl AppController {
             Some(id) => {
                 if let Some((active_id, _, _)) = anchor {
                     self.place_tab_after(group, id, active_id);
+                }
+                // Same rule as the group menu's "New Terminal": the new tab is selected, so its
+                // group must be expanded or the active terminal would have no visible row.
+                if let Some(gi) = group {
+                    if let Some(g) = self.model.borrow_mut().groups.get_mut(gi) {
+                        g.collapsed = false;
+                    }
                 }
                 self.select(id);
                 self.save();
@@ -579,6 +689,11 @@ impl AppController {
         let n = self.model.borrow().next_id;
         match self.spawn_tab(Some(gi), format!("Terminal {}", n), &cwd, 0, false) {
             Some(id) => {
+                // A collapsed group hides its tabs, so the new (and now active) terminal would have
+                // no row in the sidebar: expand the group so it is visible where it was created.
+                if let Some(g) = self.model.borrow_mut().groups.get_mut(gi) {
+                    g.collapsed = false;
+                }
                 self.select(id);
                 self.save();
                 self.refresh_sidebar();
@@ -1143,7 +1258,12 @@ impl AppController {
         // Collapsing must not leave an invisible search/rename box holding the keyboard.
         self.sidebar.end_input();
         self.collapsed.set(!self.collapsed.get());
+        // Slide the card in/out instead of swapping it in place. Only the card and the toggle
+        // animate: the terminal host jumps straight to its final width, because animating it would
+        // reflow the grid and TIOCSWINSZ the shell on every frame of the slide.
+        self.animating.set(true);
         self.relayout();
+        self.animating.set(false);
         self.update_title();
     }
 
