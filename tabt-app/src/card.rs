@@ -1,19 +1,19 @@
 //! The floating sidebar card: the rounded, inset panel the sidebar draws inside.
 //!
 //! The card is a plain layer-backed `NSView` whose layer carries the whole look — fill, hairline
-//! border, corner radius, drop shadow — so `SidebarView` can go on painting only its rows. The fill
-//! is the theme's plain background, the same color the terminal draws on, so the window reads as one
-//! continuous surface; the card is told apart by its border and shadow alone, not by a lighter tint.
+//! border, corner radius — so `SidebarView` can go on painting only its rows.
 //!
-//! The layer deliberately does **not** mask to its bounds — masking would clip the shadow away.
-//! Nothing the sidebar draws reaches the rounded corners (rows and boxes are inset by `HPAD`, and
-//! the footer separator sits far from them), so there is nothing to clip.
+//! Every surface in the window is the theme's plain background: the card's fill, the terminal
+//! beside it, and the gutter around it (the window's own background color). The card is told apart
+//! by its hairline alone. It carries no drop shadow for the same reason — a shadow tints the gutter
+//! it falls into, and a gutter darker than the panes on either side is exactly the seam this layout
+//! is trying not to have.
 
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{NSAutoresizingMaskOptions, NSColor, NSView};
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
+use objc2_foundation::{MainThreadMarker, NSPoint, NSRect};
 
 use crate::theme;
 use crate::view::ns_color;
@@ -57,23 +57,12 @@ pub fn apply_theme(card: &NSView) {
             return;
         }
         let _: () = msg_send![layer, setCornerRadius: CARD_RADIUS];
-        let _: () = msg_send![layer, setMasksToBounds: false];
+        // Safe to clip now that no shadow has to escape the bounds, and it keeps whatever the
+        // sidebar draws inside the rounded corners.
+        let _: () = msg_send![layer, setMasksToBounds: true];
         let _: () = msg_send![layer, setBackgroundColor: cg(&ns_color(t.bg))];
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
         let _: () = msg_send![layer, setBorderColor: cg(&ns_color(t.card_border()))];
-        // A soft ambient shadow on all four sides: no offset, so it reads as the card lifted off
-        // the background rather than as a light source somewhere off-screen.
-        //
-        // The radius is deliberately much wider than the 8pt gutter it falls into. A tight, opaque
-        // shadow would still be dark where the window edge cuts it off, leaving a visible band with
-        // a hard outer edge; spreading it wide and keeping it faint means it has already faded to
-        // near nothing by the time it is clipped, so the transition reads as a gradient rather than
-        // a border. Dark themes carry more of it — a black shadow on a near-black backdrop barely
-        // registers otherwise.
-        let _: () = msg_send![layer, setShadowColor: cg(&ns_color((0.0, 0.0, 0.0)))];
-        let _: () = msg_send![layer, setShadowOpacity: if t.is_dark() { 0.28f32 } else { 0.10f32 }];
-        let _: () = msg_send![layer, setShadowRadius: 20.0f64];
-        let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, 0.0)];
     }
 }
 

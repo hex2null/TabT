@@ -687,8 +687,11 @@ impl SidebarView {
 
         // ---- Session row (Tab) ----
         // Selection highlight is a theme-aligned neutral wash (adapts to light/dark), not a fixed accent.
+        // Kept deliberately faint: the row is already marked by its brighter label, its dot and the
+        // "⋯", so the wash only has to place them — a heavier one reads as a block of color in a
+        // sidebar that is otherwise all background.
         if row.selected {
-            round_fill(inset, 7.0, &overlay(0.16));
+            round_fill(inset, 7.0, &overlay(0.10));
         } else if hovered {
             round_fill(inset, 7.0, &overlay(0.06));
         }
