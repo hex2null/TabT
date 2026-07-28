@@ -7,10 +7,9 @@
 A small, fast native terminal emulator for macOS, written in Rust on top of AppKit. Multi-tab
 sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT/ANSI core.
 
-<p align="center">
-  <img src="screen1.png" width="49%" alt="TabT window with a floating sidebar of grouped sessions and a terminal session" />
-  <img src="screen2.png" width="49%" alt="TabT on a light theme, running the test suite" />
-</p>
+![TabT on a light theme: a floating sidebar of grouped sessions beside a terminal showing the curl man page](screenshot1.jpeg)
+
+![The same window on a dark theme](screenshot2.jpeg)
 
 ## Features
 
