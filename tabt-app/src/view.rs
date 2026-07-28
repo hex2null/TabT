@@ -69,7 +69,7 @@ pub struct TermViewIvars {
     ended: Cell<bool>,
     // Mouse selection: anchor + current drag point, as (col, virtual-buffer row) — NOT viewport
     // rows, so the highlight stays on the selected text while the scrollback viewport moves. The
-    // top viewport row is buffer row `history_len - view_offset`; see `Grid::buf_cell`.
+    // top viewport row is `Grid::view_base()`; see `Grid::buf_cell`.
     // Equal anchor/head = empty selection.
     sel_anchor: Cell<Option<(usize, usize)>>,
     sel_head: Cell<Option<(usize, usize)>>,
@@ -292,7 +292,7 @@ declare_class!(
             // The visible screen, in virtual-buffer rows (⌘A takes what is on screen, not the
             // whole scrollback).
             let (cols, rows) = (grid.cols, grid.rows);
-            let base = grid.history_len() - grid.view_offset();
+            let base = grid.view_base();
             drop(grid);
             self.ivars().sel_anchor.set(Some((0, base)));
             self.ivars().sel_head.set(Some((cols - 1, base + rows - 1)));
@@ -635,7 +635,7 @@ impl TermView {
         let (cols, rows) = (grid.cols as i64, grid.rows as i64);
         let col = (((lp.x - PAD) / settings::cell_w()).floor() as i64).clamp(0, cols - 1);
         let row = (((lp.y - PAD) / settings::line_h()).floor() as i64).clamp(0, rows - 1);
-        (col as usize, grid.history_len() - grid.view_offset() + row as usize)
+        (col as usize, grid.view_base() + row as usize)
     }
 
     /// The normalized selection ((start, end), inclusive of both ends); returns None for an empty selection.
@@ -703,7 +703,7 @@ impl TermView {
             unsafe {
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.30, 0.45, 0.75, 0.45).set();
             }
-            let base = grid.history_len() - grid.view_offset();
+            let base = grid.view_base();
             for r in sr.max(base)..=er.min(base + rows - 1) {
                 let c0 = (if r == sr { sc } else { 0 }).min(cols - 1);
                 let c1 = (if r == er { ec } else { cols - 1 }).min(cols - 1);

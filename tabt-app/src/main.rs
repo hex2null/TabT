@@ -142,8 +142,12 @@ fn main() {
         toggle_btn.setAutoresizingMask(
             NSAutoresizingMaskOptions::NSViewMinYMargin | NSAutoresizingMaskOptions::NSViewMaxXMargin,
         );
-        container.addSubview(&card);
+        // Host first, card above it. Both the terminal and the header fill their whole rect, so with
+        // the card underneath the host would clip the card's shadow where it reaches past the
+        // CARD_GAP gutter — the gradient would end in a hard line — and would cover the card
+        // outright for the whole collapse slide, which is why only the expand used to animate.
         container.addSubview(&host);
+        container.addSubview(&card);
         container.addSubview(&divider); // above the seam, takes over dragging
         container.addSubview(&toggle_btn); // topmost, floats in the title-bar zone
     }

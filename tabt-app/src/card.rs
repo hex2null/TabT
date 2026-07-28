@@ -3,17 +3,26 @@
 //! The card is a plain layer-backed `NSView` whose layer carries the whole look — fill, hairline
 //! border, corner radius — so `SidebarView` can go on painting only its rows.
 //!
-//! Every surface in the window is the theme's plain background: the card's fill, the terminal
-//! beside it, and the gutter around it (the window's own background color). The card is told apart
-//! by its hairline alone. It carries no drop shadow for the same reason — a shadow tints the gutter
-//! it falls into, and a gutter darker than the panes on either side is exactly the seam this layout
-//! is trying not to have.
+//! The terminal and the gutter around the card are the theme's plain background; the card itself is
+//! that background stepped one notch deeper ([`theme::Theme::card_bg`]), so the panel reads as its
+//! own recessed surface. The hairline is left much fainter than that step — it only finishes the
+//! rounded edge — and a tight, very faint drop shadow lifts the card off the gutter.
+//!
+//! The shadow is deliberately near the limit of visibility, and its spread stays close to CARD_GAP:
+//! a heavier or wider one tints the gutter it falls into, and that gutter is shared with the
+//! terminal, so it turns into a dark seam down the middle of the window. Weak and short, it reads
+//! as depth instead.
+//!
+//! A layer's shadow is drawn outside its bounds, so `masksToBounds` would erase it. The clip that
+//! keeps the sidebar's own drawing inside the rounded corners therefore lives on the *content*
+//! layer, which has the card's exact bounds, while the card layer stays unmasked to let the shadow
+//! out.
 
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{NSAutoresizingMaskOptions, NSColor, NSView};
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect};
+use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
 
 use crate::theme;
 use crate::view::ns_color;
@@ -24,6 +33,12 @@ use crate::view::ns_color;
 pub const CARD_INSET: f64 = 8.0;
 /// Gap between the card and the terminal pane.
 pub const CARD_GAP: f64 = 8.0;
+/// Blur radius of the card's drop shadow.
+const SHADOW_RADIUS: f64 = 7.0;
+/// How far the shadow can still be seen past the card's own edge. The blur is Gaussian, so it does
+/// not stop dead at `SHADOW_RADIUS`; `relayout` has to park the collapsed card at least this far
+/// off-screen or the tail of the shadow stays visible as a smudge down the window edge.
+pub const SHADOW_REACH: f64 = SHADOW_RADIUS * 2.0;
 /// Corner radius of the card.
 ///
 /// Concentric with the window: macOS rounds the window itself at ~24pt, and an inset shape stays
@@ -40,6 +55,14 @@ pub fn new(mtm: MainThreadMarker, frame: NSRect, content: &NSView) -> Retained<N
         content.setAutoresizingMask(
             NSAutoresizingMaskOptions::NSViewWidthSizable | NSAutoresizingMaskOptions::NSViewHeightSizable,
         );
+        // The rounded clip lives here rather than on the card, so the card's shadow can escape its
+        // bounds. Both layers carry the same radius and the same frame, so the seam is invisible.
+        content.setWantsLayer(true);
+        let content_layer: *mut AnyObject = msg_send![content, layer];
+        if !content_layer.is_null() {
+            let _: () = msg_send![content_layer, setCornerRadius: CARD_RADIUS];
+            let _: () = msg_send![content_layer, setMasksToBounds: true];
+        }
         card.addSubview(content);
     }
     apply_theme(&card);
@@ -57,12 +80,21 @@ pub fn apply_theme(card: &NSView) {
             return;
         }
         let _: () = msg_send![layer, setCornerRadius: CARD_RADIUS];
-        // Safe to clip now that no shadow has to escape the bounds, and it keeps whatever the
-        // sidebar draws inside the rounded corners.
-        let _: () = msg_send![layer, setMasksToBounds: true];
-        let _: () = msg_send![layer, setBackgroundColor: cg(&ns_color(t.bg))];
+        // Unmasked on purpose: the clip that keeps the sidebar's drawing inside the corners is on
+        // the content layer (see `new`), because masking here would cut the shadow off.
+        let _: () = msg_send![layer, setMasksToBounds: false];
+        let _: () = msg_send![layer, setBackgroundColor: cg(&ns_color(t.card_bg()))];
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
         let _: () = msg_send![layer, setBorderColor: cg(&ns_color(t.card_border()))];
+        // Weak and tight, offset a hair downward: enough to lift the card, not enough to darken the
+        // gutter it shares with the terminal — the spread is kept close to CARD_GAP so the gradient
+        // has faded out by the time it reaches the text. Black on every theme: a light theme's
+        // gutter needs the same "something in front of something" cue, and tinting the shadow with
+        // the theme would only make it a colored smudge.
+        let _: () = msg_send![layer, setShadowColor: cg(&NSColor::blackColor())];
+        let _: () = msg_send![layer, setShadowOpacity: 0.10f32];
+        let _: () = msg_send![layer, setShadowRadius: SHADOW_RADIUS];
+        let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -1.0)];
     }
 }
 

@@ -277,25 +277,49 @@ impl Grid {
         self.history.len()
     }
 
-    /// Total rows of the virtual buffer: the scrollback lines followed by the `rows` screen rows.
-    pub fn buf_rows(&self) -> usize {
-        self.history.len() + self.rows
+    /// First virtual-buffer row still retained: rows below this scrolled off and were evicted from
+    /// the capped history.
+    pub fn buf_top(&self) -> usize {
+        // `history` only ever grows in `scroll_line_into_history`, which bumps `scrolled` in the
+        // same breath, so it can never outrun it. Worth asserting: this subtraction runs on every
+        // `buf_cell` (so on every frame with a live selection), and the release profile is
+        // `panic = "abort"` — an underflow here would take the whole app down, not just the
+        // selection. A new push site that forgets the counter trips this in debug builds.
+        debug_assert!(self.scrolled >= self.history.len());
+        self.scrolled - self.history.len()
     }
 
-    /// The cell at a virtual-buffer row: `0..history_len()` are scrollback lines, the next `rows`
-    /// are the screen rows. This is the viewport-independent counterpart of `view_cell`, for state
-    /// that must stay attached to content while the viewport scrolls (the mouse selection).
+    /// One past the last virtual-buffer row (the bottom screen row is `buf_end() - 1`).
+    pub fn buf_end(&self) -> usize {
+        self.scrolled + self.rows
+    }
+
+    /// The virtual-buffer row currently at the top of the viewport. The renderer and the mouse
+    /// selection both need it to convert between the two coordinate spaces, and deriving it here
+    /// keeps that one expression from being open-coded at every call site.
+    pub fn view_base(&self) -> usize {
+        self.scrolled - self.view_offset
+    }
+
+    /// The cell at a virtual-buffer row. Rows are *absolute*: counted from the first line ever
+    /// printed, not from the head of the deque, so they stay attached to their text no matter how
+    /// much history is later evicted or cleared. `buf_top()..scrolled` are scrollback lines and
+    /// `scrolled..buf_end()` the screen rows. This is the viewport-independent counterpart of
+    /// `view_cell`, for state that must survive the viewport moving (the mouse selection).
     ///
-    /// `buf_cell(col, history_len() - view_offset() + row) == view_cell(col, row)` for every
-    /// visible `row`. Coordinates past the end of the buffer read as blank rather than panicking,
-    /// so a selection left over from before a reflow can never take the process down.
+    /// `buf_cell(col, view_base() + row) == view_cell(col, row)` for every visible `row`.
+    /// Coordinates outside the buffer — evicted below, past the screen above — read as blank
+    /// rather than panicking, so a selection left over from before a reflow, an eviction or an ED3
+    /// can never take the process down.
     pub fn buf_cell(&self, col: usize, row: usize) -> &Cell {
-        let h = self.history.len();
-        if row < h {
-            return self.history[row].get(col).unwrap_or(&BLANK);
+        if col >= self.cols || row < self.buf_top() {
+            return &BLANK;
         }
-        let r = row - h;
-        if r >= self.rows || col >= self.cols {
+        if row < self.scrolled {
+            return self.history[row - self.buf_top()].get(col).unwrap_or(&BLANK);
+        }
+        let r = row - self.scrolled;
+        if r >= self.rows {
             return &BLANK;
         }
         self.cell(col, r)
@@ -1530,11 +1554,10 @@ mod tests {
         for off in 0..=g.history_len() {
             g.scroll_to_bottom();
             g.scroll_view(off as isize);
-            let base = g.history_len() - g.view_offset();
             for r in 0..g.rows {
                 for c in 0..g.cols {
                     assert_eq!(
-                        g.buf_cell(c, base + r),
+                        g.buf_cell(c, g.view_base() + r),
                         g.view_cell(c, r),
                         "offset {off}, cell ({c},{r})"
                     );
@@ -1543,10 +1566,56 @@ mod tests {
         }
 
         // Out of range in either axis reads as blank instead of panicking.
-        assert_eq!(g.buf_cell(0, g.buf_rows()), &BLANK);
-        assert_eq!(g.buf_cell(0, g.buf_rows() + 100), &BLANK);
-        assert_eq!(g.buf_cell(99, g.buf_rows() - 1), &BLANK);
-        assert_eq!(g.buf_cell(99, 0), &BLANK); // past the end of a trimmed history line
+        assert_eq!(g.buf_cell(0, g.buf_end()), &BLANK);
+        assert_eq!(g.buf_cell(0, g.buf_end() + 100), &BLANK);
+        assert_eq!(g.buf_cell(99, g.buf_end() - 1), &BLANK);
+        assert_eq!(g.buf_cell(99, g.buf_top()), &BLANK); // past the end of a trimmed history line
+    }
+
+    /// The bug the absolute coordinates exist to prevent: at HISTORY_MAX every new line evicts one
+    /// from the front, so a deque-relative row would slide onto different text once per line.
+    #[test]
+    fn buf_cell_coordinates_survive_history_eviction() {
+        const LINES: usize = HISTORY_MAX + 10;
+        let mut g = Grid::new(10, 2);
+        for i in 0..LINES {
+            g.feed(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(g.history_len(), HISTORY_MAX, "history must be at the cap for this to bite");
+
+        // Pin a coordinate to a known line, then push enough output to evict a chunk of the front.
+        let row = g.buf_end() - 3; // the newest line that has scrolled off
+        let read = |g: &Grid, row| (0..10).map(|c| g.buf_cell(c, row).ch).collect::<String>();
+        let text = read(&g, row);
+        assert_eq!(text.trim_end(), format!("line{}", LINES - 2));
+        for i in 0..100 {
+            g.feed(format!("more{i}\r\n").as_bytes());
+        }
+        assert_eq!(read(&g, row), text, "the coordinate must still name the line it was taken from");
+
+        // Rows evicted out of the deque read as blank rather than as whatever slid into their slot.
+        assert!(g.buf_top() > 0);
+        assert_eq!(g.buf_cell(0, g.buf_top() - 1), &BLANK);
+    }
+
+    /// ED3 (`clear`) drops the whole scrollback. `scrolled` is monotonic, so the screen keeps its
+    /// coordinates across it — a deque-relative row would have every stored coordinate jump by the
+    /// discarded `history_len()` at once, which is the fast way to reproduce the drift.
+    #[test]
+    fn erasing_the_scrollback_keeps_the_screen_rows_addressable() {
+        let mut g = Grid::new(4, 2);
+        g.feed(b"1\r\n2\r\n3\r\n4"); // "1"/"2" scrolled off, "3"/"4" on screen
+        let base = g.view_base();
+        assert_eq!(g.buf_cell(0, base + 1).ch, '4');
+
+        // ED3 blanks the screen as well as the history, so the row goes blank — but it must still
+        // *be* that row, not fall out of the buffer and resolve somewhere else.
+        g.feed(b"\x1b[3J");
+        assert_eq!(g.history_len(), 0);
+        assert_eq!(g.view_base(), base, "the viewport's top row must not move");
+        assert_eq!(g.buf_top(), base, "the dropped scrollback is simply no longer retained");
+        g.feed(b"\x1b[HX");
+        assert_eq!(g.buf_cell(0, base).ch, 'X');
     }
 
     #[test]

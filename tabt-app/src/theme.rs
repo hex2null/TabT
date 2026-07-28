@@ -24,9 +24,30 @@ impl Theme {
         luminance(self.bg) <= 0.5
     }
 
-    /// Hairline around the sidebar card. The card is filled with the plain body background, so the
-    /// window reads as one surface and this edge — with the shadow — is the only thing separating
-    /// the two panes; it has to hold on themes where the shadow has little to work with.
+    /// Fill of the sidebar card: the body background stepped one notch deeper, so the panel is set
+    /// apart by its own surface and the hairline only has to finish the edge.
+    ///
+    /// The step is a fixed *perceived* one — a luminance delta, not a constant blend fraction — so
+    /// it lands the same on a near-black theme and on a white one, where the same fraction would be
+    /// invisible on the first and a slab on the second. Blending toward black keeps the panel in the
+    /// theme's own hue family. A background already near black has nowhere darker to go, so there
+    /// the step is taken toward the foreground instead: still a distinct surface, just the only
+    /// direction the theme leaves open (the phosphor CRT themes are the ones this covers).
+    pub fn card_bg(&self) -> Rgb {
+        const STEP: f64 = 0.03;
+        let l = luminance(self.bg);
+        if l < STEP * 2.0 {
+            mix(self.bg, self.fg, self.blend_for(STEP))
+        } else {
+            // Darkening by t scales luminance to l*(1-t), so t = STEP/l lands the delta. Capped so a
+            // very dark theme dims rather than collapsing to black.
+            mix(self.bg, (0.0, 0.0, 0.0), (STEP / l).min(0.35))
+        }
+    }
+
+    /// Hairline around the sidebar card. With [`Theme::card_bg`] now carrying the separation, this
+    /// is only the edge that keeps the rounded corner crisp — deliberately fainter than the surface
+    /// step, so the card is read as depth rather than as an outlined box.
     ///
     /// The step is solved for a fixed *perceived* separation rather than being a constant fraction,
     /// because a constant one leaves low-contrast themes (Solarized Light, whose base00 text sits
@@ -35,7 +56,7 @@ impl Theme {
     /// light ones with one rule, and keeps the line inside the theme's own hue family, so an amber
     /// CRT gets a warm rim instead of a gray-brown smudge.
     pub fn card_border(&self) -> Rgb {
-        mix(self.bg, self.fg, self.blend_for(0.075))
+        mix(self.bg, self.fg, self.blend_for(0.03))
     }
 
     /// The blend fraction toward `fg` that shifts `bg`'s luminance by `target`. Capped, because on
@@ -52,9 +73,9 @@ impl Theme {
         mix(self.bg, self.fg, 0.10)
     }
 
-    /// Separator drawn on the sidebar panel. The panel carries the theme background at full
-    /// strength and its content is quieter than the terminal's, so the shared [`Theme::border`]
-    /// sinks into it — this is one step stronger, enough for the edge to read as a rim.
+    /// Separator drawn on the sidebar panel. The panel carries [`Theme::card_bg`] and its content is
+    /// quieter than the terminal's, so the shared [`Theme::border`] sinks into it — this is one step
+    /// stronger, enough for the edge to read as a rim.
     pub fn sidebar_border(&self) -> Rgb {
         mix(self.bg, self.fg, 0.20)
     }
@@ -82,6 +103,11 @@ pub const NAMES: [&str; 9] = [
     "Nord",
     "GitHub Light",
 ];
+
+/// The theme a fresh install starts on. Kept here rather than in `config.rs` so the on-disk default
+/// and the value the drawing code falls back to before the layout is read cannot drift apart.
+pub const DEFAULT_INDEX: usize = 5;
+pub const DEFAULT_NAME: &str = NAMES[DEFAULT_INDEX];
 
 /// Standard xterm 16 colors (used by the default theme).
 const BASE16: [(u8, u8, u8); 16] = [
@@ -278,7 +304,7 @@ pub fn index_of(name: &str) -> usize {
 }
 
 thread_local! {
-    static CURRENT: Cell<Theme> = Cell::new(by_index(0));
+    static CURRENT: Cell<Theme> = Cell::new(by_index(DEFAULT_INDEX));
 }
 
 /// Set the current theme (called when switching styles; takes effect once each view redraws).

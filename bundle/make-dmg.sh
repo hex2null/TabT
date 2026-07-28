@@ -4,8 +4,10 @@
 # Produces `dist/TabT-<version>.dmg`: a compressed (UDZO) read-only image containing the app
 # next to a symlink to /Applications, i.e. the standard "drag the icon onto the folder" macOS
 # install flow. No dependencies beyond the system tools (hdiutil/ditto/PlistBuddy) -- in
-# particular there is no Finder/AppleScript step to set a background image or icon positions,
-# which would need Automation permission and tends to break in CI.
+# particular there is no Finder/AppleScript step here, which would need Automation permission
+# and tends to break in CI. The window's icon size and layout instead ship as a pre-authored
+# `.DS_Store` (`bundle/dmg-DS_Store`) that is simply copied in; `bundle/make-dmg-dsstore.sh`
+# regenerates it by hand when the geometry or the item names change.
 #
 # Gatekeeper: by default the app carries the local self-signed "TabT Dev" signature (or an
 # ad-hoc one), which is fine on this machine but is refused on any other Mac. To ship it
@@ -45,6 +47,9 @@ trap 'rm -rf "$STAGE"' EXIT
 # signature and extended attributes intact (a cp -R'd app can fail to launch).
 ditto "$APP" "$STAGE/$(basename "$APP")"
 ln -s /Applications "$STAGE/Applications"
+# hdiutil copies the source folder verbatim, dotfiles included, so dropping the pre-authored
+# view settings in here is all it takes for Finder to open the image at the intended size.
+cp bundle/dmg-DS_Store "$STAGE/.DS_Store"
 
 mkdir -p "$OUTDIR"
 rm -f "$DMG"

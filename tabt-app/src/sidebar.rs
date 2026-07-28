@@ -41,6 +41,13 @@ const PAD: f64 = 14.0; // content left inset
 /// edge already sits CARD_INSET below the window's, so this is that much shorter than HEADER_H.
 const TOP_INSET: f64 = HEADER_H - CARD_INSET;
 const HPAD: f64 = 10.0; // row background (selected/hover/search box) inset from the sidebar's left and right edges
+/// The "chip" fill shared by the search box, the two action buttons and the selected session row,
+/// so a selected session and a button read as the same surface. `CHIP_HOVER` is the same chip under
+/// the pointer. `ROW_HOVER` is every *list* row's hover wash — one step below the chip, so hovering
+/// a group title or an unselected session never paints it exactly like the selected row.
+const CHIP_BG: f64 = 0.06;
+const CHIP_HOVER: f64 = 0.10;
+const ROW_HOVER: f64 = 0.04;
 const GAP: f64 = 10.0;
 const FROW_H: f64 = 32.0; // bottom settings row (same height as session rows)
 const FPAD: f64 = 8.0; // settings row top/bottom margin (symmetric)
@@ -658,7 +665,7 @@ impl SidebarView {
         // ---- Group title: section label + system folder icon ----
         if let Press::Group(_) = row.kind {
             if hovered {
-                round_fill(inset, 7.0, &overlay(0.06));
+                round_fill(inset, 7.0, &overlay(ROW_HOVER));
             }
             let folder = if row.collapsed { "folder.fill" } else { "folder" };
             draw_symbol(folder, rect(row.indent, vmid(12.0), 14.0, 12.0), text_placeholder());
@@ -673,7 +680,7 @@ impl SidebarView {
         // ---- Bottom settings row: gear + Settings + ⌘, badge (8px inset inside the container) ----
         if let Press::StyleMenu = row.kind {
             if hovered {
-                round_fill(inset, 7.0, &overlay(0.06));
+                round_fill(inset, 7.0, &overlay(ROW_HOVER));
             }
             let ip = 8.0; // inset relative to the hover container (HPAD..w-HPAD)
             let col = text_secondary(); // theme-aligned foreground
@@ -686,14 +693,14 @@ impl SidebarView {
         }
 
         // ---- Session row (Tab) ----
-        // Selection highlight is a theme-aligned neutral wash (adapts to light/dark), not a fixed accent.
-        // Kept deliberately faint: the row is already marked by its brighter label, its dot and the
-        // "⋯", so the wash only has to place them — a heavier one reads as a block of color in a
-        // sidebar that is otherwise all background.
+        // Selection highlight is a theme-aligned neutral wash (adapts to light/dark), not a fixed accent,
+        // and it is the same chip the action buttons draw. Kept deliberately faint: the row is already
+        // marked by its brighter label, its dot and the "⋯", so the wash only has to place them — a
+        // heavier one reads as a block of color in a sidebar that is otherwise all background.
         if row.selected {
-            round_fill(inset, 7.0, &overlay(0.10));
+            round_fill(inset, 7.0, &overlay(if hovered { CHIP_HOVER } else { CHIP_BG }));
         } else if hovered {
-            round_fill(inset, 7.0, &overlay(0.06));
+            round_fill(inset, 7.0, &overlay(ROW_HOVER));
         }
         // Status dot: an explicit per-tab color if set, else auto (active = green, otherwise = gray).
         // Index defensively (the dot index comes from the on-disk layout file and may be out of range).
@@ -735,15 +742,15 @@ impl SidebarView {
         let hover_left = in_row && hx < HPAD + bw + gap / 2.0;
         let hover_right = in_row && !hover_left;
 
-        // Both buttons share the same neutral low-opacity white style (no accent highlight).
-        let lbg = if hover_left { overlay(0.10) } else { overlay(0.06) };
-        round_fill(left, 7.0, &lbg);
-        round_stroke(left, 7.0, 1.0, &overlay(0.07));
+        // Both buttons share the same neutral low-opacity wash as a selected session row (no accent
+        // highlight) and carry no outline: the fill alone already lifts them off the card, and a
+        // hairline around them was the only stroke left in the list, so it read as a stray box.
+        let lbg = if hover_left { CHIP_HOVER } else { CHIP_BG };
+        round_fill(left, 7.0, &overlay(lbg));
         self.draw_btn_content(left, "plus", "Terminal", text_secondary());
 
-        let rbg = if hover_right { overlay(0.10) } else { overlay(0.06) };
-        round_fill(right, 7.0, &rbg);
-        round_stroke(right, 7.0, 1.0, &overlay(0.07));
+        let rbg = if hover_right { CHIP_HOVER } else { CHIP_BG };
+        round_fill(right, 7.0, &overlay(rbg));
         self.draw_btn_content(right, "folder", "Group", text_secondary());
     }
 
@@ -1163,15 +1170,15 @@ impl SidebarView {
         unsafe { self.setNeedsDisplay(true) };
     }
 
-    /// Draw the top search box: light box + magnifier + placeholder/query + ⌘F badge on the right; when focused, stroke it and draw the cursor.
+    /// Draw the top search box: chip fill + magnifier + placeholder/query + ⌘F badge on the right; when focused, stroke it and draw the cursor.
     fn draw_search(&self, row: &Row, w: f64, query: &str, searching: bool) {
         let box_rect = rect(HPAD, row.top, w - 2.0 * HPAD, row.h);
-        round_fill(box_rect, 7.0, &overlay(0.06));
-        // Inner stroke (accent color when focused, otherwise very faint white).
+        round_fill(box_rect, 7.0, &overlay(CHIP_BG));
+        // No resting outline — the chip fill is what marks the field, same as the action buttons
+        // below it. The accent stroke stays, because focus needs a mark of its own: the caret alone
+        // is easy to miss on an empty box.
         if searching {
             round_stroke(box_rect, 7.0, 1.0, &rgba(ACCENT_ICON.0, ACCENT_ICON.1, ACCENT_ICON.2, 0.7));
-        } else {
-            round_stroke(box_rect, 7.0, 1.0, &overlay(0.05));
         }
         // Magnifier SF icon on the left.
         draw_symbol("magnifyingglass", rect(HPAD + 9.0, row.top + (row.h - 13.0) / 2.0, 13.0, 13.0), text_placeholder());

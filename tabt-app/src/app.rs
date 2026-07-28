@@ -207,9 +207,8 @@ impl AppController {
         self.sidebar_right.get()
     }
 
-    /// Distance from the window's top edge to the centerline the traffic lights (and the collapse
-    /// Centerline the top strip sits on — traffic lights, collapse toggle, and header title all
-    /// share it, so the row reads as one line.
+    /// Centerline the top strip sits on, as a distance from the window's top edge — traffic lights,
+    /// collapse toggle, and header title all share it, so the row reads as one line.
     ///
     /// Measured for the card, which starts CARD_INSET below the window's top edge: this centers
     /// the cluster in the part of the band the card actually covers, instead of letting it ride
@@ -217,6 +216,14 @@ impl AppController {
     /// currently showing — see [`Self::reposition_traffic_lights`].
     fn titlebar_center_y(&self) -> f64 {
         (CARD_INSET + HEADER_H) / 2.0
+    }
+
+    /// x of the right edge of the traffic-light cluster, in window coordinates. AppKit lays the
+    /// three buttons out to about 72pt from the window's left edge, and
+    /// [`Self::reposition_traffic_lights`] then shifts the whole cluster right by CARD_INSET —
+    /// anything that has to sit clear of them has to follow the same shift, so both come from here.
+    fn lights_right_x(&self) -> f64 {
+        72.0 + CARD_INSET
     }
 
     /// Move the traffic-light buttons onto [`Self::titlebar_center_y`], shifted right by the
@@ -343,11 +350,13 @@ impl AppController {
             NSPoint::new(if right { fw - CARD_INSET - w } else { CARD_INSET }, CARD_INSET),
             NSSize::new(w, (fh - 2.0 * CARD_INSET).max(0.0)),
         );
-        // Collapsed, the card is parked just past the window edge it docks to rather than hidden:
-        // an off-screen frame is what `toggle_sidebar` slides it to and from, and the window clips
-        // it there just as effectively as `setHidden:` would.
+        // Collapsed, the card is parked past the window edge it docks to rather than hidden: an
+        // off-screen frame is what `toggle_sidebar` slides it to and from, and the window clips it
+        // there just as effectively as `setHidden:` would. Far enough out to take the card's shadow
+        // with it — parked flush, the blur's tail stays behind as a smudge down the window edge.
+        let off = w + CARD_INSET + card::SHADOW_REACH;
         let parked = NSRect::new(
-            NSPoint::new(if right { fw + CARD_INSET } else { -(w + CARD_INSET) }, card.origin.y),
+            NSPoint::new(if right { fw + CARD_INSET + card::SHADOW_REACH } else { -off }, card.origin.y),
             card.size,
         );
         unsafe {
@@ -383,14 +392,14 @@ impl AppController {
             let (tw, th) = (TOGGLE_W + 12.0, TOGGLE_W);
             let icon = 17.0; // toggle glyph size (see toggle.rs); centered within the button
             let icon_pad = (tw - icon) / 2.0;
+            let gap = 14.0;
             let (tx, title_inset) = if self.collapsed.get() {
-                let gap = 14.0;
-                let icon_left = 72.0 + gap; // 72 ≈ right edge of the traffic lights
+                let icon_left = self.lights_right_x() + gap;
                 (icon_left - icon_pad, icon_left + icon + gap)
             } else if right {
                 // Sidebar docked right: the terminal is on the left, so the traffic lights sit at
                 // the window's top-left over the header — the title must clear them.
-                (card.origin.x + 8.0, 72.0 + 14.0)
+                (card.origin.x + 8.0, self.lights_right_x() + gap)
             } else {
                 (card.origin.x + w - tw - 8.0, 16.0)
             };
@@ -532,6 +541,13 @@ impl AppController {
                 return;
             }
             m.active = Some(id);
+            // A collapsed group hides its tabs, so the tab just made active would have no row in
+            // the sidebar and keystrokes would go to a terminal nothing marks as selected. The rule
+            // lives here rather than at the callers because every path that activates a tab — new
+            // tab, sidebar click, restoring the persisted selection — goes through this one.
+            if let Some(g) = m.groups.iter_mut().find(|g| g.tabs.contains(&id)) {
+                g.collapsed = false;
+            }
         }
         self.layout_active();
         self.refresh_sidebar();
@@ -644,14 +660,7 @@ impl AppController {
                 if let Some((active_id, _, _)) = anchor {
                     self.place_tab_after(group, id, active_id);
                 }
-                // Same rule as the group menu's "New Terminal": the new tab is selected, so its
-                // group must be expanded or the active terminal would have no visible row.
-                if let Some(gi) = group {
-                    if let Some(g) = self.model.borrow_mut().groups.get_mut(gi) {
-                        g.collapsed = false;
-                    }
-                }
-                self.select(id);
+                self.select(id); // expands the tab's group if it was collapsed
                 self.save();
                 self.refresh_sidebar();
             }
@@ -680,12 +689,7 @@ impl AppController {
         let n = self.model.borrow().next_id;
         match self.spawn_tab(Some(gi), format!("Terminal {}", n), &cwd, 0, false) {
             Some(id) => {
-                // A collapsed group hides its tabs, so the new (and now active) terminal would have
-                // no row in the sidebar: expand the group so it is visible where it was created.
-                if let Some(g) = self.model.borrow_mut().groups.get_mut(gi) {
-                    g.collapsed = false;
-                }
-                self.select(id);
+                self.select(id); // expands `gi` if it was collapsed, so the new row is visible
                 self.save();
                 self.refresh_sidebar();
             }
