@@ -84,3 +84,16 @@ let icon = NSWorkspace.shared.icon(forFile: path)   // what Finder & Dock draw
 - `make` does `rm -rf "dist/TabT Dev.app"` and recreates it. Don't stash anything in there.
 - `bundle/AppIcon.icns` is committed, so the icon rebuild is a manual step. If
   you change `tabt.png`, run this skill or the bundle keeps the old icon.
+- `logo.png` (the README header) is the *other* committed derivative of
+  `tabt.png`, and nothing rebuilds it either. Regenerate it alongside the icns:
+
+  ```bash
+  sips -z 128 128 tabt.png --out logo.png
+  ```
+
+  128 is deliberate, not a round number: the art is pixel art, so the only safe
+  reductions are integer ratios (256 -> 128 maps each output pixel to exactly
+  2x2 input ones). Scaling to the 120 the README's old `<img width>` used would
+  resample across pixel boundaries and visibly mush the sprite. The README uses
+  markdown image syntax, which has no width attribute, so the file's pixel size
+  *is* its display size — that is why the source can't simply be linked directly.

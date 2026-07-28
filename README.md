@@ -1,4 +1,4 @@
-![TabT logo](tabt.png)
+![TabT logo: a pixel-art ginger cat](logo.png)
 
 # TabT
 
