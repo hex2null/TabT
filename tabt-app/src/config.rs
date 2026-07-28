@@ -12,7 +12,7 @@
 //!
 //! ```ini
 //! [settings]
-//! style = Default
+//! style = One Dark
 //! font_family = Menlo
 //! font_size = 13
 //! sidebar_width = 200
@@ -90,10 +90,10 @@ enum Section {
 /// Load the layout; if the file is missing or empty, provide a default group + a single tab.
 pub fn load() -> Layout {
     let text = fs::read_to_string(file()).unwrap_or_default();
-    let mut style = "Default".to_string();
+    let mut style = crate::theme::DEFAULT_NAME.to_string();
     let mut font_family = crate::settings::DEFAULT_FAMILY.to_string();
     let mut font_size = crate::settings::DEFAULT_SIZE;
-    let mut sidebar_w = 232.0;
+    let mut sidebar_w = crate::sidebar::SIDEBAR_W;
     let mut sidebar_right = false;
     let mut show_border = false;
     let mut window_w = 0.0;

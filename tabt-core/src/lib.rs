@@ -10,7 +10,8 @@
 //!   - scroll region DECSTBM and IND/RI/NEL, SU/SD;
 //!   - save/restore cursor DECSC/DECRC and CSI s/u;
 //!   - DEC private modes `?…h/l` (autowrap, cursor visibility, alt screen, app cursor keys) are
-//!     applied; bracketed paste (2004) is tracked via `bracketed_paste()` for the input layer;
+//!     applied; bracketed paste (2004), alternate scroll (1007) and mouse tracking (1000/1002/1003)
+//!     are tracked for the input layer via `bracketed_paste()` / `alt_scroll_keys()`;
 //!     others are acknowledged and swallowed, no longer leaking out as literal text;
 //!   - OSC title (`]0;…`) collected into `title`;
 //!   - OSC 7 cwd reporting, percent-decoded;
@@ -156,6 +157,12 @@ pub struct Grid {
     // Rows are trimmed of trailing blank cells; `view_cell` substitutes BLANK past a row's end.
     // The alt screen never contributes here (vim/less redraw themselves; their scrolling is not history).
     history: VecDeque<Vec<Cell>>,
+    // Total number of lines that have ever scrolled off the top, *including* those since evicted
+    // from the capped deque. Monotonic — it is what makes `buf_cell`'s coordinates stable: the
+    // deque's own indices shift down by one on every eviction at HISTORY_MAX, so a coordinate
+    // stored by the caller (the mouse selection) would silently slide onto other text.
+    // `history[i]` is absolute row `scrolled - history.len() + i`; screen row `r` is `scrolled + r`.
+    scrolled: usize,
     // How many lines the viewport is scrolled back from the live bottom. 0 = following the output.
     // Always <= history.len().
     view_offset: usize,
@@ -168,6 +175,15 @@ pub struct Grid {
     // DECSET 2004: bracketed paste. When on, the caller should wrap pasted text in
     // ESC[200~ ... ESC[201~ so the program can tell it apart from typed keystrokes.
     bracketed_paste: bool,
+    // DECSET 1007: alternate scroll. The alt screen has no scrollback of its own, so while it is
+    // active the input layer turns wheel/trackpad scrolling into cursor-key presses instead —
+    // otherwise the wheel is dead in every full-screen app (less, vim, TUIs). On by default, as in
+    // most modern terminals; an application can turn it off with CSI ? 1007 l.
+    alt_scroll: bool,
+    // DECSET 1000/1002/1003: mouse tracking. This layer has no mouse reporting of its own, but the
+    // input layer must know when an application asked for it: it then wants real mouse events, and
+    // synthesizing cursor keys for the wheel would feed it keystrokes it never asked for.
+    mouse_report: bool,
 
     // ---- Window title received via OSC ----
     pub title: String,
@@ -209,11 +225,14 @@ impl Grid {
             scroll_top: 0,
             scroll_bot: rows.saturating_sub(1),
             history: VecDeque::new(),
+            scrolled: 0,
             view_offset: 0,
             autowrap: true,
             cursor_visible: true,
             app_cursor_keys: false,
             bracketed_paste: false,
+            alt_scroll: true,
+            mouse_report: false,
             title: String::new(),
             cwd: String::new(),
             replies: Vec::new(),
@@ -256,6 +275,54 @@ impl Grid {
     /// Number of lines retained in the scrollback.
     pub fn history_len(&self) -> usize {
         self.history.len()
+    }
+
+    /// First virtual-buffer row still retained: rows below this scrolled off and were evicted from
+    /// the capped history.
+    pub fn buf_top(&self) -> usize {
+        // `history` only ever grows in `scroll_line_into_history`, which bumps `scrolled` in the
+        // same breath, so it can never outrun it. Worth asserting: this subtraction runs on every
+        // `buf_cell` (so on every frame with a live selection), and the release profile is
+        // `panic = "abort"` — an underflow here would take the whole app down, not just the
+        // selection. A new push site that forgets the counter trips this in debug builds.
+        debug_assert!(self.scrolled >= self.history.len());
+        self.scrolled - self.history.len()
+    }
+
+    /// One past the last virtual-buffer row (the bottom screen row is `buf_end() - 1`).
+    pub fn buf_end(&self) -> usize {
+        self.scrolled + self.rows
+    }
+
+    /// The virtual-buffer row currently at the top of the viewport. The renderer and the mouse
+    /// selection both need it to convert between the two coordinate spaces, and deriving it here
+    /// keeps that one expression from being open-coded at every call site.
+    pub fn view_base(&self) -> usize {
+        self.scrolled - self.view_offset
+    }
+
+    /// The cell at a virtual-buffer row. Rows are *absolute*: counted from the first line ever
+    /// printed, not from the head of the deque, so they stay attached to their text no matter how
+    /// much history is later evicted or cleared. `buf_top()..scrolled` are scrollback lines and
+    /// `scrolled..buf_end()` the screen rows. This is the viewport-independent counterpart of
+    /// `view_cell`, for state that must survive the viewport moving (the mouse selection).
+    ///
+    /// `buf_cell(col, view_base() + row) == view_cell(col, row)` for every visible `row`.
+    /// Coordinates outside the buffer — evicted below, past the screen above — read as blank
+    /// rather than panicking, so a selection left over from before a reflow, an eviction or an ED3
+    /// can never take the process down.
+    pub fn buf_cell(&self, col: usize, row: usize) -> &Cell {
+        if col >= self.cols || row < self.buf_top() {
+            return &BLANK;
+        }
+        if row < self.scrolled {
+            return self.history[row - self.buf_top()].get(col).unwrap_or(&BLANK);
+        }
+        let r = row - self.scrolled;
+        if r >= self.rows {
+            return &BLANK;
+        }
+        self.cell(col, r)
     }
 
     /// How many lines the viewport is scrolled back from the live bottom (0 = following output).
@@ -310,6 +377,42 @@ impl Grid {
     /// wrap a paste in `ESC[200~ ... ESC[201~`.
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Whether the alternate screen is active (a full-screen application is running).
+    pub fn alt_screen(&self) -> bool {
+        self.alt
+    }
+
+    /// Whether an application asked for mouse tracking (DECSET 1000/1002/1003). Nothing acts on
+    /// this yet — it is the hook for real mouse reporting; see `alt_scroll_keys`.
+    pub fn mouse_report(&self) -> bool {
+        self.mouse_report
+    }
+
+    /// The byte sequence a wheel scroll of `lines` should send while the alternate screen is up,
+    /// or `None` when the wheel must not be translated (main screen, or DECSET 1007 turned off).
+    ///
+    /// Positive `lines` means scrolling back toward older output, i.e. cursor up. The count is
+    /// capped at one screenful so a fast flick cannot flood the shell with keystrokes.
+    ///
+    /// Note that `mouse_report` is deliberately *not* consulted. Terminals that suppress alternate
+    /// scroll under mouse tracking do so because they send the wheel as a mouse report instead;
+    /// this layer has no mouse reporting at all, so suppressing here would leave the application
+    /// with nothing — a dead wheel in every TUI that turns tracking on. Add the check together with
+    /// real mouse reports, not before.
+    pub fn alt_scroll_keys(&self, lines: isize) -> Option<Vec<u8>> {
+        if !self.alt || !self.alt_scroll || lines == 0 {
+            return None;
+        }
+        let seq: &[u8] = match (lines > 0, self.app_cursor_keys) {
+            (true, true) => b"\x1bOA",
+            (true, false) => b"\x1b[A",
+            (false, true) => b"\x1bOB",
+            (false, false) => b"\x1b[B",
+        };
+        let n = (lines.unsigned_abs()).min(self.rows);
+        Some(seq.repeat(n))
     }
 
     /// Feed bytes: advance the parsing state machine one byte at a time.
@@ -817,6 +920,7 @@ impl Grid {
             self.history.pop_front();
         }
         self.history.push_back(row[..end].to_vec());
+        self.scrolled += 1;
         if self.view_offset > 0 {
             self.view_offset = (self.view_offset + 1).min(self.history.len());
         }
@@ -1050,6 +1154,8 @@ impl Grid {
                             }
                         }
                     }
+                    1000 | 1002 | 1003 => self.mouse_report = set, // mouse tracking (see `mouse_report`)
+                    1007 => self.alt_scroll = set,                 // alternate scroll
                     2004 => self.bracketed_paste = set,
                     _ => {} // other private modes: acknowledged and ignored
                 }
@@ -1163,6 +1269,8 @@ impl Grid {
         self.autowrap = true;
         self.cursor_visible = true;
         self.app_cursor_keys = false;
+        self.alt_scroll = true;
+        self.mouse_report = false;
         self.state = State::Ground;
         self.params.clear();
         self.csi_cur = 0;
@@ -1392,6 +1500,122 @@ mod tests {
         assert_eq!(g.view_offset(), HISTORY_MAX);
         assert_eq!(g.history_len(), HISTORY_MAX);
         let _ = view_lines(&g); // must not panic on the evicted front
+    }
+
+    #[test]
+    fn alt_scroll_translates_the_wheel_into_cursor_keys() {
+        let mut g = Grid::new(4, 3);
+        g.feed(b"1\r\n2\r\n3\r\n4"); // some scrollback on the main screen
+
+        // Main screen: the viewport scrolls, so the wheel must not be translated.
+        assert!(!g.alt_screen());
+        assert_eq!(g.alt_scroll_keys(1), None);
+
+        // Alt screen: no scrollback of its own, so the wheel becomes cursor keys.
+        g.feed(b"\x1b[?1049h");
+        assert!(g.alt_screen());
+        assert_eq!(g.alt_scroll_keys(2), Some(b"\x1b[A\x1b[A".to_vec()));
+        assert_eq!(g.alt_scroll_keys(-1), Some(b"\x1b[B".to_vec()));
+        assert_eq!(g.alt_scroll_keys(0), None);
+        // Never more than a screenful of keystrokes per event.
+        assert_eq!(g.alt_scroll_keys(50).unwrap().len(), 3 * b"\x1b[A".len());
+
+        // DECCKM picks the application-mode prefix, exactly like the arrow keys themselves.
+        g.feed(b"\x1b[?1h");
+        assert_eq!(g.alt_scroll_keys(1), Some(b"\x1bOA".to_vec()));
+        g.feed(b"\x1b[?1l");
+
+        // An application that turns 1007 off gets nothing; one that turns it back on gets keys again.
+        g.feed(b"\x1b[?1007l");
+        assert_eq!(g.alt_scroll_keys(1), None);
+        g.feed(b"\x1b[?1007h");
+        assert_eq!(g.alt_scroll_keys(1), Some(b"\x1b[A".to_vec()));
+
+        // Mouse tracking is tracked but must NOT suppress the translation while this layer has no
+        // mouse reports to send in its place (see `alt_scroll_keys`) — that would be a dead wheel.
+        g.feed(b"\x1b[?1000h");
+        assert!(g.mouse_report());
+        assert_eq!(g.alt_scroll_keys(1), Some(b"\x1b[A".to_vec()));
+        g.feed(b"\x1b[?1000l");
+        assert!(!g.mouse_report());
+
+        // Back on the main screen the viewport takes over again.
+        g.feed(b"\x1b[?1049l");
+        assert_eq!(g.alt_scroll_keys(1), None);
+    }
+
+    #[test]
+    fn buf_cell_matches_the_viewport_at_every_offset() {
+        let mut g = Grid::new(3, 2);
+        g.feed(b"1\r\n2\r\n3\r\n4\r\n5"); // three lines in history, "4"/"5" on screen
+
+        // The identity the selection relies on: a virtual-buffer coordinate resolves to the same
+        // cell as the viewport coordinate it is currently displayed at, whatever the offset is.
+        for off in 0..=g.history_len() {
+            g.scroll_to_bottom();
+            g.scroll_view(off as isize);
+            for r in 0..g.rows {
+                for c in 0..g.cols {
+                    assert_eq!(
+                        g.buf_cell(c, g.view_base() + r),
+                        g.view_cell(c, r),
+                        "offset {off}, cell ({c},{r})"
+                    );
+                }
+            }
+        }
+
+        // Out of range in either axis reads as blank instead of panicking.
+        assert_eq!(g.buf_cell(0, g.buf_end()), &BLANK);
+        assert_eq!(g.buf_cell(0, g.buf_end() + 100), &BLANK);
+        assert_eq!(g.buf_cell(99, g.buf_end() - 1), &BLANK);
+        assert_eq!(g.buf_cell(99, g.buf_top()), &BLANK); // past the end of a trimmed history line
+    }
+
+    /// The bug the absolute coordinates exist to prevent: at HISTORY_MAX every new line evicts one
+    /// from the front, so a deque-relative row would slide onto different text once per line.
+    #[test]
+    fn buf_cell_coordinates_survive_history_eviction() {
+        const LINES: usize = HISTORY_MAX + 10;
+        let mut g = Grid::new(10, 2);
+        for i in 0..LINES {
+            g.feed(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(g.history_len(), HISTORY_MAX, "history must be at the cap for this to bite");
+
+        // Pin a coordinate to a known line, then push enough output to evict a chunk of the front.
+        let row = g.buf_end() - 3; // the newest line that has scrolled off
+        let read = |g: &Grid, row| (0..10).map(|c| g.buf_cell(c, row).ch).collect::<String>();
+        let text = read(&g, row);
+        assert_eq!(text.trim_end(), format!("line{}", LINES - 2));
+        for i in 0..100 {
+            g.feed(format!("more{i}\r\n").as_bytes());
+        }
+        assert_eq!(read(&g, row), text, "the coordinate must still name the line it was taken from");
+
+        // Rows evicted out of the deque read as blank rather than as whatever slid into their slot.
+        assert!(g.buf_top() > 0);
+        assert_eq!(g.buf_cell(0, g.buf_top() - 1), &BLANK);
+    }
+
+    /// ED3 (`clear`) drops the whole scrollback. `scrolled` is monotonic, so the screen keeps its
+    /// coordinates across it — a deque-relative row would have every stored coordinate jump by the
+    /// discarded `history_len()` at once, which is the fast way to reproduce the drift.
+    #[test]
+    fn erasing_the_scrollback_keeps_the_screen_rows_addressable() {
+        let mut g = Grid::new(4, 2);
+        g.feed(b"1\r\n2\r\n3\r\n4"); // "1"/"2" scrolled off, "3"/"4" on screen
+        let base = g.view_base();
+        assert_eq!(g.buf_cell(0, base + 1).ch, '4');
+
+        // ED3 blanks the screen as well as the history, so the row goes blank — but it must still
+        // *be* that row, not fall out of the buffer and resolve somewhere else.
+        g.feed(b"\x1b[3J");
+        assert_eq!(g.history_len(), 0);
+        assert_eq!(g.view_base(), base, "the viewport's top row must not move");
+        assert_eq!(g.buf_top(), base, "the dropped scrollback is simply no longer retained");
+        g.feed(b"\x1b[HX");
+        assert_eq!(g.buf_cell(0, base).ch, 'X');
     }
 
     #[test]

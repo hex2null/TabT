@@ -11,6 +11,7 @@
 
 mod app;
 mod branding;
+mod card;
 mod config;
 mod divider;
 mod header;
@@ -31,6 +32,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
+use card::{CARD_GAP, CARD_INSET};
 use divider::DIVIDER_W;
 use sidebar::{SidebarView, SIDEBAR_W};
 use toggle::{ToggleButton, TOGGLE_W};
@@ -90,11 +92,19 @@ fn main() {
     // ---- Layout: container = left sidebar + right terminal host ----
     let container: objc2::rc::Retained<NSView> = unsafe { NSView::initWithFrame(mtm.alloc(), rect) };
 
-    let sidebar_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(SIDEBAR_W, CONTENT_H));
-    let sidebar = SidebarView::new(mtm, sidebar_frame);
+    // The sidebar is a floating rounded card inset from the window edges; the terminal host runs
+    // from the card's far edge to the window edge. `AppController::relayout` owns both frames from
+    // here on — these initial ones only have to be self-consistent.
+    let card_frame = NSRect::new(
+        NSPoint::new(CARD_INSET, CARD_INSET),
+        NSSize::new(SIDEBAR_W, CONTENT_H - 2.0 * CARD_INSET),
+    );
+    let sidebar = SidebarView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), card_frame.size));
+    let card = card::new(mtm, card_frame, &sidebar);
+    let host_x = CARD_INSET + SIDEBAR_W + CARD_GAP;
     let host_frame = NSRect::new(
-        NSPoint::new(SIDEBAR_W, 0.0),
-        NSSize::new(CONTENT_W - SIDEBAR_W, CONTENT_H),
+        NSPoint::new(host_x, 0.0),
+        NSSize::new(CONTENT_W - host_x, CONTENT_H),
     );
     let host: objc2::rc::Retained<NSView> = unsafe { NSView::initWithFrame(mtm.alloc(), host_frame) };
 
@@ -112,8 +122,9 @@ fn main() {
     let toggle_btn = ToggleButton::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(TOGGLE_W + 12.0, TOGGLE_W)));
 
     unsafe {
-        // Sidebar: fixed width, pinned left, resizes with height.
-        sidebar.setAutoresizingMask(
+        // Sidebar card: fixed width, pinned left, resizes with height (the sidebar view inside it
+        // fills the card, so it needs no mask of its own — `card::new` sets that).
+        card.setAutoresizingMask(
             NSAutoresizingMaskOptions::NSViewHeightSizable
                 | NSAutoresizingMaskOptions::NSViewMaxXMargin,
         );
@@ -131,8 +142,12 @@ fn main() {
         toggle_btn.setAutoresizingMask(
             NSAutoresizingMaskOptions::NSViewMinYMargin | NSAutoresizingMaskOptions::NSViewMaxXMargin,
         );
-        container.addSubview(&sidebar);
+        // Host first, card above it. Both the terminal and the header fill their whole rect, so with
+        // the card underneath the host would clip the card's shadow where it reaches past the
+        // CARD_GAP gutter — the gradient would end in a hard line — and would cover the card
+        // outright for the whole collapse slide, which is why only the expand used to animate.
         container.addSubview(&host);
+        container.addSubview(&card);
         container.addSubview(&divider); // above the seam, takes over dragging
         container.addSubview(&toggle_btn); // topmost, floats in the title-bar zone
     }
@@ -143,6 +158,7 @@ fn main() {
         mtm,
         window.clone(),
         sidebar.clone(),
+        card.clone(),
         host.clone(),
         toggle_btn.clone(),
         divider.clone(),
