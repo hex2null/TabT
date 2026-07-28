@@ -19,7 +19,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-APP=TabT.app
+APP=dist/TabT.app
+ITEM=$(basename "$APP")   # the name inside the image, which is what the records are keyed by
 VOLNAME="TabT dsstore authoring"
 OUT=bundle/dmg-DS_Store
 
@@ -42,7 +43,7 @@ cleanup() {
 trap cleanup EXIT
 
 # A writable image, because Finder has to be able to write the .DS_Store we are here to harvest.
-ditto "$APP" "$STAGE/$APP"
+ditto "$APP" "$STAGE/$ITEM"
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov -quiet "$IMG"
 hdiutil attach "$IMG" -quiet
@@ -61,7 +62,7 @@ tell application "Finder"
         set icon size of opts to $ICON_SIZE
         set text size of opts to 12
         set label position of opts to bottom
-        set position of item "$APP" of container window to {$APP_POS_X, $APP_POS_Y}
+        set position of item "$ITEM" of container window to {$APP_POS_X, $APP_POS_Y}
         set position of item "Applications" of container window to {$LINK_POS_X, $LINK_POS_Y}
         update without registering applications
         delay 1

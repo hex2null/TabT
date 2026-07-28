@@ -1,7 +1,7 @@
 # 用法:
-#   make            # 编译 + 打包开发版 "TabT Dev.app" + 签名
+#   make            # 编译 + 打包开发版 "dist/TabT Dev.app" + 签名
 #   make run        # 打包并启动开发版
-#   make release    # 打包正式版 TabT.app(名称 / bundle id / 配置目录都用发布身份)
+#   make release    # 打包正式版 dist/TabT.app(名称 / bundle id / 配置目录都用发布身份)
 #   make dmg        # 用正式版构建安装镜像 dist/TabT-<version>.dmg
 #   make cert       # 一次性创建本地稳定签名身份(见下方 CERT_NAME),让 TCC 授权跨重新编译保留
 #   make echo       # 跑第 1 步的 PTY 回声环(在当前终端里)
@@ -20,7 +20,10 @@ BUNDLE_ID  ?= dev.local.tabt.dev
 CONFIG_DIR ?= .tabt-dev
 EXEC       ?= tabt-dev
 
-APP       := $(APP_NAME).app
+# Both bundles are build output, so they land in dist/ next to the disk images rather than in
+# the repository root. `dist/` is hardcoded, not a variable: `bundle:` starts with
+# `rm -rf "$(APP)"`, and an accidentally empty DISTDIR would point that at the filesystem root.
+APP       := dist/$(APP_NAME).app
 BIN       := target/release/tabt
 BUNDLE    := $(APP)/Contents
 CERT_NAME := TabT Dev
@@ -70,7 +73,7 @@ release:
 # Drag-to-Applications disk image, always built from the release identity. Set SIGN_ID /
 # NOTARY_PROFILE (see bundle/make-dmg.sh) to produce one that Gatekeeper accepts on other Macs.
 dmg: release
-	APP=TabT.app bash bundle/make-dmg.sh
+	APP=dist/TabT.app bash bundle/make-dmg.sh
 
 # These pass the same identity as `build` so alternating with `make run` doesn't flip
 # TABT_APP_NAME/TABT_CONFIG_DIR and force a full relink of tabt-app every time.
@@ -83,6 +86,8 @@ test:
 bloat:
 	TABT_APP_NAME="$(APP_NAME)" TABT_CONFIG_DIR="$(CONFIG_DIR)" cargo bloat --release --bin tabt -n 20
 
+# Removes both bundles but keeps dist/*.dmg: the images are the shippable output, and rebuilding
+# one means re-running the whole release+notarization path.
 clean:
 	cargo clean
-	rm -rf "$(APP)" TabT.app
+	rm -rf "$(APP)" dist/TabT.app

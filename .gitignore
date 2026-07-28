@@ -2,11 +2,8 @@
 /target/
 *.rs.bk
 
-# Built app bundles (`make release` produces TabT.app, `make`/`make run` the dev-named one)
-/TabT.app/
-/TabT Dev.app/
-
-# Installer disk images (produced by `make dmg`, or with OUTDIR pointed elsewhere)
+# Build output: the app bundles (`make release` produces dist/TabT.app, `make`/`make run` the
+# dev-named one) and the installer disk images (`make dmg`, or with OUTDIR pointed elsewhere)
 /dist/
 *.dmg
 

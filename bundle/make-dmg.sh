@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build a distributable disk image from an already-built TabT.app.
+# Build a distributable disk image from an already-built dist/TabT.app.
 #
 # Produces `dist/TabT-<version>.dmg`: a compressed (UDZO) read-only image containing the app
 # next to a symlink to /Applications, i.e. the standard "drag the icon onto the folder" macOS
@@ -21,7 +21,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-APP=${APP:-TabT.app}   # release identity; `make dmg` passes it explicitly
+APP=${APP:-dist/TabT.app}   # release identity; `make dmg` passes it explicitly
 OUTDIR=${OUTDIR:-dist}
 SIGN_ID=${SIGN_ID:-}
 NOTARY_PROFILE=${NOTARY_PROFILE:-}

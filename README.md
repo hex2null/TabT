@@ -34,7 +34,8 @@ git clone https://github.com/hex2null/TabT.git tabt && cd tabt
 make run
 ```
 
-This builds a release binary, bundles it into `TabT.app`, ad-hoc code-signs it, and launches it.
+This builds a release binary, bundles it into `dist/TabT Dev.app`, code-signs it, and launches it.
+`make release` produces the shipping identity, `dist/TabT.app`.
 
 ## Keyboard shortcuts
 
@@ -56,7 +57,7 @@ runs and tests on any platform) and `tabt-app` (the AppKit UI layer via `objc2`,
 
 ```sh
 make test    # tabt-core unit tests
-make run     # build, bundle, and launch TabT.app
+make run     # build, bundle into dist/, and launch the app
 make echo    # standalone PTY echo loop, a debugging tool; run in a real terminal, not an IDE panel
 make bloat   # binary size audit (needs `cargo install cargo-bloat`)
 make clean   # remove build artifacts
