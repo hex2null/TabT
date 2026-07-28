@@ -8,7 +8,7 @@ description: Regenerate the macOS app icon (bundle/AppIcon.icns) from tabt.png. 
 ```bash
 .claude/skills/app-icon/make-icon.sh                    # tabt.png -> bundle/AppIcon.icns
 .claude/skills/app-icon/make-icon.sh art.png out.icns   # explicit paths
-make                                                    # re-bundle so TabT.app picks it up
+make                                                    # re-bundle so the app picks it up
 ```
 
 The script is the source of truth. Everything below is *why* it does what it
@@ -80,7 +80,7 @@ let icon = NSWorkspace.shared.icon(forFile: path)   // what Finder & Dock draw
 - The Dock/Finder icon cache is keyed by **bundle id**, not by file contents.
   Two bundles with identical artwork render differently if one was launched
   earlier under a stale icon. Test icon changes in a throwaway bundle with a
-  fresh `CFBundleIdentifier`, not by relaunching `TabT.app`.
-- `make` does `rm -rf TabT.app` and recreates it. Don't stash anything in there.
+  fresh `CFBundleIdentifier`, not by relaunching the built app.
+- `make` does `rm -rf "dist/TabT Dev.app"` and recreates it. Don't stash anything in there.
 - `bundle/AppIcon.icns` is committed, so the icon rebuild is a manual step. If
   you change `tabt.png`, run this skill or the bundle keeps the old icon.

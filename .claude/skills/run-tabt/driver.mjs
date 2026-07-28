@@ -25,11 +25,23 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const APP_BIN = join(REPO, 'TabT.app/Contents/MacOS/tabt');
+// Either build identity will do: we spawn the executable directly, so nothing here depends on
+// the bundle id or the app name. The dev bundle comes first because `make` is the default
+// target. Each identity is a *pair* though -- it names its executable and its config directory
+// differently (see the identity table in CLAUDE.md) -- so the config dir has to be taken from
+// whichever bundle we ended up with, not hardcoded, or the layout assertions below read a path
+// the app never writes.
+const APP_BUILDS = [
+  { bin: join(REPO, 'dist/TabT Dev.app/Contents/MacOS/tabt-dev'), configDir: '.tabt-dev' },
+  { bin: join(REPO, 'dist/TabT.app/Contents/MacOS/tabt'), configDir: '.tabt' },
+];
+const BUILD = APP_BUILDS.find((b) => existsSync(b.bin)) ?? APP_BUILDS[0];
+const APP_BIN = BUILD.bin;
 const HOME = join(process.env.TMPDIR || '/tmp', 'tabt-driver-home');
 const PROOF = join(HOME, 'proof');
 const PIDFILE = join(HOME, 'tabt.pid');
 const MARKER_CWD = join(HOME, 'marker-cwd');
+const CONF = join(HOME, BUILD.configDir, 'layout.conf');
 
 const log = (...a) => console.log(...a);
 
@@ -64,9 +76,10 @@ function killOurs(pid) {
 }
 
 // ---------------------------------------------------------------------------
-// The fixture $HOME. TabT reads $HOME/.tabt/layout.conf (config.rs `dir()`), and the
-// login zsh it spawns reads $HOME/.zshrc -- so one env var isolates the app's config
-// from the real ~/.tabt AND gives us our hook inside the tab.
+// The fixture $HOME. TabT reads $HOME/<config dir>/layout.conf (config.rs `dir()`, the
+// directory itself coming from branding.rs), and the login zsh it spawns reads $HOME/.zshrc
+// -- so one env var isolates the app's config from the real one AND gives us our hook
+// inside the tab.
 // ---------------------------------------------------------------------------
 // NOTE: String.raw stops backslash escapes being eaten by JS, but it does NOT stop
 // ${...} interpolation -- so this shell code must avoid ${...} entirely. That is why
@@ -128,7 +141,11 @@ function setupHome() {
 
 function launch({ fresh = true } = {}) {
   if (!existsSync(APP_BIN)) {
-    throw new Error(`missing ${APP_BIN} -- run \`make\` first (NOT \`make run\`, see SKILL.md)`);
+    throw new Error(
+      `no built app bundle found -- run \`make\` first (NOT \`make run\`: it killalls by\n` +
+      `executable name, which would take down a TabT window hosting this session).\n` +
+      `Looked for:\n${APP_BUILDS.map((b) => `  ${b.bin}`).join('\n')}`,
+    );
   }
   if (fresh) setupHome();
   const child = spawn(APP_BIN, [], {
@@ -171,7 +188,7 @@ async function smoke() {
 
   log(`repo:   ${REPO}`);
   log(`app:    ${APP_BIN}`);
-  log(`HOME:   ${HOME}  (isolated; your real ~/.tabt is untouched)`);
+  log(`HOME:   ${HOME}  (isolated; your real ~/${BUILD.configDir} is untouched)`);
   log('');
 
   const child = launch();
@@ -192,10 +209,9 @@ async function smoke() {
     const da = readReply(join(PROOF, 'da.txt'));
     check('device attributes reply', /^ESC\[\?\d/.test(da), JSON.stringify(da));
 
-    // The app persists layout (incl. OSC 7 cwd) to $HOME/.tabt/layout.conf.
-    const conf = join(HOME, '.tabt/layout.conf');
-    const confExists = await waitFor(conf, 3000);
-    check('wrote layout.conf under the scratch HOME', confExists, conf);
+    // The app persists layout (incl. OSC 7 cwd) to $HOME/<config dir>/layout.conf.
+    const confExists = await waitFor(CONF, 3000);
+    check('wrote layout.conf under the scratch HOME', confExists, CONF);
 
     const alive = (() => { try { process.kill(child.pid, 0); return true; } catch { return false; } })();
     check('app still running (no crash)', alive);
@@ -215,7 +231,10 @@ async function smoke() {
   mkdirSync(MARKER_CWD, { recursive: true });
   rmSync(join(PROOF, 'boot.txt'), { force: true });
   rmSync(join(PROOF, 'ready.txt'), { force: true });
-  writeFileSync(join(HOME, '.tabt/layout.conf'),
+  // Phase 1 only reaches here if the app already created the directory, but `launch({fresh:true})`
+  // wipes $HOME, so seed it unconditionally rather than depending on that ordering.
+  mkdirSync(dirname(CONF), { recursive: true });
+  writeFileSync(CONF,
     `[settings]\nstyle = Default\n\n[tabs]\ntab = Restored\ncwd = ${MARKER_CWD}\n`);
 
   const child2 = launch({ fresh: false });
