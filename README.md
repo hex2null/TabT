@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="tabt.png" width="120" alt="TabT logo" />
-</p>
+![TabT logo](tabt.png)
 
 # TabT
 
