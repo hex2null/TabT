@@ -20,8 +20,11 @@ sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT
 6. **Settings dialog** (⌘,) — theme, font, sidebar side, border visibility, all applied live.
 7. **Per-tab status dot** — click a tab's dot to give it a color.
 8. **Persistence** — layout, groups, tabs, theme, font, and window size are restored on launch.
-9. **VT/ANSI core** — SGR colors and text attributes, cursor/scroll/erase operations, alternate
-   screen buffer, DEC private modes, DSR/DA, OSC title and cwd reporting, UTF-8.
+9. **Mouse support in TUIs** — clicks, drags and the wheel are reported to the running application
+   (vim, tmux, htop, lazygit), in both the legacy and the SGR encoding; hold ⇧ to select text
+   instead.
+10. **VT/ANSI core** — SGR colors and text attributes, cursor/scroll/erase operations, alternate
+    screen buffer, DEC private modes, DSR/DA, OSC title and cwd reporting, UTF-8.
 
 ## Build & run
 
@@ -46,7 +49,8 @@ This builds a release binary, bundles it into `dist/TabT Dev.app`, code-signs it
 | ⌘, | Settings | | ⌘C / ⌘V / ⌘A | Copy / paste / select all |
 
 Also: double-click the header to zoom the window, double-click a tab/group name to rename it,
-and click a tab's status dot to set its color.
+and click a tab's status dot to set its color. While an application is using the mouse itself,
+hold ⇧ to select text with it instead.
 
 ## Development
 
