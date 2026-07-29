@@ -744,11 +744,17 @@ impl Grid {
     fn tab_move(&mut self, n: usize, forward: bool) {
         self.pending_wrap = false;
         for _ in 0..n {
+            let before = self.cursor.0;
             self.cursor.0 = if forward {
-                self.next_tab_stop(self.cursor.0)
+                self.next_tab_stop(before)
             } else {
-                self.prev_tab_stop(self.cursor.0)
+                self.prev_tab_stop(before)
             };
+            // Parked at a margin, so every further step is a no-op. The count comes straight off
+            // the wire, and `CSI 65535 I` would otherwise rescan the columns 65535 times.
+            if self.cursor.0 == before {
+                break;
+            }
         }
     }
 
