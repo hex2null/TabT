@@ -481,8 +481,12 @@ impl Grid {
         }
     }
 
-    /// Whether an application asked for mouse tracking at all. The input layer uses this to decide
-    /// whether the mouse belongs to the application or to the terminal's own text selection.
+    /// Whether an application asked for mouse tracking at all.
+    ///
+    /// This is *not* on its own the test for "the application owns the mouse": mode 1000 reports
+    /// presses and releases but no motion, so a drag under 1000 must still select text or the user
+    /// gets neither a selection nor a working drag. The input layer gates each event kind on
+    /// `mouse_mode()` instead — press/release on `!= Off`, motion on `>= Drag`.
     pub fn mouse_report(&self) -> bool {
         self.mouse_mode() != MouseMode::Off
     }

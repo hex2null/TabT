@@ -19,7 +19,8 @@ use objc2_app_kit::{
     NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontWeightRegular,
     NSForegroundColorAttributeName, NSImage, NSImageSymbolConfiguration, NSImageSymbolScale,
     NSLineBreakMode, NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard,
-    NSPasteboardTypeString, NSRectFill, NSResponder, NSStringDrawing, NSTextInputClient, NSView,
+    NSPasteboardTypeString, NSRectFill, NSResponder, NSStringDrawing, NSTextInputClient,
+    NSTrackingArea, NSTrackingAreaOptions, NSView,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSInteger,
@@ -27,10 +28,30 @@ use objc2_foundation::{
     NSString, NSUInteger,
 };
 
-use tabt_core::{char_width, Color, Grid, BOLD, UNDERLINE, WIDE_TRAILER};
+use tabt_core::{
+    char_width, Color, Grid, MouseButton, MouseEvent, MouseMode, MouseMods, BOLD, UNDERLINE,
+    WIDE_TRAILER,
+};
 
 use crate::settings;
 use crate::theme::{self, Rgb, Theme};
+
+/// The modifiers of a mouse event, as the mouse protocol counts them.
+///
+/// Option maps to the protocol's meta bit. On macOS Option is also the compose key (`é`, `–`), but
+/// that only concerns text input: no composition is in flight during a click, so there is nothing
+/// for it to conflict with here. Shift, by contrast, never actually reaches an application: it is
+/// the "give the mouse back to the terminal" escape hatch, so `mouse_owned_by_app` has already
+/// declined the event. The bit is filled in anyway to keep this a faithful reading of the event
+/// rather than a function whose result depends on where it is called from.
+fn mouse_mods(event: &NSEvent) -> MouseMods {
+    let flags = unsafe { event.modifierFlags() };
+    MouseMods {
+        shift: flags.contains(NSEventModifierFlags::NSEventModifierFlagShift),
+        alt: flags.contains(NSEventModifierFlags::NSEventModifierFlagOption),
+        ctrl: flags.contains(NSEventModifierFlags::NSEventModifierFlagControl),
+    }
+}
 
 /// Text padding relative to the view's edges (logical points).
 pub(crate) const PAD: f64 = 10.0;
@@ -79,6 +100,16 @@ pub struct TermViewIvars {
     // Leftover trackpad scroll distance (pixels) below one line's worth, carried to the next event
     // so a slow continuous swipe still advances instead of rounding to zero forever.
     scroll_accum: Cell<f64>,
+    // ---- Mouse reporting to the application (see `mouse_owned_by_app`) ----
+    // The button currently held for reporting purposes, so a drag can name it: AppKit delivers
+    // `mouseDragged:` without one. None when no button is down.
+    mouse_button: Cell<Option<MouseButton>>,
+    // The last cell a motion report was sent for. Motion events arrive per pixel but the protocol
+    // speaks in cells, so a report is only worth sending when the cell actually changes — otherwise
+    // one slow drag across a single character floods the shell with identical reports.
+    mouse_last_cell: Cell<Option<(usize, usize)>>,
+    // Whether `updateTrackingAreas` has installed the area that feeds `mouseMoved:` (mode 1003).
+    tracking_added: Cell<bool>,
 }
 
 declare_class!(
@@ -197,10 +228,13 @@ declare_class!(
             self.on_resize(size);
         }
 
-        // ---- Mouse selection ----
+        // ---- Mouse: either reported to the application or used for text selection ----
         #[method(mouseDown:)]
         fn mouse_down(&self, event: &NSEvent) {
             self.take_focus();
+            if self.report_press(event, MouseButton::Left) {
+                return;
+            }
             let c = self.cell_at(event);
             self.ivars().sel_anchor.set(Some(c));
             self.ivars().sel_head.set(Some(c));
@@ -209,8 +243,82 @@ declare_class!(
 
         #[method(mouseDragged:)]
         fn mouse_dragged(&self, event: &NSEvent) {
+            if self.report_drag(event) {
+                return;
+            }
             self.ivars().sel_head.set(Some(self.cell_at(event)));
             unsafe { self.setNeedsDisplay(true) };
+        }
+
+        #[method(mouseUp:)]
+        fn mouse_up(&self, event: &NSEvent) {
+            self.report_release(event);
+        }
+
+        #[method(rightMouseDown:)]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            self.take_focus();
+            self.report_press(event, MouseButton::Right);
+        }
+
+        #[method(rightMouseDragged:)]
+        fn right_mouse_dragged(&self, event: &NSEvent) {
+            self.report_drag(event);
+        }
+
+        #[method(rightMouseUp:)]
+        fn right_mouse_up(&self, event: &NSEvent) {
+            self.report_release(event);
+        }
+
+        // Every button past left and right arrives here; only the middle one (button 2) maps to a
+        // terminal button, so the rest are dropped rather than guessed at.
+        #[method(otherMouseDown:)]
+        fn other_mouse_down(&self, event: &NSEvent) {
+            if unsafe { event.buttonNumber() } == 2 {
+                self.take_focus();
+                self.report_press(event, MouseButton::Middle);
+            }
+        }
+
+        #[method(otherMouseDragged:)]
+        fn other_mouse_dragged(&self, event: &NSEvent) {
+            if unsafe { event.buttonNumber() } == 2 {
+                self.report_drag(event);
+            }
+        }
+
+        #[method(otherMouseUp:)]
+        fn other_mouse_up(&self, event: &NSEvent) {
+            if unsafe { event.buttonNumber() } == 2 {
+                self.report_release(event);
+            }
+        }
+
+        // Button-less motion, needed only by mode 1003. `InVisibleRect` makes the area follow the
+        // view's size, so a window or font resize does not need to rebuild it.
+        #[method(updateTrackingAreas)]
+        fn update_tracking_areas(&self) {
+            let _: () = unsafe { msg_send![super(self), updateTrackingAreas] };
+            if self.ivars().tracking_added.get() {
+                return;
+            }
+            let mtm = MainThreadMarker::new().expect("main thread");
+            let opts = NSTrackingAreaOptions::NSTrackingMouseMoved
+                | NSTrackingAreaOptions::NSTrackingActiveInKeyWindow
+                | NSTrackingAreaOptions::NSTrackingInVisibleRect;
+            let owner: &AnyObject = unsafe { &*(self as *const Self as *const AnyObject) };
+            let zero = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+            let area = unsafe {
+                NSTrackingArea::initWithRect_options_owner_userInfo(mtm.alloc(), zero, opts, Some(owner), None)
+            };
+            unsafe { self.addTrackingArea(&area) };
+            self.ivars().tracking_added.set(true);
+        }
+
+        #[method(mouseMoved:)]
+        fn mouse_moved(&self, event: &NSEvent) {
+            self.report_motion(event, None);
         }
 
         // ---- Scrollback ----
@@ -230,6 +338,25 @@ declare_class!(
                 dy.round() as isize
             };
             if lines == 0 {
+                return;
+            }
+            // An application tracking the mouse wants the wheel as a real report, one per line.
+            // The count is capped for the same reason `alt_scroll_keys` caps its own: a fast flick
+            // on a trackpad can otherwise deliver a burst far larger than the screen.
+            if self.mouse_owned_by_app(event, false) {
+                let button = if lines > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+                let (col, row) = self.viewport_cell_at(event);
+                let mods = mouse_mods(event);
+                let grid = self.ivars().grid.borrow();
+                let rows = grid.rows;
+                let mut out = Vec::new();
+                for _ in 0..lines.unsigned_abs().min(rows) {
+                    if let Some(b) = grid.mouse_report_bytes(MouseEvent::Press(button), mods, col, row) {
+                        out.extend_from_slice(&b);
+                    }
+                }
+                drop(grid);
+                self.write_report(&out);
                 return;
             }
             // A full-screen application (less, vim, a TUI) owns the whole screen and has no
@@ -425,6 +552,9 @@ impl TermView {
             toggle_fn: Cell::new(None),
             ended: Cell::new(false),
             scroll_accum: Cell::new(0.0),
+            mouse_button: Cell::new(None),
+            mouse_last_cell: Cell::new(None),
+            tracking_added: Cell::new(false),
             sel_anchor: Cell::new(None),
             sel_head: Cell::new(None),
             marked_text: RefCell::new(String::new()),
@@ -636,6 +766,134 @@ impl TermView {
         let col = (((lp.x - PAD) / settings::cell_w()).floor() as i64).clamp(0, cols - 1);
         let row = (((lp.y - PAD) / settings::line_h()).floor() as i64).clamp(0, rows - 1);
         (col as usize, grid.view_base() + row as usize)
+    }
+
+    /// The cell under the pointer in *viewport* coordinates (0..cols, 0..rows), which is what the
+    /// mouse protocol speaks — unlike `cell_at`, which returns a virtual-buffer row for selection.
+    fn viewport_cell_at(&self, event: &NSEvent) -> (usize, usize) {
+        let p = unsafe { event.locationInWindow() };
+        let lp = self.convertPoint_fromView(p, None);
+        let grid = self.ivars().grid.borrow();
+        let (cols, rows) = (grid.cols as i64, grid.rows as i64);
+        // Clamped, not just cast: a drag can leave the view entirely, and a negative or oversized
+        // index would be a panic (which aborts the process under `panic="abort"`) or a bogus report.
+        let col = (((lp.x - PAD) / settings::cell_w()).floor() as i64).clamp(0, cols - 1);
+        let row = (((lp.y - PAD) / settings::line_h()).floor() as i64).clamp(0, rows - 1);
+        (col as usize, row as usize)
+    }
+
+    /// Whether this event belongs to the running application rather than to the terminal's own
+    /// selection. `motion` asks about a motion event, which only modes 1002/1003 consume.
+    ///
+    /// Two deliberate escape hatches keep the terminal usable under a mouse-grabbing application:
+    /// holding Shift always yields the mouse back for text selection (as in xterm and iTerm2 —
+    /// without it there is no way at all to select text in tmux or vim), and a scrolled-back
+    /// viewport keeps it too, since the rows on screen then are history the application never drew
+    /// and any coordinate we reported for them would name the wrong line.
+    fn mouse_owned_by_app(&self, event: &NSEvent, motion: bool) -> bool {
+        if self.ivars().ended.get() {
+            return false;
+        }
+        if unsafe { event.modifierFlags() }.contains(NSEventModifierFlags::NSEventModifierFlagShift)
+        {
+            return false;
+        }
+        let grid = self.ivars().grid.borrow();
+        if grid.view_offset() > 0 {
+            return false;
+        }
+        let mode = grid.mouse_mode();
+        if motion {
+            mode >= MouseMode::Drag
+        } else {
+            mode != MouseMode::Off
+        }
+    }
+
+    /// Write a mouse report to the PTY. Empty input and ended sessions are no-ops.
+    fn write_report(&self, bytes: &[u8]) {
+        if bytes.is_empty() || self.ivars().ended.get() {
+            return;
+        }
+        unsafe { write_all(self.ivars().master_fd.get(), bytes) };
+    }
+
+    /// Report a button press, returning whether the application took the event. When it did, the
+    /// button is remembered so the drag that may follow can name it — AppKit's `mouseDragged:`
+    /// does not carry one.
+    fn report_press(&self, event: &NSEvent, button: MouseButton) -> bool {
+        if !self.mouse_owned_by_app(event, false) {
+            return false;
+        }
+        let (col, row) = self.viewport_cell_at(event);
+        let bytes = self.ivars().grid.borrow().mouse_report_bytes(
+            MouseEvent::Press(button),
+            mouse_mods(event),
+            col,
+            row,
+        );
+        self.ivars().mouse_button.set(Some(button));
+        self.ivars().mouse_last_cell.set(Some((col, row)));
+        if let Some(b) = bytes {
+            self.write_report(&b);
+        }
+        true
+    }
+
+    /// Report a button release, returning whether the application took the event. The held button
+    /// is cleared either way, so a release that arrives after tracking was turned off mid-drag
+    /// cannot leave a phantom button behind.
+    fn report_release(&self, event: &NSEvent) -> bool {
+        let button = self.ivars().mouse_button.replace(None);
+        self.ivars().mouse_last_cell.set(None);
+        let button = match button {
+            Some(b) => b,
+            None => return false,
+        };
+        if !self.mouse_owned_by_app(event, false) {
+            return false;
+        }
+        let (col, row) = self.viewport_cell_at(event);
+        let bytes = self.ivars().grid.borrow().mouse_report_bytes(
+            MouseEvent::Release(button),
+            mouse_mods(event),
+            col,
+            row,
+        );
+        if let Some(b) = bytes {
+            self.write_report(&b);
+        }
+        true
+    }
+
+    /// Report a drag, i.e. motion with the remembered button held.
+    fn report_drag(&self, event: &NSEvent) -> bool {
+        let button = self.ivars().mouse_button.get();
+        self.report_motion(event, button)
+    }
+
+    /// Report pointer motion, returning whether the application took the event. Reports are
+    /// deduplicated by cell: the protocol has no sub-cell resolution, so sending one per pixel of
+    /// travel would be pure noise for the application to parse.
+    fn report_motion(&self, event: &NSEvent, button: Option<MouseButton>) -> bool {
+        if !self.mouse_owned_by_app(event, true) {
+            return false;
+        }
+        let (col, row) = self.viewport_cell_at(event);
+        if self.ivars().mouse_last_cell.get() == Some((col, row)) {
+            return true; // same cell: taken, but nothing new to say
+        }
+        self.ivars().mouse_last_cell.set(Some((col, row)));
+        let bytes = self.ivars().grid.borrow().mouse_report_bytes(
+            MouseEvent::Motion(button),
+            mouse_mods(event),
+            col,
+            row,
+        );
+        if let Some(b) = bytes {
+            self.write_report(&b);
+        }
+        true
     }
 
     /// The normalized selection ((start, end), inclusive of both ends); returns None for an empty selection.
