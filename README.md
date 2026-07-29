@@ -24,7 +24,8 @@ sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT
    (vim, tmux, htop, lazygit), in both the legacy and the SGR encoding; hold ⇧ to select text
    instead.
 10. **VT/ANSI core** — SGR colors and text attributes, cursor/scroll/erase operations, alternate
-    screen buffer, DEC private modes, DSR/DA, OSC title and cwd reporting, UTF-8.
+    screen buffer, DEC private modes and IRM, tab stops, the DEC line-drawing charset, DSR/DA,
+    OSC title and cwd reporting, UTF-8.
 
 ## Build & run
 

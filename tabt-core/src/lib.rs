@@ -21,14 +21,18 @@
 //!   - alternate screen buffer (DECSET 47/1047/1049), used by vim/less/htop/man;
 //!   - device status reports (DSR `CSI 6n`/`5n`) and device attributes (DA `CSI c`), queued via
 //!     `take_replies()` for the caller to write back to the PTY;
-//!   - UTF-8 multibyte character decoding.
+//!   - UTF-8 multibyte character decoding;
+//!   - the DEC Special Graphics charset (`ESC ( 0` / `ESC ) 0` plus SI/SO), which is what every
+//!     ncurses box border is actually made of;
+//!   - tab stops: HT against a per-column stop table, edited by HTS/TBC and walked by CHT/CBT;
+//!   - IRM (ANSI mode 4), where printing opens a gap instead of overwriting.
 //!
 //!   - a scrollback buffer: lines that scroll off the top of the main screen are kept in
 //!     `history` (capped at `HISTORY_MAX`), and the renderer reads through `view_cell()` so the
 //!     viewport can be scrolled back with `scroll_view()`.
 //!
-//! Still not implemented (left for later milestones): custom tab stops, and reflowing the
-//! scrollback when the window is resized.
+//! Still not implemented (left for later milestones): reflowing the scrollback when the window is
+//! resized.
 
 use std::collections::VecDeque;
 
@@ -302,6 +306,10 @@ pub struct Grid {
     mouse_any: bool,   // 1003: the above, plus motion with no button held
     mouse_sgr: bool,   // 1006: SGR encoding, which lifts the legacy 223-column coordinate limit
 
+    // ANSI mode 4 (IRM): printing pushes the rest of the line right instead of overwriting it.
+    // Line editors and `less` use it to open a gap without redrawing the whole row.
+    insert_mode: bool,
+
     // ---- Horizontal tab stops, one flag per column ----
     // Power-on layout is every eighth column; HTS/TBC edit it and `resize` extends it. Kept as a
     // per-column flag rather than a stride because an application may put a stop anywhere, which
@@ -370,6 +378,7 @@ impl Grid {
             mouse_drag: false,
             mouse_any: false,
             mouse_sgr: false,
+            insert_mode: false,
             tab_stops: Self::default_tab_stops(cols),
             g0_graphics: false,
             g1_graphics: false,
@@ -798,6 +807,11 @@ impl Grid {
         if w == 2 && self.cursor.0 + 1 >= self.cols && self.autowrap {
             self.cursor.0 = 0;
             self.linefeed();
+        }
+        // IRM: make room by pushing the rest of the line right, instead of overwriting what is
+        // already there. A wide glyph needs both of its columns.
+        if self.insert_mode {
+            self.insert_chars(w);
         }
         let (c, r) = self.cursor;
         let (fg, bg, fl) = (self.pen_fg, self.pen_bg, self.pen_flags);
@@ -1481,8 +1495,15 @@ impl Grid {
                     _ => {} // other private modes: acknowledged and ignored
                 }
             }
+        } else {
+            let params = self.params.clone();
+            for p in params {
+                match p {
+                    4 => self.insert_mode = set, // IRM: insert rather than overwrite
+                    _ => {}                      // other ANSI modes: acknowledged and ignored
+                }
+            }
         }
-        // Non-private ANSI modes (such as IRM insert mode) are not implemented yet.
     }
 
     /// Enter the alt screen: swap with the undisplayed buffer, clear the newly displayed one, and reset the scroll region.
@@ -1603,6 +1624,7 @@ impl Grid {
         self.mouse_drag = false;
         self.mouse_any = false;
         self.mouse_sgr = false;
+        self.insert_mode = false;
         self.tab_stops = Self::default_tab_stops(self.cols);
         self.g0_graphics = false;
         self.g1_graphics = false;
@@ -1880,6 +1902,49 @@ mod tests {
         // Back on the main screen the viewport takes over again.
         g.feed(b"\x1b[?1049l");
         assert_eq!(g.alt_scroll_keys(1), None);
+    }
+
+    // ---- IRM ----
+
+    #[test]
+    fn irm_inserts_instead_of_overwriting() {
+        let mut g = Grid::new(10, 1);
+        g.feed(b"abcdef");
+        // Replace mode (the default): typing over the line overwrites it.
+        g.feed(b"\x1b[1GXY");
+        assert_eq!(g.to_lines()[0], "XYcdef");
+
+        // Insert mode: the rest of the line is pushed right instead.
+        g.feed(b"\x1b[4h\x1b[1GZ");
+        assert_eq!(g.to_lines()[0], "ZXYcdef");
+
+        // ... and turning it back off resumes overwriting.
+        g.feed(b"\x1b[4l\x1b[1GQ");
+        assert_eq!(g.to_lines()[0], "QXYcdef");
+    }
+
+    #[test]
+    fn irm_pushes_content_off_the_right_margin() {
+        let mut g = Grid::new(6, 1);
+        g.feed(b"abcdef\x1b[4h\x1b[1GZ");
+        // The line cannot grow, so the last column falls off rather than wrapping.
+        assert_eq!(g.to_lines()[0], "Zabcde");
+    }
+
+    #[test]
+    fn irm_makes_room_for_both_columns_of_a_wide_glyph() {
+        let mut g = Grid::new(6, 1);
+        g.feed("abcdef\x1b[4h\x1b[1G\u{4e2d}".as_bytes());
+        // A wide glyph occupies two cells, so two are opened and two fall off the end.
+        assert_eq!(g.to_lines()[0], "中abcd");
+    }
+
+    #[test]
+    fn irm_is_cleared_by_a_hard_reset() {
+        let mut g = Grid::new(10, 1);
+        g.feed(b"\x1b[4h\x1bc");
+        g.feed(b"abc\x1b[1GX");
+        assert_eq!(g.to_lines()[0], "Xbc");
     }
 
     // ---- tab stops ----

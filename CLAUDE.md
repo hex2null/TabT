@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A native macOS terminal emulator written in Rust on top of AppKit, built as a sequence of numbered milestones (step 0 = window, 1 = PTY echo, 2 = dumb rendering, 3 = VT parser). Steps 0–3 are done: it is a working multi-tab terminal with a self-drawn sidebar, groups, themes, fonts, settings, scrollback, and layout persistence. Remaining known gaps in the core: no custom tab stops, and the scrollback is not reflowed on resize.
+A native macOS terminal emulator written in Rust on top of AppKit, built as a sequence of numbered milestones (step 0 = window, 1 = PTY echo, 2 = dumb rendering, 3 = VT parser). Steps 0–3 are done: it is a working multi-tab terminal with a self-drawn sidebar, groups, themes, fonts, settings, scrollback, and layout persistence. Remaining known gap in the core: the scrollback is not reflowed on resize.
 
 Keep new code comments and UI strings in English (the Rust sources are; the Makefile and `Cargo.toml` still carry some older Chinese comments).
 
@@ -33,7 +33,7 @@ Two-crate Cargo workspace with a strict dependency direction: `tabt-app` → `ta
 
 `tabt-core/src/lib.rs`, one file, **deliberately zero-dependency** so it compiles and tests on any platform independent of macOS. Defines `Cell`, `Color`, and `Grid` (fixed-size screen grid in a flat `Vec<Cell>`, indexed `row * cols + col`).
 
-`Grid::feed(&[u8])` is a VT500-style parser state machine (ground / escape / csi / osc, modeled on Paul Williams' diagram) covering SGR pen attributes, cursor movement, erase/insert/delete, scroll regions, save/restore cursor, DEC private modes, alternate screen, OSC title and OSC 7 cwd, UTF-8 and wide characters (a wide glyph occupies two cells, the second flagged `WIDE_TRAILER`). Terminal→host replies (DSR/DA) are queued internally and drained by the app layer via `take_replies()`; other state the renderer/input layer reads back through `cwd()`, `cursor_visible()`, `app_cursor_keys()`, `bracketed_paste()`.
+`Grid::feed(&[u8])` is a VT500-style parser state machine (ground / escape / csi / osc, modeled on Paul Williams' diagram) covering SGR pen attributes, cursor movement, erase/insert/delete, scroll regions, save/restore cursor, DEC private modes, IRM, alternate screen, tab stops (a per-column table, edited by HTS/TBC and walked by CHT/CBT), the DEC Special Graphics charset, OSC title and OSC 7 cwd, UTF-8 and wide characters (a wide glyph occupies two cells, the second flagged `WIDE_TRAILER`). Terminal→host replies (DSR/DA) are queued internally and drained by the app layer via `take_replies()`; other state the renderer/input layer reads back through `cwd()`, `cursor_visible()`, `app_cursor_keys()`, `bracketed_paste()`, `mouse_mode()`.
 
 Lines scrolled off the top are pushed into a capped `history` deque. **The renderer must read cells through `view_cell()`, not `cell()`** — `view_cell()` resolves the current scrollback viewport (`view_offset()`, moved by `scroll_view()` / `scroll_to_bottom()`); `cell()` is raw screen access. The alt screen has no scrollback, and lines removed by DL/ED must not enter it. `to_lines()` exports rows as trimmed strings, used by the ~40 unit tests at the bottom of the same file.
 
