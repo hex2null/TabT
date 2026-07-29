@@ -1,23 +1,38 @@
 #!/usr/bin/env node
 // Launch and drive TabT.app from a script.
 //
-// TabT is a native AppKit GUI with no remote-control surface, and macOS gates the
-// obvious ways in (screencapture / System Events keystrokes) behind TCC permissions
-// that a headless agent does not have. So this driver goes in through the one channel
-// the app hands us for free: it is a terminal emulator, so it spawns a login zsh in a
-// PTY. We point the app at a scratch $HOME whose .zshrc is ours, and that shell becomes
-// our agent inside the running GUI -- it queries the terminal and writes the answers to
-// files we read back.
+// TabT is a native AppKit GUI with no remote-control surface, so this driver reaches into
+// a running instance three different ways. Each covers a different layer of the app, and
+// which one you want depends on what you changed:
 //
-// A DSR round-trip (`ESC[6n` -> `ESC[row;colR`) exercises the entire data flow in the
-// live app: shell writes to the PTY slave -> GCD dispatch source reads the master ->
-// Grid::feed parses -> take_replies() -> write back to the PTY. Preceding it with a CUP
-// makes the reply an assertion about the parser, not just a liveness check.
+//   1. PTY feed (`feed`)  -- the app is a terminal emulator, so every tab is a PTY whose
+//      slave device (/dev/ttysNNN) is writable by us. Bytes written there are exactly what
+//      the shell would have printed: GCD dispatch source -> Grid::feed -> parser -> render.
+//      This is the handle for anything in tabt-core, which is what most PRs here touch.
+//   2. Screenshot (`shot`) -- `screencapture -R` over the window rectangle read out of the
+//      Accessibility API. This is how you check that the *renderer* agrees with the parser.
+//   3. Keystrokes (`keys`) -- System Events, for the AppKit layer: tabs, sidebar, menus.
+//
+// (2) and (3) are TCC-gated: the terminal app running this driver needs Screen Recording
+// and Accessibility respectively. `doctor` tells you whether they are granted. (1) needs
+// no permission at all, so a smoke test that must run anywhere sticks to it.
+//
+// A fourth channel runs the other way: the app spawns a login zsh, so pointing it at a
+// scratch $HOME whose .zshrc is ours puts an agent *inside* the GUI that can query the
+// terminal and write the answers to files we read back. A DSR round-trip (`ESC[6n` ->
+// `ESC[row;colR`) exercises the whole data flow, and preceding it with a CUP makes the
+// reply an assertion about the parser rather than just a liveness check.
 //
 // Usage:
-//   node .claude/skills/run-tabt/driver.mjs smoke    # build-free full run, asserts, exits nonzero on failure
-//   node .claude/skills/run-tabt/driver.mjs launch   # leave it running, prints the pid
-//   node .claude/skills/run-tabt/driver.mjs quit     # stop the instance this driver started
+//   node .claude/skills/run-tabt/driver.mjs smoke        # full run + asserts, nonzero exit on failure
+//   node .claude/skills/run-tabt/driver.mjs launch       # leave it running, prints the pid
+//   node .claude/skills/run-tabt/driver.mjs feed '\e[31mred\r\n' [tab]  # tab: index or "last"
+//   node .claude/skills/run-tabt/driver.mjs shot [file]  # screenshot the window
+//   node .claude/skills/run-tabt/driver.mjs keys t cmd   # send a keystroke (here: new tab)
+//   node .claude/skills/run-tabt/driver.mjs scene vt     # render a VT torture page, then shot
+//   node .claude/skills/run-tabt/driver.mjs tty [n]      # print tab n's PTY slave path
+//   node .claude/skills/run-tabt/driver.mjs doctor       # check the TCC permissions
+//   node .claude/skills/run-tabt/driver.mjs quit [--graceful]  # stop it (--graceful runs persist())
 
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, realpathSync } from 'node:fs';
@@ -32,8 +47,8 @@ const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 // whichever bundle we ended up with, not hardcoded, or the layout assertions below read a path
 // the app never writes.
 const APP_BUILDS = [
-  { bin: join(REPO, 'dist/TabT Dev.app/Contents/MacOS/tabt-dev'), configDir: '.tabt-dev' },
-  { bin: join(REPO, 'dist/TabT.app/Contents/MacOS/tabt'), configDir: '.tabt' },
+  { bin: join(REPO, 'dist/TabT Dev.app/Contents/MacOS/tabt-dev'), configDir: '.tabt-dev', bundleId: 'dev.local.tabt.dev' },
+  { bin: join(REPO, 'dist/TabT.app/Contents/MacOS/tabt'), configDir: '.tabt', bundleId: 'dev.local.tabt' },
 ];
 const BUILD = APP_BUILDS.find((b) => existsSync(b.bin)) ?? APP_BUILDS[0];
 const APP_BIN = BUILD.bin;
@@ -42,6 +57,7 @@ const PROOF = join(HOME, 'proof');
 const PIDFILE = join(HOME, 'tabt.pid');
 const MARKER_CWD = join(HOME, 'marker-cwd');
 const CONF = join(HOME, BUILD.configDir, 'layout.conf');
+const SHOTS = join(HOME, 'shots');
 
 const log = (...a) => console.log(...a);
 
@@ -155,12 +171,109 @@ function launch({ fresh = true } = {}) {
       TABT_PROOF: PROOF,
       TABT_MARKER_CWD: MARKER_CWD,
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    // 'ignore', not 'pipe': a piped stdio keeps a handle referenced in this process's event
+    // loop, so `launch` would print its pid and then hang forever instead of exiting. Nothing
+    // reads the app's stdout anyway -- it logs nothing useful, and the assertions come back
+    // through $PROOF files.
+    stdio: 'ignore',
     detached: true,
   });
   child.unref();
   writeFileSync(PIDFILE, String(child.pid));
   return child;
+}
+
+// ---------------------------------------------------------------------------
+// Reaching into a *running* instance. Everything below targets the pid in PIDFILE,
+// never a process matched by name -- see the killOurs note above.
+// ---------------------------------------------------------------------------
+function runningPid() {
+  const pid = Number(read(PIDFILE));
+  if (!pid) throw new Error('no instance running (no pidfile) -- start one with: driver.mjs launch');
+  try { process.kill(pid, 0); } catch {
+    throw new Error(`pid ${pid} from the pidfile is gone -- relaunch with: driver.mjs launch`);
+  }
+  return pid;
+}
+
+const osa = (script) => execFileSync('osascript', ['-e', script], { encoding: 'utf8' }).trim();
+
+/// The tabs' PTY slave devices, in spawn order. Each tab is one forked login zsh (pty.rs), so
+/// the app's direct children *are* the tabs; ascending pid is the order they were created in,
+/// which for a driver-launched instance is also their order in the sidebar.
+function tabTtys(pid = runningPid()) {
+  const kids = execFileSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' })
+    .trim().split('\n').filter(Boolean).map(Number).sort((a, b) => a - b);
+  return kids
+    .map((k) => {
+      const tty = execFileSync('ps', ['-o', 'tty=', '-p', String(k)], { encoding: 'utf8' }).trim();
+      return tty && tty !== '??' ? { pid: k, dev: `/dev/${tty}` } : null;
+    })
+    .filter(Boolean);
+}
+
+/// Interpret the escapes a shell would: \e \n \r \t \0 \\. Written straight to the PTY slave,
+/// so the app sees them exactly as if the shell had printed them.
+function unescape(s) {
+  return s.replace(/\\(e|E|n|r|t|a|0|\\)/g, (_, c) =>
+    ({ e: '\x1b', E: '\x1b', n: '\n', r: '\r', t: '\t', a: '\x07', 0: '\0', '\\': '\\' })[c]);
+}
+
+/// `which` is a 0-based index, or "last" / a negative index counting from the end.
+///
+/// "last" matters because `shot` photographs whichever tab is *visible*, and the driver has no
+/// way to ask which that is -- the sidebar is self-drawn, so it exposes nothing to the
+/// Accessibility API, and the app binds no tab-switch key equivalent for `keys` to press.
+/// What is knowable: a fresh `launch` has exactly one tab, and `keys t cmd` makes the newest
+/// tab the visible one. So "the visible tab" is reachable as long as you only ever address tab
+/// 0 (fresh instance) or the last one (right after ⌘T).
+function resolveTab(which = 0) {
+  const tabs = tabTtys();
+  const i = which === 'last' ? tabs.length - 1 : Number(which) < 0 ? tabs.length + Number(which) : Number(which);
+  const tab = tabs[i];
+  if (!tab) throw new Error(`no tab ${which} (this instance has ${tabs.length}: ${tabs.map((t) => t.dev).join(' ')})`);
+  return tab;
+}
+
+function feed(bytes, which = 0) {
+  const tab = resolveTab(which);
+  writeFileSync(tab.dev, unescape(bytes));
+  return tab.dev;
+}
+
+/// The window rectangle, straight out of the Accessibility API. Needs the Accessibility
+/// permission; without it osascript throws and `doctor` says so.
+function windowBounds(pid = runningPid()) {
+  const out = osa(
+    `tell application "System Events" to tell (first process whose unix id is ${pid}) ` +
+    `to get {position, size} of window 1`);
+  const n = out.split(',').map((v) => Number(v.trim()));
+  if (n.length !== 4 || n.some(Number.isNaN)) throw new Error(`unparseable window bounds: ${out}`);
+  return n; // [x, y, w, h] in points
+}
+
+function shot(file) {
+  const pid = runningPid();
+  const [x, y, w, h] = windowBounds(pid);
+  const out = file ? resolve(file) : join(SHOTS, 'latest.png');
+  mkdirSync(dirname(out), { recursive: true });
+  // -x: no shutter sound. -R: crop to the window, so the shot is the app and not the desktop.
+  execFileSync('screencapture', ['-x', `-R${x},${y},${w},${h}`, out]);
+  return out;
+}
+
+/// Raise the instance and send one keystroke through System Events. `mods` is any of
+/// cmd/shift/opt/ctrl, comma- or space-separated. Needs the Accessibility permission.
+function keys(key, mods = '') {
+  const pid = runningPid();
+  const list = mods.split(/[ ,]+/).filter(Boolean).map((m) =>
+    ({ cmd: 'command down', command: 'command down', shift: 'shift down', opt: 'option down',
+       option: 'option down', alt: 'option down', ctrl: 'control down', control: 'control down' })[m]
+    ?? (() => { throw new Error(`unknown modifier: ${m}`); })());
+  const using = list.length ? ` using {${list.join(', ')}}` : '';
+  osa(`tell application "System Events" to set frontmost of (first process whose unix id is ${pid}) to true`);
+  osa('delay 0.3');
+  osa(`tell application "System Events" to keystroke "${key}"${using}`);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -224,9 +337,10 @@ async function smoke() {
   // -------------------------------------------------------------------------
   // Phase 2: restore. Seed layout.conf with a cwd and relaunch -- the shell must
   // come up *in that directory*. Exercises config parse -> tab restore -> PTY
-  // spawn-in-cwd, which is the half of the persistence path we can observe
-  // without a clean quit (persist() only runs from applicationWillTerminate:,
-  // and SIGTERM skips it -- see Gotchas in SKILL.md).
+  // spawn-in-cwd. Seeding by hand rather than by quitting a live instance keeps this
+  // phase independent of how the previous one was stopped: AppController::save() runs
+  // on every layout mutation, but the *final* save is applicationWillTerminate: ->
+  // persist(), which a SIGTERM skips (`quit --graceful` is the one that runs it).
   // -------------------------------------------------------------------------
   mkdirSync(MARKER_CWD, { recursive: true });
   rmSync(join(PROOF, 'boot.txt'), { force: true });
@@ -257,7 +371,80 @@ async function smoke() {
   return failed.length === 0 ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// Scenes: canned pages of escape sequences that put a lot of the parser on screen at
+// once, so one screenshot is a visual regression test of `Grid::feed` + the renderer.
+// ---------------------------------------------------------------------------
+const SCENES = {
+  // Each block is labelled on screen, so a diff in the screenshot points at a feature.
+  vt: [
+    '\x1b[2J\x1b[H',                                  // clear + home
+    '\x1b[1mTabT VT scene\x1b[0m\r\n\r\n',
+    'SGR:      ',
+    ...[31, 32, 33, 34, 35, 36].map((c) => `\x1b[${c}m##\x1b[0m`),
+    ' \x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munderline\x1b[0m \x1b[7minverse\x1b[0m\r\n\r\n',
+    'DEC gfx:  \x1b(0lqqqk\x1b(B\r\n',
+    '          \x1b(0x   x\x1b(B\r\n',
+    '          \x1b(0mqqqj\x1b(B\r\n\r\n',
+    // Wide glyphs, then IRM inserting *into* a wide pair -- the case that used to leave an
+    // orphan half behind. The label is 10 columns, so 中 occupies columns 11-12 (1-based) and
+    // CHA to 12 parks the cursor on its *trailing* half: exactly the split that has to blank
+    // both halves. Expect "IRM+wide:  Z x" -- one space where 中 was, no doubled or clipped
+    // glyph. Aiming at column 13 instead would land on the `x` and prove nothing.
+    'wide:     中文 CJK ok\r\n',
+    'IRM+wide: 中x\x1b[4h\x1b[12GZ\x1b[4l\r\n\r\n',
+    // Custom tab stops: clear the power-on set, place one at column 30, then walk to it.
+    '\x1b[3g\x1b[31G\x1bH\x1b[1Gtabs:\tstop@30\r\n',
+  ].join(''),
+};
+
+function scene(name, file, which = 'last') {
+  const body = SCENES[name];
+  if (!body) throw new Error(`unknown scene "${name}" (have: ${Object.keys(SCENES).join(', ')})`);
+  // Defaults to the last tab, not tab 0: that is the one ⌘T leaves visible, and a shot of a
+  // tab that is not on screen is a photo of some other tab's contents.
+  const dev = feed(body, which);
+  return { dev, out: shot(file) };
+}
+
+function doctor() {
+  let ok = true;
+  const line = (name, good, detail) => {
+    log(`${good ? 'OK  ' : 'FAIL'}  ${name}${detail ? `  -- ${detail}` : ''}`);
+    if (!good) ok = false;
+  };
+  line('app bundle built', existsSync(APP_BIN), APP_BIN);
+  let pid = 0;
+  try { pid = runningPid(); line('instance running', true, `pid ${pid}`); }
+  catch (e) { line('instance running', false, e.message); return ok ? 0 : 1; }
+
+  try {
+    const b = windowBounds(pid);
+    line('Accessibility (window bounds, needed by shot/keys)', true, `x,y,w,h = ${b.join(',')}`);
+  } catch (e) {
+    line('Accessibility (window bounds, needed by shot/keys)', false,
+      `${String(e.message).split('\n')[0]} -- grant Accessibility to the app running this driver`);
+  }
+  try {
+    const out = shot(join(SHOTS, 'doctor.png'));
+    const bytes = readFileSync(out).length;
+    // A capture without Screen Recording still succeeds but comes back as desktop wallpaper
+    // only, which compresses far smaller than a window full of text.
+    line('Screen Recording (screencapture)', bytes > 20000, `${out} (${bytes} bytes) -- open it to confirm it shows the app`);
+  } catch (e) {
+    line('Screen Recording (screencapture)', false, String(e.message).split('\n')[0]);
+  }
+  try {
+    const tabs = tabTtys(pid);
+    line('PTY feed channel', tabs.length > 0, tabs.map((t) => t.dev).join(' '));
+  } catch (e) {
+    line('PTY feed channel', false, String(e.message).split('\n')[0]);
+  }
+  return ok ? 0 : 1;
+}
+
 const cmd = process.argv[2] || 'smoke';
+const arg = (i) => process.argv[3 + i];
 if (cmd === 'smoke') {
   process.exit(await smoke());
 } else if (cmd === 'launch') {
@@ -266,8 +453,30 @@ if (cmd === 'smoke') {
   log(`quit with: node ${process.argv[1]} quit`);
 } else if (cmd === 'quit') {
   const pid = Number(read(PIDFILE));
-  if (pid) { killOurs(pid); log(`stopped pid ${pid}`); } else { log('no pidfile'); }
+  if (!pid) { log('no pidfile'); }
+  else if (arg(0) === '--graceful') {
+    // Runs applicationWillTerminate: -> persist(), i.e. one last save of titles/cwds/geometry.
+    // Beware: ⌘Q's confirm dialog (confirm_quit) can block this if a tab has a foreground job.
+    osa(`tell application id "${BUILD.bundleId}" to quit`);
+    log(`asked pid ${pid} to quit (graceful)`);
+  } else { killOurs(pid); log(`stopped pid ${pid}`); }
+} else if (cmd === 'feed') {
+  log(`wrote ${arg(0)?.length ?? 0} chars to ${feed(arg(0) ?? '', arg(1) ?? 0)}`);
+} else if (cmd === 'shot') {
+  log(shot(arg(0)));
+} else if (cmd === 'keys') {
+  keys(arg(0), process.argv.slice(4).join(' '));
+  log(`sent ${[process.argv.slice(4).join('+'), arg(0)].filter(Boolean).join('+')}`);
+} else if (cmd === 'scene') {
+  const { dev, out } = scene(arg(0) ?? 'vt', arg(1), arg(2) ?? 'last');
+  log(`rendered scene "${arg(0) ?? 'vt'}" into ${dev}\n${out}`);
+} else if (cmd === 'tty') {
+  const tabs = tabTtys();
+  const i = arg(0) === undefined ? null : Number(arg(0));
+  log(i === null ? tabs.map((t, n) => `${n}  ${t.dev}  (shell pid ${t.pid})`).join('\n') : tabs[i]?.dev ?? '');
+} else if (cmd === 'doctor') {
+  process.exit(doctor());
 } else {
-  log('usage: driver.mjs [smoke|launch|quit]');
+  log('usage: driver.mjs [smoke|launch|quit|feed <bytes> [tab|last]|shot [file]|keys <key> [mods]|scene <name> [file] [tab]|tty [n]|doctor]');
   process.exit(2);
 }
