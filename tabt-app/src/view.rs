@@ -1223,12 +1223,18 @@ pub(crate) fn draw_symbol(name: &str, rect: NSRect, color: Rgb) {
             let colored = img.imageWithSymbolConfiguration(&cfg).unwrap_or(img);
             // Draw centered at the symbol's own size to avoid drawInRect stretching (e.g. "⋯" squashed into a vertical ellipse).
             let sz = colored.size();
+            // …but snapped to whole points. A symbol's natural size is fractional, so centering it
+            // inside an even-sized box lands the origin off the pixel grid, and these are hairline
+            // glyphs: every 1pt stroke then straddles two pixels and the whole icon renders as a
+            // soft gray smudge rather than a line. Rounding the size too keeps the far edge on the
+            // grid as well — it is a sub-point adjustment, not the stretching the note above warns
+            // about, which was a symbol forced into a box of the wrong aspect.
             let dst = NSRect::new(
                 NSPoint::new(
-                    rect.origin.x + (rect.size.width - sz.width) / 2.0,
-                    rect.origin.y + (rect.size.height - sz.height) / 2.0,
+                    (rect.origin.x + (rect.size.width - sz.width) / 2.0).round(),
+                    (rect.origin.y + (rect.size.height - sz.height) / 2.0).round(),
                 ),
-                sz,
+                NSSize::new(sz.width.round(), sz.height.round()),
             );
             colored.drawInRect(dst);
         }

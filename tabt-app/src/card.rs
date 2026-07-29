@@ -35,10 +35,14 @@ pub const CARD_INSET: f64 = 8.0;
 pub const CARD_GAP: f64 = 8.0;
 /// Blur radius of the card's drop shadow.
 const SHADOW_RADIUS: f64 = 7.0;
+/// The same on a light theme, where the falloff is the part that is actually visible (see
+/// `apply_theme`) and so has room to be a little wider.
+const SHADOW_RADIUS_LIGHT: f64 = 9.0;
 /// How far the shadow can still be seen past the card's own edge. The blur is Gaussian, so it does
-/// not stop dead at `SHADOW_RADIUS`; `relayout` has to park the collapsed card at least this far
-/// off-screen or the tail of the shadow stays visible as a smudge down the window edge.
-pub const SHADOW_REACH: f64 = SHADOW_RADIUS * 2.0;
+/// not stop dead at the radius; `relayout` has to park the collapsed card at least this far
+/// off-screen or the tail of the shadow stays visible as a smudge down the window edge. Taken from
+/// the wider of the two radii, since the parking distance cannot depend on the theme in force.
+pub const SHADOW_REACH: f64 = SHADOW_RADIUS_LIGHT * 2.0;
 /// Corner radius of the card.
 ///
 /// Concentric with the window: macOS rounds the window itself at ~24pt, and an inset shape stays
@@ -91,9 +95,19 @@ pub fn apply_theme(card: &NSView) {
         // has faded out by the time it reaches the text. Black on every theme: a light theme's
         // gutter needs the same "something in front of something" cue, and tinting the shadow with
         // the theme would only make it a colored smudge.
+        //
+        // A touch stronger on a light theme, for the same reason `Theme::card_border` steps less
+        // there: black over a light gutter is the only case where the falloff has room to be read as
+        // a gradient. Over a dark one it is nearly black on black, so raising it would darken the
+        // seam without ever looking like a shadow.
         let _: () = msg_send![layer, setShadowColor: cg(&NSColor::blackColor())];
-        let _: () = msg_send![layer, setShadowOpacity: 0.10f32];
-        let _: () = msg_send![layer, setShadowRadius: SHADOW_RADIUS];
+        let (opacity, radius): (f32, f64) = if t.is_dark() {
+            (0.06, SHADOW_RADIUS)
+        } else {
+            (0.09, SHADOW_RADIUS_LIGHT)
+        };
+        let _: () = msg_send![layer, setShadowOpacity: opacity];
+        let _: () = msg_send![layer, setShadowRadius: radius];
         let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -1.0)];
     }
 }

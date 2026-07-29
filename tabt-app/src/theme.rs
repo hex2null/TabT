@@ -69,15 +69,33 @@ impl Theme {
     /// the foreground — rather than adding a flat gray offset — lightens dark themes and darkens
     /// light ones with one rule, and keeps the line inside the theme's own hue family, so an amber
     /// CRT gets a warm rim instead of a gray-brown smudge.
+    ///
+    /// It has to be measured from [`Theme::card_bg`], not from `bg`: the line is drawn *on* the card,
+    /// and `card_bg` already stepped away from `bg`. On a dark theme the two steps go opposite ways
+    /// (the card darkens, the line lightens) and the edge shows up by accident; on a light one both
+    /// go down and the same delta lands the line exactly on the fill it is supposed to bound, which
+    /// is why every light theme used to have no visible border at all.
+    ///
+    /// The step is smaller on a light theme, because the same delta does not read the same way in
+    /// both directions: there the line is *darker* than the surface it bounds, and a dark line on a
+    /// light field reads as a drawn outline, where the light rim a dark theme gets reads as an edge
+    /// catching the light. Matching them by number makes the light one heavier than the dark one.
     pub fn card_border(&self) -> Rgb {
-        mix(self.bg, self.fg, self.blend_for(0.03))
+        let card = self.card_bg();
+        let step = if self.is_dark() { 0.055 } else { 0.032 };
+        mix(card, self.fg, self.blend_from(card, step))
     }
 
-    /// The blend fraction toward `fg` that shifts `bg`'s luminance by `target`. Capped, because on
+    /// The blend fraction toward `fg` that shifts `bg`'s luminance by `target`.
+    fn blend_for(&self, target: f64) -> f64 {
+        self.blend_from(self.bg, target)
+    }
+
+    /// The blend fraction toward `fg` that shifts `base`'s luminance by `target`. Capped, because on
     /// a theme whose fg and bg nearly coincide no blend reaches the target and an uncapped one
     /// would wash the surface out entirely.
-    fn blend_for(&self, target: f64) -> f64 {
-        let contrast = (luminance(self.fg) - luminance(self.bg)).abs().max(1e-3);
+    fn blend_from(&self, base: Rgb, target: f64) -> f64 {
+        let contrast = (luminance(self.fg) - luminance(base)).abs().max(1e-3);
         (target / contrast).min(0.20)
     }
 
@@ -184,7 +202,7 @@ fn ensure_loaded() {
             (!list.is_empty()).then_some((text, list))
         };
         let user = crate::config::themes_file();
-        let list = match read(Some(user.clone())) {
+        let mut list = match read(Some(user.clone())) {
             Some((_, list)) => list,
             None => match read(crate::config::bundled_themes_file()) {
                 Some((text, list)) => {
@@ -200,6 +218,13 @@ fn ensure_loaded() {
                 None => fallback_list(),
             },
         };
+        // The pop-up is a list to find a name in, so it is ordered like one, whatever order the file
+        // was written in — the shipped file groups its dark themes and then its light ones, which
+        // reads well as a file and badly as a menu. Sorted here rather than in `parse` so the parser
+        // stays a faithful reading of the file, and so a hand-edited user copy gets the same
+        // treatment. Nothing is pinned to a position: `style` is stored by name, and every index the
+        // app holds is resolved through this list.
+        list.sort_by_key(|e| e.name.to_lowercase());
         *r.borrow_mut() = Some(list);
     });
 }

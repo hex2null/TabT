@@ -404,9 +404,17 @@ impl AppController {
                 (card.origin.x + w - tw - 8.0, 16.0)
             };
             let cy = self.titlebar_center_y();
+            // Snapped to whole points. The button's content is a hairline symbol, and `draw_symbol`
+            // can only align it within the view's own coordinates — a frame at a half point moves
+            // the whole grid with it and every stroke goes back to straddling two pixels. Collapsed
+            // is where this bites: that x is the traffic lights' edge plus a gap, minus the half-point
+            // pad that centers a 17pt glyph in a 34pt button.
             self.set_frame_maybe_animated(
                 &self.toggle_btn,
-                NSRect::new(NSPoint::new(tx, fh - cy - th / 2.0), NSSize::new(tw, th)),
+                NSRect::new(
+                    NSPoint::new(tx.round(), (fh - cy - th / 2.0).round()),
+                    NSSize::new(tw, th),
+                ),
             );
             self.header.set_left_inset(title_inset);
             self.header.set_center_y(cy);
