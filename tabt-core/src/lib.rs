@@ -302,6 +302,12 @@ pub struct Grid {
     mouse_any: bool,   // 1003: the above, plus motion with no button held
     mouse_sgr: bool,   // 1006: SGR encoding, which lifts the legacy 223-column coordinate limit
 
+    // ---- Horizontal tab stops, one flag per column ----
+    // Power-on layout is every eighth column; HTS/TBC edit it and `resize` extends it. Kept as a
+    // per-column flag rather than a stride because an application may put a stop anywhere, which
+    // is the whole point of HTS.
+    tab_stops: Vec<bool>,
+
     // ---- Character sets ----
     // Which of G0/G1 currently holds DEC Special Graphics (designated by `ESC ( 0` / `ESC ) 0`),
     // and which of the two SI/SO has selected. Applications commonly park the line-drawing set in
@@ -364,6 +370,7 @@ impl Grid {
             mouse_drag: false,
             mouse_any: false,
             mouse_sgr: false,
+            tab_stops: Self::default_tab_stops(cols),
             g0_graphics: false,
             g1_graphics: false,
             shift_out: false,
@@ -709,6 +716,52 @@ impl Grid {
         }
     }
 
+    // ===================== Tab stops =====================
+
+    /// The column HT moves to from `col`: the next stop to its right, or the last column when there
+    /// is none. Clearing every stop therefore parks HT at the right margin rather than doing
+    /// nothing, which is what a terminal with no stops left should do.
+    fn next_tab_stop(&self, col: usize) -> usize {
+        let last = self.cols.saturating_sub(1);
+        ((col + 1)..self.cols).find(|&c| self.tab_stops[c]).unwrap_or(last)
+    }
+
+    /// The column CBT moves to from `col`: the next stop to its left, or column 0.
+    fn prev_tab_stop(&self, col: usize) -> usize {
+        (0..col).rev().find(|&c| self.tab_stops[c]).unwrap_or(0)
+    }
+
+    /// CHT / CBT: move forward or back `n` tab stops.
+    fn tab_move(&mut self, n: usize, forward: bool) {
+        self.pending_wrap = false;
+        for _ in 0..n {
+            self.cursor.0 = if forward {
+                self.next_tab_stop(self.cursor.0)
+            } else {
+                self.prev_tab_stop(self.cursor.0)
+            };
+        }
+    }
+
+    /// TBC: clear the stop under the cursor (`0`) or every stop (`3`).
+    fn clear_tab_stop(&mut self, mode: u16) {
+        match mode {
+            0 => {
+                let c = self.cursor.0;
+                if c < self.tab_stops.len() {
+                    self.tab_stops[c] = false;
+                }
+            }
+            3 => self.tab_stops.iter_mut().for_each(|s| *s = false),
+            _ => {}
+        }
+    }
+
+    /// The power-on stop layout: every eighth column, which is what HT used to hardcode.
+    fn default_tab_stops(cols: usize) -> Vec<bool> {
+        (0..cols).map(|c| c > 0 && c % 8 == 0).collect()
+    }
+
     /// Translate a character through the active graphic set.
     ///
     /// Only DEC Special Graphics does anything here, and only over `_` to `~`: that block is where
@@ -784,10 +837,9 @@ impl Grid {
                 }
             }
             0x09 => {
-                // HT: next 8-column tab stop
+                // HT
                 self.pending_wrap = false;
-                let next = (self.cursor.0 / 8 + 1) * 8;
-                self.cursor.0 = next.min(self.cols - 1);
+                self.cursor.0 = self.next_tab_stop(self.cursor.0);
             }
             0x0e => self.shift_out = true,  // SO: select G1 into GL
             0x0f => self.shift_out = false, // SI: select G0 into GL
@@ -863,6 +915,13 @@ impl Grid {
                 // NEL
                 self.cursor.0 = 0;
                 self.linefeed();
+            }
+            b'H' => {
+                // HTS: set a tab stop at the cursor's column
+                let c = self.cursor.0;
+                if c < self.tab_stops.len() {
+                    self.tab_stops[c] = true;
+                }
             }
             b'c' => self.hard_reset(),        // RIS
             b'=' | b'>' => {}                 // keypad application/numeric mode: ignored
@@ -995,6 +1054,9 @@ impl Grid {
             b'l' => self.set_mode(false),
             b's' => self.save_cursor(),
             b'u' => self.restore_cursor(),
+            b'I' => self.tab_move(self.p1(0), true),  // CHT: forward n tab stops
+            b'Z' => self.tab_move(self.p1(0), false), // CBT: back n tab stops
+            b'g' => self.clear_tab_stop(self.praw(0)), // TBC
             b'n' => self.report_status(),
             b'c' => self.report_device_attrs(),
             _ => {}
@@ -1473,6 +1535,14 @@ impl Grid {
         self.cursor.1 = (self.cursor.1 - drop_top).min(rows - 1);
         self.cursor.0 = self.cursor.0.min(cols - 1);
         self.pending_wrap = false;
+        // Tab stops are per column, so a wider screen needs stops for the columns it gained. The
+        // existing ones are kept (an application that placed them did so deliberately) and the new
+        // tail gets the default every-eighth-column layout.
+        let old_len = self.tab_stops.len();
+        self.tab_stops.resize(cols, false);
+        for c in old_len..cols {
+            self.tab_stops[c] = c % 8 == 0;
+        }
         // History rows keep their old width (no reflow); `view_cell` pads short rows with blanks
         // and ignores the overhang, so only the offset needs re-clamping.
         self.view_offset = self.view_offset.min(self.history.len());
@@ -1533,6 +1603,7 @@ impl Grid {
         self.mouse_drag = false;
         self.mouse_any = false;
         self.mouse_sgr = false;
+        self.tab_stops = Self::default_tab_stops(self.cols);
         self.g0_graphics = false;
         self.g1_graphics = false;
         self.shift_out = false;
@@ -1809,6 +1880,73 @@ mod tests {
         // Back on the main screen the viewport takes over again.
         g.feed(b"\x1b[?1049l");
         assert_eq!(g.alt_scroll_keys(1), None);
+    }
+
+    // ---- tab stops ----
+
+    #[test]
+    fn tabs_default_to_every_eighth_column() {
+        let mut g = Grid::new(40, 1);
+        g.feed(b"a\tb\tc");
+        assert_eq!(g.to_lines()[0], "a       b       c");
+    }
+
+    #[test]
+    fn hts_and_tbc_edit_the_stops() {
+        let mut g = Grid::new(40, 1);
+        // Clear every stop, then place one at column 5 and one at column 12.
+        g.feed(b"\x1b[3g");
+        g.feed(b"\x1b[6G\x1bH\x1b[13G\x1bH\x1b[1G");
+        g.feed(b"a\tb\tc");
+        assert_eq!(g.to_lines()[0], "a    b      c");
+
+        // TBC with no parameter clears just the stop under the cursor, so the tab overshoots it.
+        g.feed(b"\x1b[H\x1b[K\x1b[6G\x1b[g\x1b[1G");
+        g.feed(b"a\tb");
+        assert_eq!(g.to_lines()[0], "a           b");
+    }
+
+    #[test]
+    fn tab_with_no_stops_left_parks_at_the_right_margin() {
+        let mut g = Grid::new(10, 1);
+        g.feed(b"\x1b[3g"); // clear every stop
+        g.feed(b"a\tb");
+        assert_eq!(g.to_lines()[0], "a        b");
+    }
+
+    #[test]
+    fn cht_and_cbt_walk_the_stops() {
+        let mut g = Grid::new(40, 1);
+        // CHT: forward three stops from column 0 → column 24 (stops at 8/16/24).
+        g.feed(b"\x1b[3IX");
+        assert_eq!(g.to_lines()[0], "                        X");
+
+        // CBT counts from where the cursor is now, which printing X advanced to 25 — so two stops
+        // back is 24 then 16, not 16 then 8.
+        g.feed(b"\x1b[2ZY");
+        assert_eq!(g.to_lines()[0].find('Y'), Some(16));
+
+        // CBT past the first stop stops at column 0 rather than wrapping.
+        g.feed(b"\x1b[9ZZ");
+        assert_eq!(g.to_lines()[0].find('Z'), Some(0));
+    }
+
+    #[test]
+    fn tab_stops_survive_a_resize_and_reset_with_ris() {
+        let mut g = Grid::new(20, 1);
+        g.feed(b"\x1b[3g\x1b[6G\x1bH"); // only stop: column 5
+        g.resize(40, 1);
+        // The stop the application placed survives the widening.
+        g.feed(b"\x1b[1G\x1b[Ka\tb");
+        assert_eq!(g.to_lines()[0], "a    b");
+        // The columns gained by widening (20..39) get the default layout, so the next stop past 5
+        // is 24 — the old columns keep the cleared state they were left in, they are not refilled.
+        g.feed(b"\x1b[1G\x1b[Ka\t\tb");
+        assert_eq!(g.to_lines()[0].find('b'), Some(24));
+
+        g.feed(b"\x1bc"); // RIS restores the power-on stops everywhere
+        g.feed(b"a\tb");
+        assert_eq!(g.to_lines()[0], "a       b");
     }
 
     // ---- DEC Special Graphics ----
