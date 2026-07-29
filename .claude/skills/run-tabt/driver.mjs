@@ -25,10 +25,11 @@
 //
 // Usage:
 //   node .claude/skills/run-tabt/driver.mjs smoke        # full run + asserts, nonzero exit on failure
-//   node .claude/skills/run-tabt/driver.mjs launch       # leave it running, prints the pid
+//   node .claude/skills/run-tabt/driver.mjs launch [--keep] # leave it running (--keep: don't wipe $HOME)
 //   node .claude/skills/run-tabt/driver.mjs feed '\e[31mred\r\n' [tab]  # tab: index or "last"
 //   node .claude/skills/run-tabt/driver.mjs shot [file]  # screenshot the window
 //   node .claude/skills/run-tabt/driver.mjs keys t cmd   # send a keystroke (here: new tab)
+//   node .claude/skills/run-tabt/driver.mjs menu 'Settings…'   # click a menu item (⌘, is not deliverable)
 //   node .claude/skills/run-tabt/driver.mjs scene vt     # render a VT torture page, then shot
 //   node .claude/skills/run-tabt/driver.mjs tty [n]      # print tab n's PTY slave path
 //   node .claude/skills/run-tabt/driver.mjs doctor       # check the TCC permissions
@@ -262,6 +263,29 @@ function shot(file) {
   return out;
 }
 
+/// Click a menu item by title, e.g. `menu('Settings…')`. Needs the Accessibility permission.
+///
+/// Not redundant with `keys`: a key equivalent only fires if AppKit routes the synthesized event
+/// to the menu, and it does not always do so. ⌘T arrives, ⌘, does not -- `keys , cmd` leaves the
+/// app untouched while this opens the Settings window. When a menu item has an action, prefer this.
+function menu(title, menuTitle = null) {
+  const pid = runningPid();
+  osa(`tell application "System Events" to set frontmost of (first process whose unix id is ${pid}) to true`);
+  osa('delay 0.3');
+  const where = menuTitle
+    ? `menu 1 of menu bar item "${menuTitle}" of menu bar 1`
+    // menu bar item 1 is the Apple menu, so the app's own menu is 2.
+    : 'menu 1 of menu bar item 2 of menu bar 1';
+  osa(`tell application "System Events" to tell (first process whose unix id is ${pid}) ` +
+      `to click menu item "${title}" of ${where}`);
+}
+
+/// The named windows of the instance, so a shot can target something other than the terminal.
+function windowNames(pid = runningPid()) {
+  return osa(`tell application "System Events" to tell (first process whose unix id is ${pid}) ` +
+             `to get name of every window`).split(',').map((s) => s.trim()).filter(Boolean);
+}
+
 /// Raise the instance and send one keystroke through System Events. `mods` is any of
 /// cmd/shift/opt/ctrl, comma- or space-separated. Needs the Accessibility permission.
 function keys(key, mods = '') {
@@ -448,8 +472,10 @@ const arg = (i) => process.argv[3 + i];
 if (cmd === 'smoke') {
   process.exit(await smoke());
 } else if (cmd === 'launch') {
-  const c = launch();
-  log(`pid ${c.pid}  HOME=${HOME}`);
+  // --keep preserves the scratch $HOME instead of rebuilding it, which is the only way to launch
+  // against a layout.conf you edited by hand (a theme, a seeded cwd): a plain launch wipes it.
+  const c = launch({ fresh: arg(0) !== '--keep' });
+  log(`pid ${c.pid}  HOME=${HOME}${arg(0) === '--keep' ? '  (kept)' : ''}`);
   log(`quit with: node ${process.argv[1]} quit`);
 } else if (cmd === 'quit') {
   const pid = Number(read(PIDFILE));
@@ -464,6 +490,11 @@ if (cmd === 'smoke') {
   log(`wrote ${arg(0)?.length ?? 0} chars to ${feed(arg(0) ?? '', arg(1) ?? 0)}`);
 } else if (cmd === 'shot') {
   log(shot(arg(0)));
+} else if (cmd === 'menu') {
+  menu(arg(0), arg(1));
+  log(`clicked menu item "${arg(0)}"`);
+} else if (cmd === 'windows') {
+  log(windowNames().join('\n'));
 } else if (cmd === 'keys') {
   keys(arg(0), process.argv.slice(4).join(' '));
   log(`sent ${[process.argv.slice(4).join('+'), arg(0)].filter(Boolean).join('+')}`);
@@ -477,6 +508,6 @@ if (cmd === 'smoke') {
 } else if (cmd === 'doctor') {
   process.exit(doctor());
 } else {
-  log('usage: driver.mjs [smoke|launch|quit|feed <bytes> [tab|last]|shot [file]|keys <key> [mods]|scene <name> [file] [tab]|tty [n]|doctor]');
+  log('usage: driver.mjs [smoke|launch|quit|feed <bytes> [tab|last]|shot [file]|keys <key> [mods]|menu <item> [menu]|windows|scene <name> [file] [tab]|tty [n]|doctor]');
   process.exit(2);
 }

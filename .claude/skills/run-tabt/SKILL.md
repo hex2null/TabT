@@ -89,6 +89,8 @@ node .claude/skills/run-tabt/driver.mjs launch          # prints the pid, return
 node .claude/skills/run-tabt/driver.mjs feed '\e[31mred\e[0m and \e[1mbold\e[0m\r\n'
 node .claude/skills/run-tabt/driver.mjs shot /tmp/tabt.png
 node .claude/skills/run-tabt/driver.mjs keys t cmd      # ⌘T — new tab
+node .claude/skills/run-tabt/driver.mjs menu 'Settings…'  # click a menu item
+node .claude/skills/run-tabt/driver.mjs windows         # list the instance's windows
 node .claude/skills/run-tabt/driver.mjs tty             # list each tab's PTY slave
 node .claude/skills/run-tabt/driver.mjs feed 'into tab 2\r\n' 1
 node .claude/skills/run-tabt/driver.mjs quit
@@ -146,6 +148,17 @@ window; see the first Gotcha before using it from an agent session.
 - **`feed` bypasses the shell.** The bytes land on screen as terminal *output*; zsh has no
   idea, so it will not repaint its prompt. A scene starting with `\e[2J\e[H` wipes the
   visible prompt — harmless, press Enter (or start a new tab) to get it back.
+- **A key equivalent is not guaranteed to arrive; a menu click is.** `keys t cmd` opens a new
+  tab, but `keys , cmd` does nothing at all — AppKit does not route that synthesized event to
+  the Settings menu item, which `menu 'Settings…'` opens reliably. Prefer `menu` whenever the
+  action has a menu entry, and verify with `windows` rather than assuming.
+- **`shot` only ever photographs window 1.** Auxiliary windows are missed, and the Settings
+  window in particular opens off-screen (`2622,-140`), where a region capture comes back
+  black. `windows` lists what exists; a shot of anything but the terminal needs its own
+  bounds.
+- **`launch` wipes the scratch `$HOME` every time.** To launch against a hand-edited
+  `layout.conf` — a theme, a seeded cwd — use `launch --keep`, or the file you just wrote is
+  deleted before the app ever reads it.
 - **`feed` picks a tab, `shot` photographs the visible one — and nothing links them.** Feed
   tab 0 while tab 2 is on screen and the screenshot shows tab 2's contents, silently. The
   driver cannot ask which tab is visible: the sidebar is self-drawn, so it exposes nothing
