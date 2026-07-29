@@ -630,11 +630,14 @@ impl Grid {
     /// Positive `lines` means scrolling back toward older output, i.e. cursor up. The count is
     /// capped at one screenful so a fast flick cannot flood the shell with keystrokes.
     ///
-    /// Mouse tracking wins: an application that asked for it gets the wheel as a real mouse report
-    /// (`mouse_report_bytes`) instead, and synthesizing cursor keys on top of that would feed it
-    /// phantom keystrokes it never asked for.
+    /// Mouse tracking is deliberately *not* consulted here. An application that asked for the mouse
+    /// normally gets the wheel as a real mouse report instead, but that routing is the input layer's
+    /// call (`mouse_owned_by_app`), because only it can see the escape hatches: with Shift held the
+    /// wheel belongs to the terminal again, and on the alternate screen "the terminal" can only mean
+    /// these cursor keys — there is no scrollback to move. Suppressing here would make Shift+wheel
+    /// under a tracking application do nothing at all.
     pub fn alt_scroll_keys(&self, lines: isize) -> Option<Vec<u8>> {
-        if !self.alt || !self.alt_scroll || lines == 0 || self.mouse_report() {
+        if !self.alt || !self.alt_scroll || lines == 0 {
             return None;
         }
         let seq: &[u8] = match (lines > 0, self.app_cursor_keys) {
@@ -1321,9 +1324,26 @@ impl Grid {
         let cols = self.cols;
         let n = n.min(cols - c);
         let base = r * cols;
+        // A shift moves one half of a double-width glyph and not the other: the pair straddling the
+        // insertion point keeps its lead in place while the trailer travels right, and the pair
+        // straddling the right margin loses its trailer off the end. Both halves are blanked first,
+        // so what moves is a blank rather than an orphan — a lead with no trailer draws its glyph
+        // over the neighbour that took its second column, and a trailer with no lead draws nothing.
+        self.split_wide_pair(c, r);
+        self.split_wide_pair(cols - n, r);
         self.cells.copy_within(base + c..base + cols - n, base + c + n);
         self.blank_range(base + c, base + c + n);
         self.pending_wrap = false;
+    }
+
+    /// Blank both halves of the wide pair straddling column `c`, i.e. the one whose trailer sits at
+    /// `c` and whose lead sits at `c - 1`. No-op for every other column, including one past the last.
+    fn split_wide_pair(&mut self, c: usize, r: usize) {
+        if c == 0 || c >= self.cols || self.cell(c, r).flags & WIDE_TRAILER == 0 {
+            return;
+        }
+        let base = r * self.cols;
+        self.blank_range(base + c - 1, base + c + 1);
     }
 
     fn delete_chars(&mut self, n: usize) {
@@ -1564,11 +1584,16 @@ impl Grid {
         self.pending_wrap = false;
         // Tab stops are per column, so a wider screen needs stops for the columns it gained. The
         // existing ones are kept (an application that placed them did so deliberately) and the new
-        // tail gets the default every-eighth-column layout.
+        // tail gets the default every-eighth-column layout. The table only ever grows: a narrower
+        // screen keeps the stops of the columns it lost, because dropping them would silently
+        // replace them with the power-on layout when the window is widened again — and an
+        // application only hears about a resize as SIGWINCH, so it never re-sends its HTS.
         let old_len = self.tab_stops.len();
-        self.tab_stops.resize(cols, false);
-        for c in old_len..cols {
-            self.tab_stops[c] = c % 8 == 0;
+        if cols > old_len {
+            self.tab_stops.resize(cols, false);
+            for c in old_len..cols {
+                self.tab_stops[c] = c % 8 == 0;
+            }
         }
         // History rows keep their old width (no reflow); `view_cell` pads short rows with blanks
         // and ignores the overhang, so only the offset needs re-clamping.
@@ -1896,14 +1921,13 @@ mod tests {
         g.feed(b"\x1b[?1007h");
         assert_eq!(g.alt_scroll_keys(1), Some(b"\x1b[A".to_vec()));
 
-        // Mouse tracking suppresses the translation: the wheel goes out as a real mouse report
-        // instead, and cursor keys on top of that would be keystrokes the application never asked for.
+        // Mouse tracking does not suppress the translation here. Sending the wheel as a mouse report
+        // instead is the input layer's decision, and it hands the wheel back to the terminal when
+        // Shift is held — at which point these keys are the only thing an alt screen can scroll with.
         g.feed(b"\x1b[?1000h");
         assert!(g.mouse_report());
-        assert_eq!(g.alt_scroll_keys(1), None);
-        g.feed(b"\x1b[?1000l");
-        assert!(!g.mouse_report());
         assert_eq!(g.alt_scroll_keys(1), Some(b"\x1b[A".to_vec()));
+        g.feed(b"\x1b[?1000l");
 
         // Back on the main screen the viewport takes over again.
         g.feed(b"\x1b[?1049l");
@@ -1943,6 +1967,23 @@ mod tests {
         g.feed("abcdef\x1b[4h\x1b[1G\u{4e2d}".as_bytes());
         // A wide glyph occupies two cells, so two are opened and two fall off the end.
         assert_eq!(g.to_lines()[0], "中abcd");
+    }
+
+    #[test]
+    fn irm_inserting_into_a_wide_glyph_blanks_both_of_its_halves() {
+        let mut g = Grid::new(6, 1);
+        // Cursor on the trailing half of 中, so the insert would separate it from its lead.
+        g.feed("\u{4e2d}x\x1b[4h\x1b[2GZ".as_bytes());
+        // Both halves become blanks (one of which is what shifts right); no orphan is left behind.
+        assert_eq!(g.to_lines()[0], " Z x");
+        assert_eq!(g.cell(0, 0).ch, ' ');
+        assert_eq!(g.cell(2, 0).flags & WIDE_TRAILER, 0);
+
+        // Same at the right margin: the pair whose trailer falls off the end goes with it.
+        let mut g = Grid::new(4, 1);
+        g.feed("ab\u{4e2d}\x1b[4h\x1b[1GZ".as_bytes());
+        assert_eq!(g.to_lines()[0], "Zab");
+        assert_eq!(g.cell(3, 0).ch, ' ');
     }
 
     #[test]
@@ -2018,6 +2059,18 @@ mod tests {
         g.feed(b"\x1bc"); // RIS restores the power-on stops everywhere
         g.feed(b"a\tb");
         assert_eq!(g.to_lines()[0], "a       b");
+    }
+
+    #[test]
+    fn tab_stops_survive_a_narrower_screen() {
+        let mut g = Grid::new(40, 1);
+        g.feed(b"\x1b[3g\x1b[31G\x1bH"); // only stop: column 30
+        // Narrowing drops the columns that hold the stop, but not the stop itself: an application
+        // only sees SIGWINCH, so it has no reason to place it again when the window comes back.
+        g.resize(20, 1);
+        g.resize(40, 1);
+        g.feed(b"\x1b[1G\x1b[Ka\tb");
+        assert_eq!(g.to_lines()[0].find('b'), Some(30));
     }
 
     // ---- DEC Special Graphics ----

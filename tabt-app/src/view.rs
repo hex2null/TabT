@@ -101,9 +101,11 @@ pub struct TermViewIvars {
     // so a slow continuous swipe still advances instead of rounding to zero forever.
     scroll_accum: Cell<f64>,
     // ---- Mouse reporting to the application (see `mouse_owned_by_app`) ----
-    // The button currently held for reporting purposes, so a drag can name it: AppKit delivers
-    // `mouseDragged:` without one. None when no button is down.
-    mouse_button: Cell<Option<MouseButton>>,
+    // The buttons whose press was reported to the application and that are still down, oldest
+    // first. A list rather than a single slot because buttons chord: a second one can go down
+    // before the first comes up, and each release has to name its own button. The last entry is
+    // the one a drag reports, since AppKit delivers `mouseDragged:` without a button of its own.
+    mouse_held: RefCell<Vec<MouseButton>>,
     // The last cell a motion report was sent for. Motion events arrive per pixel but the protocol
     // speaks in cells, so a report is only worth sending when the cell actually changes — otherwise
     // one slow drag across a single character floods the shell with identical reports.
@@ -233,6 +235,13 @@ declare_class!(
         fn mouse_down(&self, event: &NSEvent) {
             self.take_focus();
             if self.report_press(event, MouseButton::Left) {
+                // The click went to the application, but it is still a click in this view: a
+                // selection left over from before the application took the mouse would otherwise
+                // stay painted over its UI for good, and keep being what ⌘C copies.
+                if self.ivars().sel_anchor.get().is_some() {
+                    self.clear_selection();
+                    unsafe { self.setNeedsDisplay(true) };
+                }
                 return;
             }
             let c = self.cell_at(event);
@@ -252,7 +261,7 @@ declare_class!(
 
         #[method(mouseUp:)]
         fn mouse_up(&self, event: &NSEvent) {
-            self.report_release(event);
+            self.report_release(event, MouseButton::Left);
         }
 
         #[method(rightMouseDown:)]
@@ -268,7 +277,7 @@ declare_class!(
 
         #[method(rightMouseUp:)]
         fn right_mouse_up(&self, event: &NSEvent) {
-            self.report_release(event);
+            self.report_release(event, MouseButton::Right);
         }
 
         // Every button past left and right arrives here; only the middle one (button 2) maps to a
@@ -291,7 +300,7 @@ declare_class!(
         #[method(otherMouseUp:)]
         fn other_mouse_up(&self, event: &NSEvent) {
             if unsafe { event.buttonNumber() } == 2 {
-                self.report_release(event);
+                self.report_release(event, MouseButton::Middle);
             }
         }
 
@@ -363,6 +372,10 @@ declare_class!(
             // scrollback for the viewport to move through, so the wheel is translated into cursor
             // keys and the application scrolls itself — see `Grid::alt_scroll_keys`, which returns
             // None whenever that translation must not happen.
+            //
+            // Reached under tracking too, whenever the check above handed the wheel back (Shift):
+            // on the alternate screen these keys *are* the terminal's own scrolling, so skipping
+            // them there would make the escape hatch do nothing at all.
             if let Some(keys) = self.ivars().grid.borrow().alt_scroll_keys(lines) {
                 if !self.ivars().ended.get() {
                     unsafe { write_all(self.ivars().master_fd.get(), &keys) };
@@ -552,7 +565,7 @@ impl TermView {
             toggle_fn: Cell::new(None),
             ended: Cell::new(false),
             scroll_accum: Cell::new(0.0),
-            mouse_button: Cell::new(None),
+            mouse_held: RefCell::new(Vec::new()),
             mouse_last_cell: Cell::new(None),
             tracking_added: Cell::new(false),
             sel_anchor: Cell::new(None),
@@ -820,7 +833,7 @@ impl TermView {
 
     /// Report a button press, returning whether the application took the event. When it did, the
     /// button is remembered so the drag that may follow can name it — AppKit's `mouseDragged:`
-    /// does not carry one.
+    /// does not carry one — and so its release can be matched to it.
     fn report_press(&self, event: &NSEvent, button: MouseButton) -> bool {
         if !self.mouse_owned_by_app(event, false) {
             return false;
@@ -832,7 +845,10 @@ impl TermView {
             col,
             row,
         );
-        self.ivars().mouse_button.set(Some(button));
+        let mut held = self.ivars().mouse_held.borrow_mut();
+        held.retain(|&b| b != button);
+        held.push(button);
+        drop(held);
         self.ivars().mouse_last_cell.set(Some((col, row)));
         if let Some(b) = bytes {
             self.write_report(&b);
@@ -840,18 +856,26 @@ impl TermView {
         true
     }
 
-    /// Report a button release, returning whether the application took the event. The held button
-    /// is cleared either way, so a release that arrives after tracking was turned off mid-drag
-    /// cannot leave a phantom button behind.
-    fn report_release(&self, event: &NSEvent) -> bool {
-        let button = self.ivars().mouse_button.replace(None);
-        self.ivars().mouse_last_cell.set(None);
-        let button = match button {
-            Some(b) => b,
-            None => return false,
-        };
-        if !self.mouse_owned_by_app(event, false) {
+    /// Report the release of `button`, returning whether the application took the event.
+    ///
+    /// The press being remembered is the whole test: a gesture the application took belongs to it
+    /// until the button comes back up, so the release goes out even if ownership has lapsed in the
+    /// meantime — Shift pressed part-way through the drag, or a viewport scrolled back. Dropping it
+    /// there would leave the application holding a button that was never released, i.e. treating
+    /// every later move as a continuation of a drag the user finished long ago. Tracking turned off
+    /// mid-gesture is the one case that still sends nothing, and `mouse_report_bytes` handles it.
+    fn report_release(&self, event: &NSEvent, button: MouseButton) -> bool {
+        let mut held = self.ivars().mouse_held.borrow_mut();
+        let taken = held.iter().any(|&b| b == button);
+        held.retain(|&b| b != button);
+        let empty = held.is_empty();
+        drop(held);
+        if !taken {
             return false;
+        }
+        if empty {
+            // Nothing is being dragged any more, so the next motion starts its own dedup run.
+            self.ivars().mouse_last_cell.set(None);
         }
         let (col, row) = self.viewport_cell_at(event);
         let bytes = self.ivars().grid.borrow().mouse_report_bytes(
@@ -874,9 +898,11 @@ impl TermView {
     /// the drag fall through there would extend a selection whose anchor was never set by this
     /// gesture (the press went to the application), i.e. drag from wherever the *previous*
     /// selection started. Under tracking, selecting text is Shift's job; this is also what xterm does.
+    ///
+    /// A chord reports against the button pressed last, which is the one the user is acting with.
     fn report_drag(&self, event: &NSEvent) -> bool {
-        let button = match self.ivars().mouse_button.get() {
-            Some(b) => b,
+        let button = match self.ivars().mouse_held.borrow().last() {
+            Some(&b) => b,
             None => return false,
         };
         self.report_motion(event, Some(button));
