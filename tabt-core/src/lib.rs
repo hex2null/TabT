@@ -10,9 +10,12 @@
 //!   - scroll region DECSTBM and IND/RI/NEL, SU/SD;
 //!   - save/restore cursor DECSC/DECRC and CSI s/u;
 //!   - DEC private modes `?…h/l` (autowrap, cursor visibility, alt screen, app cursor keys) are
-//!     applied; bracketed paste (2004), alternate scroll (1007) and mouse tracking (1000/1002/1003)
-//!     are tracked for the input layer via `bracketed_paste()` / `alt_scroll_keys()`;
+//!     applied; bracketed paste (2004) and alternate scroll (1007) are tracked for the input layer
+//!     via `bracketed_paste()` / `alt_scroll_keys()`;
 //!     others are acknowledged and swallowed, no longer leaking out as literal text;
+//!   - mouse tracking (DECSET 1000/1002/1003) in both the legacy and the SGR (1006) encoding: the
+//!     input layer hands each event to `mouse_report_bytes()`, which gates it on the mode the
+//!     application asked for and encodes it;
 //!   - OSC title (`]0;…`) collected into `title`;
 //!   - OSC 7 cwd reporting, percent-decoded;
 //!   - alternate screen buffer (DECSET 47/1047/1049), used by vim/less/htop/man;
@@ -46,6 +49,76 @@ impl Default for Cell {
 
 /// A blank cell, returned by `view_cell()` for columns past the end of a (trimmed) history row.
 const BLANK: Cell = Cell { ch: ' ', fg: Color::Default, bg: Color::Default, flags: 0 };
+
+/// How much mouse activity the running application asked to be told about. Ordered least to most,
+/// so the effective level is simply the largest one currently enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MouseMode {
+    /// No tracking: the mouse belongs to the terminal (text selection).
+    Off,
+    /// DECSET 1000 — button presses and releases.
+    Press,
+    /// DECSET 1002 — the above, plus motion while a button is held.
+    Drag,
+    /// DECSET 1003 — the above, plus motion with no button held.
+    Any,
+}
+
+/// A mouse button, as the protocol counts them. The wheel is reported as a button too, which is
+/// why its notches live here rather than in a separate event kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+    WheelLeft,
+    WheelRight,
+}
+
+impl MouseButton {
+    /// The button field of a mouse report. The wheel occupies a separate block starting at 64.
+    fn code(self) -> u8 {
+        match self {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            MouseButton::WheelUp => 64,
+            MouseButton::WheelDown => 65,
+            MouseButton::WheelLeft => 66,
+            MouseButton::WheelRight => 67,
+        }
+    }
+
+    /// Whether this is a wheel notch, which is reported as a press with no matching release.
+    fn is_wheel(self) -> bool {
+        matches!(
+            self,
+            MouseButton::WheelUp
+                | MouseButton::WheelDown
+                | MouseButton::WheelLeft
+                | MouseButton::WheelRight
+        )
+    }
+}
+
+/// Modifier keys held during a mouse event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MouseMods {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
+/// A mouse event to be reported to the application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseEvent {
+    Press(MouseButton),
+    Release(MouseButton),
+    /// Pointer motion: `Some(button)` while a button is held (a drag), `None` otherwise.
+    Motion(Option<MouseButton>),
+}
 
 /// Maximum number of scrolled-off lines retained per grid. Rows are stored with their trailing
 /// blank cells trimmed, so a typical shell session costs far less than `HISTORY_MAX * cols`.
@@ -180,10 +253,15 @@ pub struct Grid {
     // otherwise the wheel is dead in every full-screen app (less, vim, TUIs). On by default, as in
     // most modern terminals; an application can turn it off with CSI ? 1007 l.
     alt_scroll: bool,
-    // DECSET 1000/1002/1003: mouse tracking. This layer has no mouse reporting of its own, but the
-    // input layer must know when an application asked for it: it then wants real mouse events, and
-    // synthesizing cursor keys for the wheel would feed it keystrokes it never asked for.
-    mouse_report: bool,
+    // DECSET 1000/1002/1003: mouse tracking, and DECSET 1006: the SGR encoding for it. The three
+    // tracking modes are kept as separate flags rather than one level, because they are separate
+    // modes in xterm: turning 1000 off must not cancel a 1002 that is still on, which is exactly
+    // what an application does when it switches between them. `mouse_mode()` derives the effective
+    // level from all three; `mouse_report_bytes()` does the encoding.
+    mouse_press: bool, // 1000: presses and releases
+    mouse_drag: bool,  // 1002: the above, plus motion while a button is held
+    mouse_any: bool,   // 1003: the above, plus motion with no button held
+    mouse_sgr: bool,   // 1006: SGR encoding, which lifts the legacy 223-column coordinate limit
 
     // ---- Window title received via OSC ----
     pub title: String,
@@ -232,7 +310,10 @@ impl Grid {
             app_cursor_keys: false,
             bracketed_paste: false,
             alt_scroll: true,
-            mouse_report: false,
+            mouse_press: false,
+            mouse_drag: false,
+            mouse_any: false,
+            mouse_sgr: false,
             title: String::new(),
             cwd: String::new(),
             replies: Vec::new(),
@@ -384,10 +465,89 @@ impl Grid {
         self.alt
     }
 
-    /// Whether an application asked for mouse tracking (DECSET 1000/1002/1003). Nothing acts on
-    /// this yet — it is the hook for real mouse reporting; see `alt_scroll_keys`.
+    /// The effective mouse tracking level asked for by the application (DECSET 1000/1002/1003).
+    ///
+    /// The three modes are independent flags, so the level is the most permissive one currently
+    /// on: an application that turns 1002 on and then 1000 off still wants drag reports.
+    pub fn mouse_mode(&self) -> MouseMode {
+        if self.mouse_any {
+            MouseMode::Any
+        } else if self.mouse_drag {
+            MouseMode::Drag
+        } else if self.mouse_press {
+            MouseMode::Press
+        } else {
+            MouseMode::Off
+        }
+    }
+
+    /// Whether an application asked for mouse tracking at all. The input layer uses this to decide
+    /// whether the mouse belongs to the application or to the terminal's own text selection.
     pub fn mouse_report(&self) -> bool {
-        self.mouse_report
+        self.mouse_mode() != MouseMode::Off
+    }
+
+    /// The bytes to send for a mouse event at cell (`col`, `row`), or `None` when the current
+    /// tracking mode does not want this event (which is the common case — an application in mode
+    /// 1000 gets no motion at all, and no mode reports a wheel release).
+    ///
+    /// Coordinates are zero-based cell indices; the wire format is one-based.
+    pub fn mouse_report_bytes(
+        &self,
+        event: MouseEvent,
+        mods: MouseMods,
+        col: usize,
+        row: usize,
+    ) -> Option<Vec<u8>> {
+        let mode = self.mouse_mode();
+        if mode == MouseMode::Off {
+            return None;
+        }
+
+        // Which events each mode wants, and the button field each carries. Note that a wheel notch
+        // is reported as a button *press* with no matching release, as in xterm — hence no wheel
+        // arm under `Release`. Motion with no button held uses button code 3, the same "no button"
+        // value a legacy release uses.
+        const NO_BUTTON: u8 = 3;
+        let (base, motion, release) = match event {
+            MouseEvent::Press(b) => (b.code(), false, false),
+            MouseEvent::Release(b) if b.is_wheel() => return None,
+            MouseEvent::Release(b) => (b.code(), false, true),
+            MouseEvent::Motion(Some(b)) if mode >= MouseMode::Drag => (b.code(), true, false),
+            MouseEvent::Motion(None) if mode == MouseMode::Any => (NO_BUTTON, true, false),
+            MouseEvent::Motion(_) => return None,
+        };
+
+        let mut code = base
+            + if motion { 32 } else { 0 }
+            + if mods.shift { 4 } else { 0 }
+            + if mods.alt { 8 } else { 0 }
+            + if mods.ctrl { 16 } else { 0 };
+
+        if self.mouse_sgr {
+            // SGR (1006): `CSI < code ; col ; row` and a final byte that carries press vs release,
+            // so the real button survives a release and the coordinates are unbounded.
+            let final_byte = if release { 'm' } else { 'M' };
+            return Some(
+                format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, final_byte).into_bytes(),
+            );
+        }
+
+        // Legacy (X10): `CSI M` and three bytes biased by 32. A release cannot name its button
+        // here — the encoding has no room for the distinction, so every release is button 3.
+        if release {
+            code = NO_BUTTON
+                + if mods.shift { 4 } else { 0 }
+                + if mods.alt { 8 } else { 0 }
+                + if mods.ctrl { 16 } else { 0 };
+        }
+        // A byte tops out at 255, so this encoding cannot express a coordinate past 223. We clamp
+        // rather than drop the report: an application stuck on the legacy encoding in a window
+        // wider than 223 columns is better served by a click at the last column it can name than
+        // by a mouse that silently dies over the right-hand edge of the window.
+        let cx = (col + 1).min(223) as u8 + 32;
+        let cy = (row + 1).min(223) as u8 + 32;
+        Some(vec![0x1b, b'[', b'M', code + 32, cx, cy])
     }
 
     /// The byte sequence a wheel scroll of `lines` should send while the alternate screen is up,
@@ -396,13 +556,11 @@ impl Grid {
     /// Positive `lines` means scrolling back toward older output, i.e. cursor up. The count is
     /// capped at one screenful so a fast flick cannot flood the shell with keystrokes.
     ///
-    /// Note that `mouse_report` is deliberately *not* consulted. Terminals that suppress alternate
-    /// scroll under mouse tracking do so because they send the wheel as a mouse report instead;
-    /// this layer has no mouse reporting at all, so suppressing here would leave the application
-    /// with nothing — a dead wheel in every TUI that turns tracking on. Add the check together with
-    /// real mouse reports, not before.
+    /// Mouse tracking wins: an application that asked for it gets the wheel as a real mouse report
+    /// (`mouse_report_bytes`) instead, and synthesizing cursor keys on top of that would feed it
+    /// phantom keystrokes it never asked for.
     pub fn alt_scroll_keys(&self, lines: isize) -> Option<Vec<u8>> {
-        if !self.alt || !self.alt_scroll || lines == 0 {
+        if !self.alt || !self.alt_scroll || lines == 0 || self.mouse_report() {
             return None;
         }
         let seq: &[u8] = match (lines > 0, self.app_cursor_keys) {
@@ -1154,8 +1312,15 @@ impl Grid {
                             }
                         }
                     }
-                    1000 | 1002 | 1003 => self.mouse_report = set, // mouse tracking (see `mouse_report`)
-                    1007 => self.alt_scroll = set,                 // alternate scroll
+                    1000 => self.mouse_press = set, // mouse tracking: press/release
+                    1002 => self.mouse_drag = set,  // ... plus drag motion
+                    1003 => self.mouse_any = set,   // ... plus button-less motion
+                    1006 => self.mouse_sgr = set,   // SGR mouse encoding
+                    // 1005 (UTF-8) and 1015 (urxvt) are rival extended encodings, both superseded
+                    // by 1006 and both ambiguous to decode. Left off deliberately: an application
+                    // that is refused them falls back to the legacy encoding, which does work.
+                    1005 | 1015 => {}
+                    1007 => self.alt_scroll = set, // alternate scroll
                     2004 => self.bracketed_paste = set,
                     _ => {} // other private modes: acknowledged and ignored
                 }
@@ -1270,7 +1435,10 @@ impl Grid {
         self.cursor_visible = true;
         self.app_cursor_keys = false;
         self.alt_scroll = true;
-        self.mouse_report = false;
+        self.mouse_press = false;
+        self.mouse_drag = false;
+        self.mouse_any = false;
+        self.mouse_sgr = false;
         self.state = State::Ground;
         self.params.clear();
         self.csi_cur = 0;
@@ -1531,17 +1699,176 @@ mod tests {
         g.feed(b"\x1b[?1007h");
         assert_eq!(g.alt_scroll_keys(1), Some(b"\x1b[A".to_vec()));
 
-        // Mouse tracking is tracked but must NOT suppress the translation while this layer has no
-        // mouse reports to send in its place (see `alt_scroll_keys`) — that would be a dead wheel.
+        // Mouse tracking suppresses the translation: the wheel goes out as a real mouse report
+        // instead, and cursor keys on top of that would be keystrokes the application never asked for.
         g.feed(b"\x1b[?1000h");
         assert!(g.mouse_report());
-        assert_eq!(g.alt_scroll_keys(1), Some(b"\x1b[A".to_vec()));
+        assert_eq!(g.alt_scroll_keys(1), None);
         g.feed(b"\x1b[?1000l");
         assert!(!g.mouse_report());
+        assert_eq!(g.alt_scroll_keys(1), Some(b"\x1b[A".to_vec()));
 
         // Back on the main screen the viewport takes over again.
         g.feed(b"\x1b[?1049l");
         assert_eq!(g.alt_scroll_keys(1), None);
+    }
+
+    // ---- mouse reporting ----
+
+    /// A press of the left button at (col, row) with no modifiers, the common case in these tests.
+    fn press(g: &Grid, col: usize, row: usize) -> Option<Vec<u8>> {
+        g.mouse_report_bytes(
+            MouseEvent::Press(MouseButton::Left),
+            MouseMods::default(),
+            col,
+            row,
+        )
+    }
+
+    #[test]
+    fn mouse_modes_are_independent_and_ordered() {
+        let mut g = Grid::new(80, 24);
+        assert_eq!(g.mouse_mode(), MouseMode::Off);
+        assert!(!g.mouse_report());
+
+        g.feed(b"\x1b[?1002h");
+        assert_eq!(g.mouse_mode(), MouseMode::Drag);
+        // Turning a *different* mode off must not cancel the one that is on — applications switch
+        // between the modes by setting one and clearing the others, in either order.
+        g.feed(b"\x1b[?1000l");
+        assert_eq!(g.mouse_mode(), MouseMode::Drag);
+        // The effective level is the most permissive one enabled, whatever order they arrived in.
+        g.feed(b"\x1b[?1003h");
+        assert_eq!(g.mouse_mode(), MouseMode::Any);
+        g.feed(b"\x1b[?1003l");
+        assert_eq!(g.mouse_mode(), MouseMode::Drag);
+        g.feed(b"\x1b[?1002l");
+        assert_eq!(g.mouse_mode(), MouseMode::Off);
+    }
+
+    #[test]
+    fn mouse_off_reports_nothing() {
+        let g = Grid::new(80, 24);
+        assert_eq!(press(&g, 0, 0), None);
+    }
+
+    #[test]
+    fn mouse_legacy_encoding_biases_by_32_and_is_one_based() {
+        let mut g = Grid::new(80, 24);
+        g.feed(b"\x1b[?1000h");
+        // Cell (0,0) → coordinates 1,1 → bytes 33,33. Left button press → code 0 → byte 32.
+        assert_eq!(press(&g, 0, 0), Some(b"\x1b[M\x20\x21\x21".to_vec()));
+        // Cell (9,4) → 10,5 → 42,37.
+        assert_eq!(press(&g, 9, 4), Some(vec![0x1b, b'[', b'M', 32, 42, 37]));
+    }
+
+    #[test]
+    fn mouse_legacy_release_loses_the_button_and_wheel_has_none() {
+        let mut g = Grid::new(80, 24);
+        g.feed(b"\x1b[?1000h");
+        // The legacy encoding has no room to name the button being released: it is always 3.
+        let right_up = g.mouse_report_bytes(
+            MouseEvent::Release(MouseButton::Right),
+            MouseMods::default(),
+            0,
+            0,
+        );
+        assert_eq!(right_up, Some(vec![0x1b, b'[', b'M', 3 + 32, 33, 33]));
+
+        // A wheel notch is a press with no matching release; the release must produce nothing.
+        let wheel_down = g.mouse_report_bytes(
+            MouseEvent::Press(MouseButton::WheelDown),
+            MouseMods::default(),
+            0,
+            0,
+        );
+        assert_eq!(wheel_down, Some(vec![0x1b, b'[', b'M', 65 + 32, 33, 33]));
+        let wheel_up_release = g.mouse_report_bytes(
+            MouseEvent::Release(MouseButton::WheelDown),
+            MouseMods::default(),
+            0,
+            0,
+        );
+        assert_eq!(wheel_up_release, None);
+    }
+
+    #[test]
+    fn mouse_modifiers_are_added_to_the_button_code() {
+        let mut g = Grid::new(80, 24);
+        g.feed(b"\x1b[?1000h\x1b[?1006h");
+        let mods = MouseMods { shift: true, alt: false, ctrl: true };
+        // Left (0) + shift (4) + ctrl (16) = 20.
+        assert_eq!(
+            g.mouse_report_bytes(MouseEvent::Press(MouseButton::Left), mods, 0, 0),
+            Some(b"\x1b[<20;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn mouse_sgr_keeps_the_button_on_release_and_lifts_the_coordinate_limit() {
+        let mut g = Grid::new(400, 24);
+        g.feed(b"\x1b[?1000h\x1b[?1006h");
+        // Press and release differ only in the final byte, so the button survives the release.
+        assert_eq!(press(&g, 0, 0), Some(b"\x1b[<0;1;1M".to_vec()));
+        assert_eq!(
+            g.mouse_report_bytes(
+                MouseEvent::Release(MouseButton::Right),
+                MouseMods::default(),
+                0,
+                0
+            ),
+            Some(b"\x1b[<2;1;1m".to_vec())
+        );
+        // Past the 223-column ceiling of the legacy encoding, which SGR does not have.
+        assert_eq!(press(&g, 299, 0), Some(b"\x1b[<0;300;1M".to_vec()));
+    }
+
+    #[test]
+    fn mouse_legacy_clamps_coordinates_past_its_ceiling() {
+        let mut g = Grid::new(400, 24);
+        g.feed(b"\x1b[?1000h");
+        // 223 is the largest coordinate a 32-biased byte can carry; beyond it we clamp rather than
+        // drop the report, so the mouse does not silently die over the right-hand edge.
+        assert_eq!(press(&g, 222, 0), Some(vec![0x1b, b'[', b'M', 32, 255, 33]));
+        assert_eq!(press(&g, 350, 0), Some(vec![0x1b, b'[', b'M', 32, 255, 33]));
+    }
+
+    #[test]
+    fn mouse_motion_is_gated_on_the_tracking_mode() {
+        let mut g = Grid::new(80, 24);
+        let drag = MouseEvent::Motion(Some(MouseButton::Left));
+        let hover = MouseEvent::Motion(None);
+        let m = MouseMods::default();
+
+        // 1000: presses only, no motion of any kind.
+        g.feed(b"\x1b[?1000h");
+        assert_eq!(g.mouse_report_bytes(drag, m, 0, 0), None);
+        assert_eq!(g.mouse_report_bytes(hover, m, 0, 0), None);
+
+        // 1002: drags, but still no button-less motion. Motion adds 32 to the button code.
+        g.feed(b"\x1b[?1002h");
+        assert_eq!(
+            g.mouse_report_bytes(drag, m, 0, 0),
+            Some(vec![0x1b, b'[', b'M', 32 + 32, 33, 33])
+        );
+        assert_eq!(g.mouse_report_bytes(hover, m, 0, 0), None);
+
+        // 1003: everything, and button-less motion reports the "no button" code 3.
+        g.feed(b"\x1b[?1003h");
+        assert_eq!(
+            g.mouse_report_bytes(hover, m, 0, 0),
+            Some(vec![0x1b, b'[', b'M', 3 + 32 + 32, 33, 33])
+        );
+    }
+
+    #[test]
+    fn mouse_state_is_cleared_by_a_hard_reset() {
+        let mut g = Grid::new(80, 24);
+        g.feed(b"\x1b[?1003h\x1b[?1006h");
+        assert_eq!(g.mouse_mode(), MouseMode::Any);
+        g.feed(b"\x1bc"); // RIS
+        assert_eq!(g.mouse_mode(), MouseMode::Off);
+        assert_eq!(press(&g, 0, 0), None);
     }
 
     #[test]
