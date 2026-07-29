@@ -16,8 +16,9 @@ sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT
 3. **Search & rename** — ⌘F filters the list; double-click a tab/group to rename in place.
 4. **Color themes** — 12 built-in schemes, six dark (Tokyo Night, Catppuccin Mocha, Dracula, Nord,
    Gruvbox Dark, Solarized Dark) and six light (Catppuccin Latte, Rosé Pine Dawn, Gruvbox Light,
-   Solarized Light, GitHub Light, Ayu Light);
-   the whole UI derives from the active theme, staying legible on light and dark alike.
+   Solarized Light, GitHub Light, Ayu Light); the whole UI derives from the active theme, staying
+   legible on light and dark alike. They are plain data, not code: edit `~/.tabt/themes.conf` to
+   change one or add your own.
 5. **Fonts** — 10 classic monospace families, adjustable live with ⌘= / ⌘- / ⌘0.
 6. **Settings dialog** (⌘,) — theme, font, sidebar side, border visibility, all applied live.
 7. **Per-tab status dot** — click a tab's dot to give it a color.
@@ -28,6 +29,16 @@ sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT
 10. **VT/ANSI core** — SGR colors and text attributes, cursor/scroll/erase operations, alternate
     screen buffer, DEC private modes and IRM, tab stops, the DEC line-drawing charset, DSR/DA,
     OSC title and cwd reporting, UTF-8.
+
+## Install
+
+Download `TabT-<version>.dmg` from the [latest release](https://github.com/hex2null/TabT/releases/latest)
+and drag TabT to Applications. macOS 12 or later.
+
+The released image is **not** signed with a Developer ID or notarized, so Gatekeeper will refuse to
+open it on first launch. Right-click the app and choose *Open* (or run
+`xattr -dr com.apple.quarantine /Applications/TabT.app`) to get past that once. Building it yourself,
+below, avoids the question entirely.
 
 ## Build & run
 
@@ -61,8 +72,9 @@ A two-crate Cargo workspace: `tabt-core` (the VT/ANSI engine — pure logic, zer
 runs and tests on any platform) and `tabt-app` (the AppKit UI layer via `objc2`, macOS-only).
 
 ```sh
-make test    # tabt-core unit tests
+make test    # tabt-core unit tests, then tabt-app's (the themes.conf parser)
 make run     # build, bundle into dist/, and launch the app
+make dmg     # build the release app and package dist/TabT-<version>.dmg
 make echo    # standalone PTY echo loop, a debugging tool; run in a real terminal, not an IDE panel
 make bloat   # binary size audit (needs `cargo install cargo-bloat`)
 make clean   # remove build artifacts
