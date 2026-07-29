@@ -866,10 +866,21 @@ impl TermView {
         true
     }
 
-    /// Report a drag, i.e. motion with the remembered button held.
+    /// Report a drag, i.e. motion with the remembered button held. Returns whether the application
+    /// took the event.
+    ///
+    /// A remembered button means the press was already taken, so the rest of the gesture is the
+    /// application's too — even in mode 1000, which asks for presses but discards motion. Letting
+    /// the drag fall through there would extend a selection whose anchor was never set by this
+    /// gesture (the press went to the application), i.e. drag from wherever the *previous*
+    /// selection started. Under tracking, selecting text is Shift's job; this is also what xterm does.
     fn report_drag(&self, event: &NSEvent) -> bool {
-        let button = self.ivars().mouse_button.get();
-        self.report_motion(event, button)
+        let button = match self.ivars().mouse_button.get() {
+            Some(b) => b,
+            None => return false,
+        };
+        self.report_motion(event, Some(button));
+        true
     }
 
     /// Report pointer motion, returning whether the application took the event. Reports are
