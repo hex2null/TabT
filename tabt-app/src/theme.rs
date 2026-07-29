@@ -92,7 +92,7 @@ fn luminance(c: Rgb) -> f64 {
 }
 
 /// The display order in the sidebar footer = the index in by_index.
-pub const NAMES: [&str; 9] = [
+pub const NAMES: [&str; 10] = [
     "Default",
     "Classic Green",
     "Amber",
@@ -102,6 +102,7 @@ pub const NAMES: [&str; 9] = [
     "Dracula",
     "Nord",
     "GitHub Light",
+    "Tokyo Night",
 ];
 
 /// The theme a fresh install starts on. Kept here rather than in `config.rs` so the on-disk default
@@ -229,6 +230,30 @@ const GITHUB_LIGHT: [(u8, u8, u8); 16] = [
     (209, 213, 218),
 ];
 
+/// Tokyo Night: deep blue-violet night palette, muted pastel accents.
+///
+/// The upstream theme ships one accent set for both halves of the 16, so the bright arm repeats
+/// the normal one — only black and white differ (bright black lifts to the comment gray, bright
+/// white to the default foreground). Written out rather than derived, to stay a faithful copy.
+const TOKYO_NIGHT: [(u8, u8, u8); 16] = [
+    (21, 22, 30),    // 0  black
+    (247, 118, 142), // 1  red
+    (158, 206, 106), // 2  green
+    (224, 175, 104), // 3  yellow
+    (122, 162, 247), // 4  blue
+    (187, 154, 247), // 5  magenta
+    (125, 207, 255), // 6  cyan
+    (169, 177, 214), // 7  white
+    (65, 72, 104),   // 8  bright black (comment gray)
+    (247, 118, 142), // 9  bright red
+    (158, 206, 106), // 10 bright green
+    (224, 175, 104), // 11 bright yellow
+    (122, 162, 247), // 12 bright blue
+    (187, 154, 247), // 13 bright magenta
+    (125, 207, 255), // 14 bright cyan
+    (192, 202, 245), // 15 bright white (= default fg)
+];
+
 /// Get a theme by index (out of bounds falls back to default). The order must match [`NAMES`].
 pub fn by_index(i: usize) -> Theme {
     match i {
@@ -286,6 +311,13 @@ pub fn by_index(i: usize) -> Theme {
             fg: (36.0 / 255.0, 41.0 / 255.0, 46.0 / 255.0),
             bg: (1.0, 1.0, 1.0),
             palette: GITHUB_LIGHT,
+            mono: false,
+        },
+        9 => Theme {
+            // Tokyo Night: #1a1b26 background / #c0caf5 foreground
+            fg: (192.0 / 255.0, 202.0 / 255.0, 245.0 / 255.0),
+            bg: (26.0 / 255.0, 27.0 / 255.0, 38.0 / 255.0),
+            palette: TOKYO_NIGHT,
             mono: false,
         },
         _ => Theme {
