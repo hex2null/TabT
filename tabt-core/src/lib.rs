@@ -50,6 +50,45 @@ impl Default for Cell {
 /// A blank cell, returned by `view_cell()` for columns past the end of a (trimmed) history row.
 const BLANK: Cell = Cell { ch: ' ', fg: Color::Default, bg: Color::Default, flags: 0 };
 
+/// DEC Special Graphics, the line-drawing set selected by `ESC ( 0`, covering `_` (0x5f) through
+/// `~` (0x7e) in order. The middle stretch is the box-drawing alphabet: `lqk` / `x x` / `mqj` draws
+/// a rectangle, which is what every ncurses frame is made of underneath.
+#[rustfmt::skip]
+const DEC_GRAPHICS: [char; 32] = [
+    ' ',      // _  blank
+    '◆',      // `  diamond
+    '▒',      // a  checkerboard
+    '␉',      // b  HT
+    '␌',      // c  FF
+    '␍',      // d  CR
+    '␊',      // e  LF
+    '°',      // f  degree
+    '±',      // g  plus/minus
+    '␤',      // h  NL
+    '␋',      // i  VT
+    '┘',      // j  lower right corner
+    '┐',      // k  upper right corner
+    '┌',      // l  upper left corner
+    '└',      // m  lower left corner
+    '┼',      // n  crossing lines
+    '⎺',      // o  horizontal scan line 1
+    '⎻',      // p  horizontal scan line 3
+    '─',      // q  horizontal scan line 5 (the plain horizontal rule)
+    '⎼',      // r  horizontal scan line 7
+    '⎽',      // s  horizontal scan line 9
+    '├',      // t  left tee
+    '┤',      // u  right tee
+    '┴',      // v  bottom tee
+    '┬',      // w  top tee
+    '│',      // x  vertical line
+    '≤',      // y  less than or equal
+    '≥',      // z  greater than or equal
+    'π',      // {  pi
+    '≠',      // |  not equal
+    '£',      // }  pound sterling
+    '·',      // ~  centered dot
+];
+
 /// How much mouse activity the running application asked to be told about. Ordered least to most,
 /// so the effective level is simply the largest one currently enabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -263,6 +302,17 @@ pub struct Grid {
     mouse_any: bool,   // 1003: the above, plus motion with no button held
     mouse_sgr: bool,   // 1006: SGR encoding, which lifts the legacy 223-column coordinate limit
 
+    // ---- Character sets ----
+    // Which of G0/G1 currently holds DEC Special Graphics (designated by `ESC ( 0` / `ESC ) 0`),
+    // and which of the two SI/SO has selected. Applications commonly park the line-drawing set in
+    // G1 and flip it in and out with SO/SI around each run of box characters.
+    g0_graphics: bool,
+    g1_graphics: bool,
+    shift_out: bool,
+    // The intermediate byte that opened the current `EscInt` sequence, needed because its final
+    // byte means nothing on its own — `0` designates the graphics set into G0 or G1 depending on it.
+    esc_intermediate: u8,
+
     // ---- Window title received via OSC ----
     pub title: String,
     // ---- Current working directory reported via OSC 7 (local path parsed from a file:// URL) ----
@@ -314,6 +364,10 @@ impl Grid {
             mouse_drag: false,
             mouse_any: false,
             mouse_sgr: false,
+            g0_graphics: false,
+            g1_graphics: false,
+            shift_out: false,
+            esc_intermediate: 0,
             title: String::new(),
             cwd: String::new(),
             replies: Vec::new(),
@@ -655,7 +709,26 @@ impl Grid {
         }
     }
 
+    /// Translate a character through the active graphic set.
+    ///
+    /// Only DEC Special Graphics does anything here, and only over `_` to `~`: that block is where
+    /// it replaces ASCII punctuation and lowercase with the box-drawing pieces, so every ncurses
+    /// border, `tree` branch and `mc` panel is really `ESC ( 0` plus the letters `qwxlkmjntuv`.
+    /// Bytes outside the block, and anything that arrived as multi-byte UTF-8, are unaffected.
+    fn map_charset(&self, ch: char) -> char {
+        let graphics = if self.shift_out { self.g1_graphics } else { self.g0_graphics };
+        if !graphics {
+            return ch;
+        }
+        let c = ch as u32;
+        if !(0x5f..=0x7e).contains(&c) {
+            return ch;
+        }
+        DEC_GRAPHICS[(c - 0x5f) as usize]
+    }
+
     fn print(&mut self, ch: char) {
+        let ch = self.map_charset(ch);
         let w = char_width(ch);
         if w == 0 {
             // Zero-width (combining marks, etc.): the minimal core does not compose them onto the
@@ -716,6 +789,8 @@ impl Grid {
                 let next = (self.cursor.0 / 8 + 1) * 8;
                 self.cursor.0 = next.min(self.cols - 1);
             }
+            0x0e => self.shift_out = true,  // SO: select G1 into GL
+            0x0f => self.shift_out = false, // SI: select G0 into GL
             0x0a | 0x0b | 0x0c => self.linefeed(), // LF / VT / FF
             0x0d => {
                 // CR
@@ -746,7 +821,12 @@ impl Grid {
                 self.state = State::Osc;
             }
             b'P' => self.state = State::DcsIgnore,
-            0x20..=0x2f => self.state = State::EscInt, // intermediate bytes (charset selection, etc.)
+            0x20..=0x2f => {
+                // Intermediate byte; the final byte that follows is only meaningful together with
+                // it (`ESC ( 0` designates G0, `ESC ) 0` designates G1), so remember which one.
+                self.esc_intermediate = b;
+                self.state = State::EscInt;
+            }
             0x30..=0x7e => {
                 self.esc_dispatch(b);
                 self.state = State::Ground;
@@ -758,8 +838,18 @@ impl Grid {
     fn esc_int(&mut self, b: u8) {
         match b {
             0x00..=0x1f => self.execute(b),
-            0x20..=0x2f => {}                       // keep consuming intermediate bytes
-            _ => self.state = State::Ground,        // final byte: charset selection, etc., ignored
+            0x20..=0x2f => self.esc_intermediate = b, // keep consuming intermediate bytes; the last one wins
+            _ => {
+                // Final byte. Only character-set designation is acted on: `0` is DEC Special
+                // Graphics (the line-drawing set every ncurses box is made of), anything else is
+                // treated as a return to ASCII. Other intermediates are still ignored wholesale.
+                match self.esc_intermediate {
+                    b'(' => self.g0_graphics = b == b'0',
+                    b')' => self.g1_graphics = b == b'0',
+                    _ => {}
+                }
+                self.state = State::Ground;
+            }
         }
     }
 
@@ -1443,6 +1533,10 @@ impl Grid {
         self.mouse_drag = false;
         self.mouse_any = false;
         self.mouse_sgr = false;
+        self.g0_graphics = false;
+        self.g1_graphics = false;
+        self.shift_out = false;
+        self.esc_intermediate = 0;
         self.state = State::Ground;
         self.params.clear();
         self.csi_cur = 0;
@@ -1715,6 +1809,49 @@ mod tests {
         // Back on the main screen the viewport takes over again.
         g.feed(b"\x1b[?1049l");
         assert_eq!(g.alt_scroll_keys(1), None);
+    }
+
+    // ---- DEC Special Graphics ----
+
+    #[test]
+    fn dec_graphics_draws_a_box_through_g0() {
+        let mut g = Grid::new(5, 3);
+        // The canonical ncurses rectangle: lqk / x x / mqj, with the set designated into G0.
+        g.feed(b"\x1b(0lqk\r\nx x\r\nmqj");
+        assert_eq!(g.to_lines()[0], "┌─┐");
+        assert_eq!(g.to_lines()[1], "│ │");
+        assert_eq!(g.to_lines()[2], "└─┘");
+
+        // Back to ASCII: the same letters are letters again.
+        g.feed(b"\x1b(B\r\x1b[Hqqq");
+        assert_eq!(g.to_lines()[0], "qqq");
+    }
+
+    #[test]
+    fn dec_graphics_in_g1_is_toggled_by_shift_out_and_in() {
+        let mut g = Grid::new(9, 1);
+        // The other common idiom: park the set in G1 and flip it in around each run.
+        g.feed(b"\x1b)0a\x0eqqq\x0fb");
+        assert_eq!(g.to_lines()[0], "a───b");
+        // G0 is untouched by the G1 designation, so SI leaves plain ASCII behind.
+        assert_eq!(g.to_lines()[0].chars().next(), Some('a'));
+    }
+
+    #[test]
+    fn dec_graphics_only_remaps_its_own_block() {
+        let mut g = Grid::new(20, 1);
+        // Digits and uppercase sit below 0x5f and pass through untouched, as does UTF-8 above it.
+        g.feed("\x1b(0A1z\u{4e2d}".as_bytes());
+        assert_eq!(g.to_lines()[0], "A1≥中");
+    }
+
+    #[test]
+    fn dec_graphics_is_cleared_by_a_hard_reset() {
+        let mut g = Grid::new(5, 1);
+        g.feed(b"\x1b(0\x1b)0\x0e");
+        g.feed(b"\x1bc"); // RIS
+        g.feed(b"qqq");
+        assert_eq!(g.to_lines()[0], "qqq");
     }
 
     // ---- mouse reporting ----
