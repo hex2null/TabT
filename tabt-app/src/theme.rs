@@ -92,7 +92,7 @@ fn luminance(c: Rgb) -> f64 {
 }
 
 /// The display order in the sidebar footer = the index in by_index.
-pub const NAMES: [&str; 10] = [
+pub const NAMES: [&str; 11] = [
     "Default",
     "Classic Green",
     "Amber",
@@ -103,6 +103,7 @@ pub const NAMES: [&str; 10] = [
     "Nord",
     "GitHub Light",
     "Tokyo Night",
+    "Ayu",
 ];
 
 /// The theme a fresh install starts on. Kept here rather than in `config.rs` so the on-disk default
@@ -254,6 +255,30 @@ const TOKYO_NIGHT: [(u8, u8, u8); 16] = [
     (192, 202, 245), // 15 bright white (= default fg)
 ];
 
+/// Ayu (the Mirage variant): a slate blue-gray background, warm off-white foreground, and the
+/// theme's soft pastel accents — salmon, lime, honey, sky.
+///
+/// Unlike Tokyo Night the two arms genuinely differ here: the bright arm is upstream's vivid
+/// syntax palette, the normal arm the same hues held one step back, so both are written out.
+const AYU: [(u8, u8, u8); 16] = [
+    (23, 27, 36),    // 0  black
+    (238, 130, 116), // 1  red
+    (134, 217, 109), // 2  green
+    (250, 204, 110), // 3  yellow
+    (111, 203, 250), // 4  blue
+    (218, 187, 250), // 5  magenta
+    (145, 226, 198), // 6  cyan
+    (199, 199, 199), // 7  white
+    (104, 104, 104), // 8  bright black
+    (242, 135, 121), // 9  bright red
+    (214, 255, 128), // 10 bright green
+    (255, 209, 115), // 11 bright yellow
+    (116, 208, 255), // 12 bright blue
+    (223, 192, 255), // 13 bright magenta
+    (149, 230, 203), // 14 bright cyan
+    (255, 255, 255), // 15 bright white
+];
+
 /// Get a theme by index (out of bounds falls back to default). The order must match [`NAMES`].
 pub fn by_index(i: usize) -> Theme {
     match i {
@@ -318,6 +343,13 @@ pub fn by_index(i: usize) -> Theme {
             fg: (192.0 / 255.0, 202.0 / 255.0, 245.0 / 255.0),
             bg: (26.0 / 255.0, 27.0 / 255.0, 38.0 / 255.0),
             palette: TOKYO_NIGHT,
+            mono: false,
+        },
+        10 => Theme {
+            // Ayu Mirage: #202430 background / #cccac2 foreground
+            fg: (204.0 / 255.0, 202.0 / 255.0, 194.0 / 255.0),
+            bg: (32.0 / 255.0, 36.0 / 255.0, 48.0 / 255.0),
+            palette: AYU,
             mono: false,
         },
         _ => Theme {
