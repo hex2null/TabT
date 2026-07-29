@@ -12,7 +12,7 @@ Keep new code comments and UI strings in English (the Rust sources are; the Make
 
 Run from the repository root (the workspace root — `Cargo.toml` and `Makefile` live here). The Makefile is the canonical entry point:
 
-- `make test` — `tabt-core` unit tests (`cargo test -p tabt-core`). Pure logic, runs on any platform.
+- `make test` — `tabt-core` unit tests (`cargo test -p tabt-core`; pure logic, runs on any platform) followed by `tabt-app`'s few (`cargo test -p tabt-app` — the `themes.conf` parser, macOS-only because the crate is).
 - `make run` — build, bundle into `dist/TabT Dev.app`, codesign, kill any old dev instance, and `open` it. **The GUI must run as a `.app` bundle** — a bare `target/release/tabt` won't get focus or a menu bar (normal macOS behavior for non-bundled processes).
 - `make release` — same, but with the shipping identity: `dist/TabT.app`, bundle id `dev.local.tabt`, config in `~/.tabt`. See "Build identities" below.
 - `make echo` — the step-1 PTY echo loop (`cargo run --release --bin pty-echo`). **Must be run in a real terminal** (Terminal.app/iTerm); it calls `tcgetattr` on stdin and dies immediately without a tty (e.g. an IDE output panel).
@@ -84,13 +84,15 @@ The top strip is arranged like the system's sidebar apps: traffic lights at the 
 
 `theme.rs` and `settings.rs` hold main-thread-only global state (current theme; font family/size and derived cell metrics) that the drawing code reads on demand, so views don't depend on each other. `config.rs` persists layout to `~/.tabt/layout.conf` (`~/.tabt-dev` for dev builds, see `branding.rs`) in **hand-written INI** (no serde, to keep the binary small); values are unescaped, so renaming must forbid newlines.
 
+The themes are **data, not source**, and their one home is `bundle/themes.conf` — installed read-only into the app bundle (`Contents/Resources/themes.conf`) and copied verbatim to `~/.tabt/themes.conf` on first run. `theme.rs` compiles in a single theme, `DEFAULT_THEME`, which is *not* the theme the app starts on but the base a parsed `[theme]` inherits each unset field from, plus the one-entry registry left if no file can be read at all; everything else — the settings pop-up, the saved `style` name — goes through the runtime registry (`names()` / `by_index()` / `index_of()`, filled lazily on first use so no ordering against `config::load()` has to be maintained). `ensure_loaded` tries the user copy, then the bundled one, then that base. Four consequences: adding or editing a theme means editing `bundle/themes.conf` (the `shipped_file_parses` test is what guards it — a typo there ships an app with one theme, and the lenient parser will not complain); the user copy is **authoritative** when present, so its order is the pop-up's and a shipped theme it omits is gone, at the price of a theme added by a later version not reaching a copy seeded by an earlier one; the app **only ever reads** it and seeds it only when it is absent (unlike `layout.conf`, which `config::save` rewrites wholesale — hand-written themes there would be dropped by the first save that didn't model them; and a user copy that fails to parse is still the user's, so it is left alone rather than replaced); and parsing must stay lenient, since `panic = "abort"` turns one bad line in a hand-edited file into a dead app. `style` is stored by name, never by index, so adding or reordering themes cannot repoint an existing config. An unbundled `cargo build` binary has no `Contents/Resources` to read, so it comes up on the base theme alone — the GUI is meant to run bundled.
+
 ### objc2 version pinning (important)
 
 `objc2 0.5` + `objc2-foundation 0.2` + `objc2-app-kit 0.2` are a **matched set** of APIs (newer major versions exist but are intentionally not used). If a type/method fails to compile, first check whether cargo upgraded a crate out of the set (`cargo tree | grep objc2`) and whether `objc2-app-kit`'s feature list is missing an entry — that crate splits features per Objective-C class, so each `NS*` type used must be enabled as a feature in `tabt-app/Cargo.toml`.
 
 ## Bundle
 
-`bundle/Info.plist.in` is the app manifest template (min macOS 12.0, version tracked alongside the crate versions); the Makefile substitutes `__APP_NAME__`/`__BUNDLE_ID__`/`__EXEC__` and writes the result, plus `bundle/AppIcon.icns` and the binary, into `<app>/Contents/`.
+`bundle/Info.plist.in` is the app manifest template (min macOS 12.0, version tracked alongside the crate versions); the Makefile substitutes `__APP_NAME__`/`__BUNDLE_ID__`/`__EXEC__` and writes the result, plus `bundle/AppIcon.icns`, `bundle/themes.conf` (the shipped theme defaults) and the binary, into `<app>/Contents/`. Everything that goes into `Contents/` must be copied **before** the `codesign` step — a resource added afterwards invalidates the signature.
 
 ### Build identities
 

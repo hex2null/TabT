@@ -5,7 +5,7 @@
 #   make dmg        # 用正式版构建安装镜像 dist/TabT-<version>.dmg
 #   make cert       # 一次性创建本地稳定签名身份(见下方 CERT_NAME),让 TCC 授权跨重新编译保留
 #   make echo       # 跑第 1 步的 PTY 回声环(在当前终端里)
-#   make test       # tabt-core 单元测试
+#   make test       # tabt-core 单元测试 + tabt-app 的少量测试
 #   make bloat      # 体积审计(需要 cargo install cargo-bloat)
 #   make clean
 
@@ -50,6 +50,10 @@ bundle: build
 	    -e 's|__BUNDLE_ID__|$(BUNDLE_ID)|g' \
 	    -e 's|__EXEC__|$(EXEC)|g' bundle/Info.plist.in > "$(BUNDLE)/Info.plist"
 	cp bundle/AppIcon.icns "$(BUNDLE)/Resources/"
+	# The shipped theme defaults (config::bundled_themes_file); copied into the user's config
+	# directory on first run. Must land before codesign — a file added to Contents/Resources
+	# afterwards invalidates the signature.
+	cp bundle/themes.conf "$(BUNDLE)/Resources/"
 	@if security find-certificate -c "$(CERT_NAME)" >/dev/null 2>&1; then \
 		codesign --force --sign "$(CERT_NAME)" "$(APP)"; \
 	else \
@@ -80,8 +84,11 @@ dmg: release
 echo:
 	TABT_APP_NAME="$(APP_NAME)" TABT_CONFIG_DIR="$(CONFIG_DIR)" cargo run --release --bin pty-echo
 
+# tabt-core's tests are the platform-independent bulk; tabt-app has a few of its own (the
+# themes.conf parser), which only build on macOS — same identity as `build`, to avoid a relink.
 test:
 	cargo test -p tabt-core
+	TABT_APP_NAME="$(APP_NAME)" TABT_CONFIG_DIR="$(CONFIG_DIR)" cargo test -p tabt-app
 
 bloat:
 	TABT_APP_NAME="$(APP_NAME)" TABT_CONFIG_DIR="$(CONFIG_DIR)" cargo bloat --release --bin tabt -n 20

@@ -14,7 +14,9 @@ sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT
 1. **Multi-tab sessions** — one PTY per tab, listed under "Sessions" in the sidebar; ⌘T for a new one.
 2. **Groups** — organize tabs into named, collapsible groups; drag to reorder tabs and groups.
 3. **Search & rename** — ⌘F filters the list; double-click a tab/group to rename in place.
-4. **Color themes** — 9 built-in schemes (Solarized, One Dark, Dracula, Nord, GitHub Light, …);
+4. **Color themes** — 12 built-in schemes, six dark (Tokyo Night, Catppuccin Mocha, Dracula, Nord,
+   Gruvbox Dark, Solarized Dark) and six light (Catppuccin Latte, Rosé Pine Dawn, Gruvbox Light,
+   Solarized Light, GitHub Light, Ayu Light);
    the whole UI derives from the active theme, staying legible on light and dark alike.
 5. **Fonts** — 10 classic monospace families, adjustable live with ⌘= / ⌘- / ⌘0.
 6. **Settings dialog** (⌘,) — theme, font, sidebar side, border visibility, all applied live.

@@ -54,8 +54,9 @@ make test
 cargo test -p tabt-core irm_inserting_into_a_wide_glyph_blanks_both_of_its_halves
 ```
 
-`make test` covers **only** `tabt-core`. The AppKit half is not unit-tested at all, so
-after touching `tabt-app` build it explicitly and then drive it:
+`make test` is almost **only** `tabt-core` — `tabt-app`'s share is the `themes.conf` parser
+and nothing else, so anything AppKit-shaped is untested. After touching `tabt-app`, build it
+explicitly and then drive it:
 
 ```bash
 cargo build -p tabt-app

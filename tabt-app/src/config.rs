@@ -12,7 +12,7 @@
 //!
 //! ```ini
 //! [settings]
-//! style = One Dark
+//! style = Tokyo Night
 //! font_family = Menlo
 //! font_size = 13
 //! sidebar_width = 200
@@ -65,7 +65,7 @@ pub struct Layout {
     pub groups: Vec<(String, bool, Vec<TabState>)>,
 }
 
-fn dir() -> PathBuf {
+pub fn dir() -> PathBuf {
     let mut p = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     // `.tabt` for the shipped app; a development build gets its own directory so the two don't
     // overwrite each other's layout (see `branding.rs`).
@@ -77,6 +77,34 @@ fn file() -> PathBuf {
     let mut p = dir();
     p.push("layout.conf");
     p
+}
+
+/// The theme definitions, in the same directory (see `theme::parse` for the format). Kept in a file
+/// of its own rather than as more sections of `layout.conf`, because [`save`] rewrites that file
+/// wholesale from in-memory state on every change — hand-written themes living there would be
+/// dropped by the first save that didn't model them. This one the app writes exactly once, when it
+/// isn't there, copying [`bundled_themes_file`] out verbatim.
+pub fn themes_file() -> PathBuf {
+    let mut p = dir();
+    p.push("themes.conf");
+    p
+}
+
+/// The read-only theme defaults shipped inside the app bundle (`bundle/themes.conf` in the repo,
+/// installed by the Makefile into `Contents/Resources/`), used when the user has no copy yet.
+///
+/// Resolved from the executable's own path — `Contents/MacOS/<exec>` → `../Resources` — rather than
+/// through `NSBundle`, which would mean enabling another `objc2-foundation` class feature for one
+/// lookup. A bare `cargo build` binary is not in a bundle, so the path it yields simply doesn't
+/// exist and the caller falls through; `None` is the case where the executable can't be located at
+/// all. The file is inside the signed bundle, so it is genuinely read-only: editing it invalidates
+/// the app's signature, which is why the editable copy in `~/.tabt` exists at all.
+pub fn bundled_themes_file() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut p = exe.parent()?.parent()?.to_path_buf();
+    p.push("Resources");
+    p.push("themes.conf");
+    Some(p)
 }
 
 /// The INI section currently being parsed.

@@ -191,7 +191,10 @@ impl SettingsDialog {
 
         // ---- Theme pop-up ----
         add_label(&content, "Theme", theme_y, mtm);
-        let theme_pop = self.make_popup(theme::NAMES.iter().copied(), theme_y - 3.0, sel!(themeChanged:), mtm);
+        // The theme list is read from themes.conf, so it is owned data rather than a static table.
+        let theme_names = theme::names();
+        let theme_pop =
+            self.make_popup(theme_names.iter().map(|s| s.as_str()), theme_y - 3.0, sel!(themeChanged:), mtm);
         unsafe { content.addSubview(&theme_pop) };
 
         // ---- Font family pop-up ----

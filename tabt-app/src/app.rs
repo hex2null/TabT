@@ -88,7 +88,7 @@ pub struct AppController {
     divider: Retained<Divider>,
     header: Retained<HeaderView>, // terminal-pane header bar (top of host)
     placeholder: Retained<PlaceholderView>, // empty-state view shown when there are no sessions
-    style: Cell<usize>,        // index of the current color theme (theme::NAMES)
+    style: Cell<usize>,        // index of the current color theme (into theme::names())
     collapsed: Cell<bool>,     // whether the sidebar is collapsed/hidden
     sidebar_w: Cell<f64>,      // current sidebar width (draggable)
     sidebar_right: Cell<bool>, // whether the sidebar is docked on the right
@@ -1084,7 +1084,7 @@ impl AppController {
 
     /// Switch the global color theme: immediately redraw the current terminal and sidebar, and persist.
     pub fn set_style(&self, idx: usize) {
-        if idx >= theme::NAMES.len() || idx == self.style.get() {
+        if idx >= theme::count() || idx == self.style.get() {
             return;
         }
         self.style.set(idx);
@@ -1290,7 +1290,7 @@ impl AppController {
             .collect();
         drop(m);
         config::save(
-            theme::NAMES[self.style.get()],
+            &theme::name_of(self.style.get()),
             &settings::family(),
             settings::size(),
             self.sidebar_w.get(),
