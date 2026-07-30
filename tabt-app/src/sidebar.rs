@@ -20,7 +20,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
-use crate::app::{AppController, Snapshot};
+use crate::app::{AppController, Snapshot, TabSnap};
 use crate::card::CARD_INSET;
 use crate::header::HEADER_H;
 use crate::settings;
@@ -496,12 +496,9 @@ impl SidebarView {
         rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
         y += BTN_H + GAP;
 
-        // Ungrouped tabs (the "会话" session list), rendered at the top with a shallow indent.
-        let matched_ung: Vec<&(u64, String, u8, bool)> = snap
-            .ungrouped
-            .iter()
-            .filter(|(_, t, _, _)| q.is_empty() || t.to_lowercase().contains(&q))
-            .collect();
+        // Ungrouped tabs, rendered at the top with a shallow indent.
+        let matched_ung: Vec<&TabSnap> =
+            snap.ungrouped.iter().filter(|t| q.is_empty() || t.title.to_lowercase().contains(&q)).collect();
         // The "Sessions" section label is always shown (even with no ungrouped tabs), so the session
         // list stays anchored and remains a visible drop target. During a search it's hidden only when
         // no session matches, matching how empty groups drop out of the filtered list.
@@ -509,20 +506,17 @@ impl SidebarView {
             // "Sessions" section label above the tabs (matches the GROUP labels below).
             rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
             y += SECTION_H;
-            for (id, title, dot, locked) in matched_ung {
-                let selected = snap.active == Some(*id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: title.clone(), kind: Press::Tab(*id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: *dot, locked: *locked });
+            for t in matched_ung {
+                let selected = snap.active == Some(t.id);
+                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: t.title.clone(), kind: Press::Tab(t.id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: t.dot, locked: t.locked });
                 y += ROW_H;
             }
         }
 
         for (gi, g) in snap.groups.iter().enumerate() {
             // Filter: when the query is non-empty, keep only tabs whose title matches, and hide groups with no match.
-            let matched: Vec<&(u64, String, u8, bool)> = g
-                .tabs
-                .iter()
-                .filter(|(_, t, _, _)| q.is_empty() || t.to_lowercase().contains(&q))
-                .collect();
+            let matched: Vec<&TabSnap> =
+                g.tabs.iter().filter(|t| q.is_empty() || t.title.to_lowercase().contains(&q)).collect();
             if !q.is_empty() && matched.is_empty() {
                 continue;
             }
@@ -532,9 +526,9 @@ impl SidebarView {
             if g.collapsed && q.is_empty() {
                 continue;
             }
-            for (id, title, dot, locked) in matched {
-                let selected = snap.active == Some(*id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: title.clone(), kind: Press::Tab(*id, gi), selected, collapsed: false, group: gi, dot: *dot, locked: *locked });
+            for t in matched {
+                let selected = snap.active == Some(t.id);
+                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: t.title.clone(), kind: Press::Tab(t.id, gi), selected, collapsed: false, group: gi, dot: t.dot, locked: t.locked });
                 y += ROW_H;
             }
         }
@@ -1037,7 +1031,7 @@ impl SidebarView {
             let holder = snap
                 .groups
                 .iter()
-                .position(|g| g.collapsed && g.tabs.iter().any(|(id, ..)| *id == active));
+                .position(|g| g.collapsed && g.tabs.iter().any(|t| t.id == active));
             if let Some(gi) = holder {
                 ctrl.toggle_group_collapsed(gi);
             }
@@ -1377,11 +1371,7 @@ impl SidebarView {
     /// Group "more" menu: rename / collapse-expand / delete.
     fn open_group_menu(&self, gi: usize) {
         let mtm = MainThreadMarker::new().expect("main thread");
-        let collapsed = self
-            .controller()
-            .map(|c| c.snapshot())
-            .and_then(|s| s.groups.get(gi).map(|g| g.collapsed))
-            .unwrap_or(false);
+        let collapsed = self.controller().map(|c| c.group_collapsed(gi)).unwrap_or(false);
         let menu = NSMenu::new(mtm);
         menu.addItem(&self.menu_item("New Terminal", sel!(groupNewTab:), gi as isize));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -1394,19 +1384,9 @@ impl SidebarView {
         self.popup(&menu);
     }
 
-    /// Whether tab `id` is currently locked (looked up from the controller's snapshot).
+    /// Whether tab `id` is currently locked.
     fn tab_locked(&self, id: u64) -> bool {
-        self.controller()
-            .map(|c| c.snapshot())
-            .map(|s| {
-                s.ungrouped
-                    .iter()
-                    .chain(s.groups.iter().flat_map(|g| g.tabs.iter()))
-                    .find(|(tid, _, _, _)| *tid == id)
-                    .map(|(_, _, _, locked)| *locked)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false)
+        self.controller().map(|c| c.is_tab_locked(id)).unwrap_or(false)
     }
 
     /// Tab "more" menu: rename / reveal / lock-unlock / close (Close is disabled while locked).
@@ -1436,18 +1416,7 @@ impl SidebarView {
         let mtm = MainThreadMarker::new().expect("main thread");
         self.ivars().dot_target.set(id);
         // Look up this tab's current color index to check the matching item.
-        let cur = self
-            .controller()
-            .map(|c| c.snapshot())
-            .map(|s| {
-                s.ungrouped
-                    .iter()
-                    .chain(s.groups.iter().flat_map(|g| g.tabs.iter()))
-                    .find(|(tid, _, _, _)| *tid == id)
-                    .map(|(_, _, d, _)| *d)
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
+        let cur = self.controller().map(|c| c.tab_dot(id)).unwrap_or(0);
         let menu = NSMenu::new(mtm);
         for (i, (name, rgb)) in DOT_COLORS.iter().enumerate() {
             let item = self.menu_item(name, sel!(pickDotColor:), i as isize);
@@ -1774,16 +1743,9 @@ impl SidebarView {
             Some(c) => c,
             None => return,
         };
-        let snap = ctrl.snapshot();
         let init = match what {
-            Editing::Tab(id) => snap
-                .ungrouped
-                .iter()
-                .chain(snap.groups.iter().flat_map(|g| g.tabs.iter()))
-                .find(|(tid, _, _, _)| *tid == id)
-                .map(|(_, t, _, _)| t.clone())
-                .unwrap_or_default(),
-            Editing::Group(gi) => snap.groups.get(gi).map(|g| g.name.clone()).unwrap_or_default(),
+            Editing::Tab(id) => ctrl.tab_title(id),
+            Editing::Group(gi) => ctrl.group_name(gi),
         };
         self.ivars().searching.set(false);
         self.ivars().query.borrow_mut().clear();

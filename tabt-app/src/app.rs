@@ -53,6 +53,20 @@ struct Tab {
     spawn_cwd: String, // working directory at spawn time: cwd fallback when OSC 7 has not reported
 }
 
+impl Tab {
+    /// This tab's working directory: the live OSC 7 report when the shell has made one, else the
+    /// directory it was spawned in. Every caller wants that fallback — a shell that never reports
+    /// would otherwise look like it has no cwd at all.
+    fn cwd(&self) -> String {
+        let live = self.view.cwd();
+        if live.is_empty() {
+            self.spawn_cwd.clone()
+        } else {
+            live
+        }
+    }
+}
+
 struct Group {
     name: String,
     collapsed: bool, // when collapsed, the sidebar hides its tabs
@@ -67,16 +81,26 @@ struct Model {
     next_id: u64,
 }
 
+/// One tab, as the sidebar sees it. A struct rather than the tuple this used to be: the sidebar
+/// needs to report what a session is actually doing, not just name it, and that is more fields than
+/// a tuple can carry legibly.
+pub struct TabSnap {
+    pub id: u64,
+    pub title: String,
+    pub dot: u8,      // status-dot color index (0 = default/auto)
+    pub locked: bool, // protected from user-initiated close
+}
+
 /// Group snapshot used by the sidebar for drawing.
 pub struct GroupSnap {
     pub name: String,
     pub collapsed: bool,
-    pub tabs: Vec<(u64, String, u8, bool)>, // (id, title, dot-color index, locked)
+    pub tabs: Vec<TabSnap>,
 }
 
 /// Read-only snapshot used by the sidebar for drawing (does not expose internal details like Retained).
 pub struct Snapshot {
-    pub ungrouped: Vec<(u64, String, u8, bool)>, // ungrouped tabs (id, title, dot-color index, locked), rendered at the top
+    pub ungrouped: Vec<TabSnap>, // tabs belonging to no group, rendered at the top
     pub groups: Vec<GroupSnap>,
     pub active: Option<u64>,
     pub style: usize,
@@ -668,11 +692,7 @@ impl AppController {
         let anchor = {
             let m = self.model.borrow();
             m.active.and_then(|a| {
-                let cwd = m.tabs.iter().find(|t| t.id == a).map(|t| {
-                    // Prefer the live OSC 7 cwd; fall back to the directory it was spawned in.
-                    let live = t.view.cwd();
-                    if live.is_empty() { t.spawn_cwd.clone() } else { live }
-                })?;
+                let cwd = m.tabs.iter().find(|t| t.id == a).map(Tab::cwd)?;
                 // The new tab stays in the active tab's group even when that group is collapsed —
                 // it is expanded below, so the tab is never created hidden.
                 let group = m.groups.iter().position(|g| g.tabs.contains(&a));
@@ -708,10 +728,7 @@ impl AppController {
             let m = self.model.borrow();
             m.active
                 .and_then(|a| {
-                    m.tabs.iter().find(|t| t.id == a).map(|t| {
-                        let live = t.view.cwd();
-                        if live.is_empty() { t.spawn_cwd.clone() } else { live }
-                    })
+                    m.tabs.iter().find(|t| t.id == a).map(Tab::cwd)
                 })
                 .unwrap_or_default()
         };
@@ -947,10 +964,7 @@ impl AppController {
     /// reusing its last known working directory. Fired when the user presses Enter on an ended tab.
     pub fn restart_tab(&self, id: u64) {
         let cwd = match self.model.borrow().tabs.iter().find(|t| t.id == id) {
-            Some(t) => {
-                let live = t.view.cwd();
-                if live.is_empty() { t.spawn_cwd.clone() } else { live }
-            }
+            Some(t) => t.cwd(),
             None => return,
         };
         let (cols, rows) = self.dims();
@@ -1074,9 +1088,33 @@ impl AppController {
         self.refresh_sidebar();
     }
 
+    // Single-field lookups for the sidebar's menus and its rename box. They exist so those paths
+    // don't build a whole `Snapshot` — which clones every title in the window — to read one bool.
+    // `snapshot()` is for drawing, hit testing and dragging, where the whole model is wanted.
+
     /// Whether the given tab is locked (protected from user-initiated close).
-    fn is_tab_locked(&self, id: u64) -> bool {
+    pub fn is_tab_locked(&self, id: u64) -> bool {
         self.model.borrow().tabs.iter().find(|t| t.id == id).map(|t| t.locked).unwrap_or(false)
+    }
+
+    /// A tab's current status-dot color index (0 = default/auto).
+    pub fn tab_dot(&self, id: u64) -> u8 {
+        self.model.borrow().tabs.iter().find(|t| t.id == id).map(|t| t.dot).unwrap_or(0)
+    }
+
+    /// A tab's current title, as the rename box should seed itself with.
+    pub fn tab_title(&self, id: u64) -> String {
+        self.model.borrow().tabs.iter().find(|t| t.id == id).map(|t| t.title.clone()).unwrap_or_default()
+    }
+
+    /// Whether a group is collapsed (its tabs hidden in the sidebar).
+    pub fn group_collapsed(&self, gi: usize) -> bool {
+        self.model.borrow().groups.get(gi).map(|g| g.collapsed).unwrap_or(false)
+    }
+
+    /// A group's current name, as the rename box should seed itself with.
+    pub fn group_name(&self, gi: usize) -> String {
+        self.model.borrow().groups.get(gi).map(|g| g.name.clone()).unwrap_or_default()
     }
 
     /// Set a tab's status-dot color (index into sidebar::DOT_COLORS; 0 = default/auto).
@@ -1107,13 +1145,15 @@ impl AppController {
 
     pub fn snapshot(&self) -> Snapshot {
         let m = self.model.borrow();
-        let title_of = |id: &u64| m.tabs.iter().find(|t| t.id == *id).map(|t| (t.id, t.title.clone(), t.dot, t.locked));
-        let ungrouped = m.ungrouped.iter().filter_map(title_of).collect();
+        let snap_of = |id: &u64| {
+            m.tabs.iter().find(|t| t.id == *id).map(|t| TabSnap { id: t.id, title: t.title.clone(), dot: t.dot, locked: t.locked })
+        };
+        let ungrouped = m.ungrouped.iter().filter_map(snap_of).collect();
         let groups = m
             .groups
             .iter()
             .map(|g| {
-                let tabs = g.tabs.iter().filter_map(title_of).collect();
+                let tabs = g.tabs.iter().filter_map(snap_of).collect();
                 GroupSnap { name: g.name.clone(), collapsed: g.collapsed, tabs }
             })
             .collect();
@@ -1381,10 +1421,7 @@ impl AppController {
             m.tabs
                 .iter()
                 .find(|t| t.id == id)
-                .map(|t| {
-                    let live = t.view.cwd();
-                    if live.is_empty() { t.spawn_cwd.clone() } else { live }
-                })
+                .map(Tab::cwd)
                 .unwrap_or_default()
         };
         if !cwd.is_empty() {
@@ -1426,12 +1463,7 @@ impl AppController {
         let m = self.model.borrow();
         // A single tab id -> (title, cwd, dot, locked).
         let tab_state = |id: &u64| {
-            m.tabs.iter().find(|t| t.id == *id).map(|t| {
-                // cwd prefers the live OSC 7 report; falls back to the spawn-time directory when missing.
-                let live = t.view.cwd();
-                let cwd = if live.is_empty() { t.spawn_cwd.clone() } else { live };
-                (t.title.clone(), cwd, t.dot, t.locked)
-            })
+            m.tabs.iter().find(|t| t.id == *id).map(|t| (t.title.clone(), t.cwd(), t.dot, t.locked))
         };
         let ungrouped: Vec<config::SavedTab> = m.ungrouped.iter().filter_map(tab_state).collect();
         let groups: Vec<config::SavedGroup> = m
