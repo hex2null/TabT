@@ -34,6 +34,8 @@ sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT
     screen buffer, DEC private modes and IRM, tab stops, the DEC line-drawing charset, DSR/DA,
     OSC title and cwd reporting, UTF-8.
 
+![The Settings dialog open on its Theme pane: a scrolling grid of preview cards — Ayu Light, Catppuccin Latte, Catppuccin Mocha, Dracula, GitHub Light, Gruvbox Dark — each a miniature of the app in that theme with its own ANSI swatches, Catppuccin Mocha selected](screenshot3.jpeg)
+
 ## Install
 
 Download `TabT-<version>.dmg` from the [latest release](https://github.com/hex2null/TabT/releases/latest)
