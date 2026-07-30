@@ -31,6 +31,7 @@
 //! collapsed = false
 //! tab = tabt
 //! cwd = /Users/me/proj
+//! auto = true
 //! tab = server
 //!
 //! [group]
@@ -39,7 +40,14 @@
 //! tab = api
 //! ```
 //!
-//! Note: values are not escaped -- a newline in a group name/tab title would corrupt the format (renaming should forbid it).
+//! `auto = true` marks a tab whose title the app derived (from the shell's OSC title) rather than
+//! one the user chose with a rename; the app is free to replace a derived title, never a chosen
+//! one. It is written only for the derived case, so **an absent `auto` means pinned** — which is
+//! what makes a config written before the key existed keep its renames.
+//!
+//! Note: values are not escaped -- a newline in a group name/tab title would corrupt the format,
+//! so every title goes through `sanitize_label` on the way in *and* on the way out. That matters
+//! more than it used to: a title can now arrive from the shell via OSC, i.e. from a remote host.
 //!
 //! [`parse`] and [`render`] are the whole format; [`load`] and [`save`] are just `fs` around them.
 //! The split is what makes the format testable: `load()` reads a path under `$HOME`, so a test
@@ -58,16 +66,27 @@ use crate::settings::{CursorShape, NewTabDir};
 /// Highest valid status-dot color index (must match sidebar::DOT_COLORS: indices 0..=8).
 const MAX_DOT: u8 = 8;
 
-/// Persistent state of one tab (title + last working directory + status-dot color index + lock).
+/// Persistent state of one tab, in both directions: what [`parse`] reads back and what the caller
+/// hands to [`save`]. One struct rather than the tuple this used to be — it is at five fields, and
+/// `auto` is a bool next to two others that a positional form makes easy to transpose.
 pub struct TabState {
     pub title: String,
     pub cwd: String,
     pub dot: u8,      // 0 = default/auto; 1..=8 = classic colors (see sidebar::DOT_COLORS)
     pub locked: bool, // locked tabs are protected from being closed (⌘W / the tab menu's Close)
+    /// Whether `title` was *derived* (from the shell's OSC title, or the directory) rather than
+    /// chosen by the user with ⌘R — in which case the app is free to re-derive it and the stored
+    /// value is only there to keep the file readable and the first frame after launch correct.
+    ///
+    /// Written as `auto = true` and **absent means false**, i.e. pinned. That inversion is what
+    /// makes every config written before this key existed safe: those titles were all either
+    /// renames or the old auto-generated "Terminal <n>", and treating them as pinned keeps the
+    /// renames rather than letting the first OSC title overwrite them.
+    pub auto: bool,
 }
 
-/// One tab as the caller hands it back to [`save`]: title, cwd, dot color, locked.
-pub type SavedTab = (String, String, u8, bool);
+/// One tab as the caller hands it back to [`save`].
+pub type SavedTab = TabState;
 /// One group as the caller hands it back to [`save`]: name, collapsed, its tabs.
 pub type SavedGroup = (String, bool, Vec<SavedTab>);
 
@@ -292,7 +311,7 @@ pub fn parse(text: &str) -> Layout {
     if total_tabs == 0 {
         // No title: the app derives one from where the shell lands. Naming it here would make a
         // first-launch tab look like the user had chosen that name, and it would then be kept.
-        ungrouped.push(TabState { title: String::new(), cwd: String::new(), dot: 0, locked: false });
+        ungrouped.push(TabState { title: String::new(), cwd: String::new(), dot: 0, locked: false, auto: true });
     }
 
     Layout { settings: s, ungrouped, groups }
@@ -302,7 +321,7 @@ pub fn parse(text: &str) -> Layout {
 /// the nearest one above them.
 fn read_tab_key(tabs: &mut Vec<TabState>, key: &str, value: &str) {
     match key {
-        "tab" => tabs.push(TabState { title: value.to_string(), cwd: String::new(), dot: 0, locked: false }),
+        "tab" => tabs.push(TabState { title: value.to_string(), cwd: String::new(), dot: 0, locked: false, auto: false }),
         "cwd" => {
             if let Some(t) = tabs.last_mut() {
                 t.cwd = value.to_string();
@@ -316,6 +335,11 @@ fn read_tab_key(tabs: &mut Vec<TabState>, key: &str, value: &str) {
         "lock" => {
             if let Some(t) = tabs.last_mut() {
                 t.locked = truthy(value);
+            }
+        }
+        "auto" => {
+            if let Some(t) = tabs.last_mut() {
+                t.auto = truthy(value);
             }
         }
         _ => {}
@@ -367,16 +391,21 @@ pub fn save(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) {
 fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String {
     // For each tab, write one tab= line and optional cwd=/dot=/lock= lines.
     let write_tabs = |out: &mut String, tabs: &[SavedTab]| {
-        for (title, cwd, dot, locked) in tabs {
-            out.push_str(&format!("tab = {}\n", title));
-            if !cwd.is_empty() {
-                out.push_str(&format!("cwd = {}\n", cwd));
+        for t in tabs {
+            // Sanitized on the way out as well as on the way in: this is the last point before a
+            // title becomes a line in a file with no escaping, and a newline here would corrupt it.
+            out.push_str(&format!("tab = {}\n", sanitize_label(&t.title)));
+            if !t.cwd.is_empty() {
+                out.push_str(&format!("cwd = {}\n", t.cwd));
             }
-            if *dot != 0 {
-                out.push_str(&format!("dot = {}\n", dot));
+            if t.dot != 0 {
+                out.push_str(&format!("dot = {}\n", t.dot));
             }
-            if *locked {
+            if t.locked {
                 out.push_str("lock = true\n");
+            }
+            if t.auto {
+                out.push_str("auto = true\n");
             }
         }
     };
@@ -421,8 +450,32 @@ fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String
 mod tests {
     use super::*;
 
+    /// A pinned tab (the user named it); `auto_tab` is the derived-title counterpart.
     fn tab(title: &str, cwd: &str, dot: u8, locked: bool) -> SavedTab {
-        (title.to_string(), cwd.to_string(), dot, locked)
+        TabState { title: title.to_string(), cwd: cwd.to_string(), dot, locked, auto: false }
+    }
+
+    fn auto_tab(title: &str, cwd: &str) -> SavedTab {
+        TabState { title: title.to_string(), cwd: cwd.to_string(), dot: 0, locked: false, auto: true }
+    }
+
+    /// A config written before `auto` existed — every v0.3.0 one — has to restore *pinned*, or the
+    /// first title the shell reports would overwrite a name the user had chosen. This is the whole
+    /// reason the key is written for the derived case rather than the chosen one.
+    #[test]
+    fn a_tab_without_the_auto_key_is_pinned() {
+        let back = parse("[tabs]\ntab = My Build\ncwd = /srv\n");
+        assert_eq!(back.ungrouped[0].title, "My Build");
+        assert!(!back.ungrouped[0].auto);
+    }
+
+    /// And the key is honored when present, in a group as well as at the top level.
+    #[test]
+    fn the_auto_key_is_read_in_both_sections() {
+        let back = parse("[tabs]\ntab = ~\nauto = true\n\n[group]\nname = W\ntab = api\nauto = true\ntab = kept\n");
+        assert!(back.ungrouped[0].auto);
+        assert!(back.groups[0].2[0].auto);
+        assert!(!back.groups[0].2[1].auto); // the key attaches to the nearest tab above it only
     }
 
     /// A newline is the one character that would actually corrupt the format: `parse` splits on
@@ -494,7 +547,7 @@ mod tests {
             padding: 4.0,
             opacity: 0.85,
         };
-        let ungrouped = vec![tab("Loose", "/tmp", 3, true)];
+        let ungrouped = vec![tab("Loose", "/tmp", 3, true), auto_tab("~", "/Users/me")];
         let groups = vec![("Work".to_string(), true, vec![tab("api", "/srv", 0, false), tab("web", "", 8, false)])];
 
         let back = parse(&render(&s, &ungrouped, &groups));
@@ -515,11 +568,14 @@ mod tests {
         assert_eq!(g.padding, 4.0);
         assert_eq!(g.opacity, 0.85);
 
-        assert_eq!(back.ungrouped.len(), 1);
+        assert_eq!(back.ungrouped.len(), 2);
         assert_eq!(back.ungrouped[0].title, "Loose");
         assert_eq!(back.ungrouped[0].cwd, "/tmp");
         assert_eq!(back.ungrouped[0].dot, 3);
         assert!(back.ungrouped[0].locked);
+        assert!(!back.ungrouped[0].auto); // pinned: the user named this one
+        assert_eq!(back.ungrouped[1].title, "~");
+        assert!(back.ungrouped[1].auto); // derived: the app may re-derive it
 
         assert_eq!(back.groups.len(), 1);
         let (name, collapsed, tabs) = &back.groups[0];

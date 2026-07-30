@@ -569,11 +569,11 @@ impl AppController {
         // Spawn ungrouped tabs first (rendered at the top), then each group. A tab that fails to
         // spawn (e.g. the system is out of file descriptors) is silently skipped — restore
         // whatever we can rather than aborting the whole session restore.
-        // A restored tab is pinned: layout.conf records one title per tab and nothing yet
-        // distinguishes a name the user chose from one that was derived, so keeping it is the
-        // choice that cannot lose a rename.
+        // `auto` says the stored title was derived and may be re-derived; its absence means the
+        // user chose it. A config written before that key existed therefore restores pinned, which
+        // is what keeps every rename made by an older version.
         for t in layout.ungrouped {
-            let _ = self.spawn_tab(None, t.title, true, &t.cwd, t.dot, t.locked);
+            let _ = self.spawn_tab(None, t.title, !t.auto, &t.cwd, t.dot, t.locked);
         }
         for (name, collapsed, tabs) in layout.groups {
             let gi = {
@@ -582,7 +582,7 @@ impl AppController {
                 m.groups.len() - 1
             };
             for t in tabs {
-                let _ = self.spawn_tab(Some(gi), t.title, true, &t.cwd, t.dot, t.locked);
+                let _ = self.spawn_tab(Some(gi), t.title, !t.auto, &t.cwd, t.dot, t.locked);
             }
         }
         let first = self.model.borrow().tabs.first().map(|t| t.id);
@@ -1553,9 +1553,17 @@ impl AppController {
     /// Persist the layout + session state (cwd + each tab's currently visible content).
     fn save(&self) {
         let m = self.model.borrow();
-        // A single tab id -> (title, cwd, dot, locked).
+        // The *displayed* title is what gets written, pinned or not, so a restored session reads
+        // right before any shell has reported anything; `auto` is what says whether the app may
+        // replace it again.
         let tab_state = |id: &u64| {
-            m.tabs.iter().find(|t| t.id == *id).map(|t| (t.display_title(), t.cwd(), t.dot, t.locked))
+            m.tabs.iter().find(|t| t.id == *id).map(|t| config::TabState {
+                title: t.display_title(),
+                cwd: t.cwd(),
+                dot: t.dot,
+                locked: t.locked,
+                auto: !t.pinned,
+            })
         };
         let ungrouped: Vec<config::SavedTab> = m.ungrouped.iter().filter_map(tab_state).collect();
         let groups: Vec<config::SavedGroup> = m
