@@ -87,6 +87,10 @@ struct Tab {
     /// `TermView::output_seq` as of the last sample, to spot new output without the PTY path
     /// having to notify anyone.
     last_seq: u64,
+    /// The shell this session is actually running. Per tab, not read from Settings: changing the
+    /// setting deliberately leaves running shells alone, so the global value names what the *next*
+    /// tab will run and would misreport this one.
+    shell: String,
 }
 
 impl Tab {
@@ -124,6 +128,21 @@ impl Tab {
             return abbreviate_dir(&cwd);
         }
         "Terminal".to_string()
+    }
+}
+
+/// A path with `$HOME` collapsed to `~`, the way every shell prompt writes it. Unlike
+/// [`abbreviate_dir`] this keeps the whole path: the header has the width for it, and there the
+/// point is to say *where* the session is, not merely to name it.
+fn home_relative(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() || !path.starts_with(&home) {
+        return path.to_string();
+    }
+    match &path[home.len()..] {
+        "" => "~".to_string(),
+        rest if rest.starts_with('/') => format!("~{}", rest),
+        _ => path.to_string(), // a sibling like /Users/garyx, which is not inside $HOME at all
     }
 }
 
@@ -573,6 +592,26 @@ impl AppController {
         self.header.set_title(&title);
     }
 
+    /// The header's dimmed second line: where the active session is and what it is running, or
+    /// that it has ended.
+    ///
+    /// Deliberately not part of `update_title`. This changes on every `cd`, and `setTitle:` relays
+    /// out the title bar and resets the traffic lights each time it is called — the header has to
+    /// be updatable without paying that.
+    fn update_header(&self) {
+        let m = self.model.borrow();
+        let meta = match m.active.and_then(|a| m.tabs.iter().find(|t| t.id == a)) {
+            Some(t) if t.state == SessionState::Ended => "session ended".to_string(),
+            Some(t) => {
+                let shell = t.shell.rsplit('/').next().unwrap_or(&t.shell);
+                format!("{} · {}", home_relative(&t.cwd()), shell)
+            }
+            None => String::new(),
+        };
+        drop(m);
+        self.header.set_meta(&meta);
+    }
+
     /// Load the layout from ~/.tabt and spawn a new shell for each tab.
     pub fn bootstrap(&self) {
         let layout = config::load();
@@ -671,7 +710,7 @@ impl AppController {
             id
         };
         let (cols, rows) = self.dims();
-        let (fd, shell_pid) = pty::spawn(cols as u16, rows as u16, cwd)?;
+        let (fd, shell_pid, shell) = pty::spawn(cols as u16, rows as u16, cwd)?;
         let frame = self.host.bounds();
         let v = TermView::new(self.mtm, frame, fd, cols, rows);
         v.set_scrollback(settings::scrollback());
@@ -696,6 +735,7 @@ impl AppController {
             activity: false,
             bell: false,
             last_seq: 0,
+            shell,
             // Record where the shell actually starts, not what was requested: `pty::spawn` falls
             // back to HOME on an empty cwd, and leaving that blank here would leave a fresh tab
             // with no directory to be named after or revealed in Finder until OSC 7 reports one —
@@ -735,6 +775,7 @@ impl AppController {
         self.layout_active();
         self.refresh_sidebar();
         self.update_title();
+        self.update_header();
     }
 
     /// Click the already-selected tab → deselect it; any other tab → select it.
@@ -767,6 +808,7 @@ impl AppController {
         self.window.makeFirstResponder(None);
         self.refresh_sidebar();
         self.update_title(); // also re-centers the traffic lights, which setTitle: resets
+        self.update_header(); // no active session: the meta line empties too
     }
 
     /// Mount the active tab's view into the host (remove the others), and make it the keyboard first responder.
@@ -1093,7 +1135,11 @@ impl AppController {
         // Marked here rather than left to the next sample: a session that just died should not go
         // on looking alive for the best part of a second. The borrow above is scoped for the same
         // reason `sample_states` scopes its own — `refresh_sidebar` takes the model again.
+        //
+        // The header has to be told here too. Setting the state directly is exactly what stops the
+        // sampler noticing a change, so leaving it to that would leave the meta line stale forever.
         self.refresh_sidebar();
+        self.update_header();
     }
 
     /// Respawn a fresh shell into a tab whose previous one already ended (see `end_tab_session`),
@@ -1104,7 +1150,7 @@ impl AppController {
             None => return,
         };
         let (cols, rows) = self.dims();
-        let (fd, shell_pid) = match pty::spawn(cols as u16, rows as u16, &cwd) {
+        let (fd, shell_pid, shell) = match pty::spawn(cols as u16, rows as u16, &cwd) {
             Some(v) => v,
             None => return, // out of fds/process table etc.: leave the tab ended, nothing else to do
         };
@@ -1114,6 +1160,7 @@ impl AppController {
                 Some(t) => {
                     t.master_fd = fd;
                     t.shell_pid = shell_pid;
+                    t.shell = shell; // a restart re-resolves it, so the setting can take effect here
                     t.reader = view::attach_reader(&t.view);
                     t.view.restart(fd, cols, rows);
                     t.state = SessionState::Idle; // a fresh shell comes up at its prompt
@@ -1125,6 +1172,7 @@ impl AppController {
             }
         }
         self.refresh_sidebar(); // clear the "ended" mark now, not on the next sample
+        self.update_header();
     }
 
     /// Close a tab the user explicitly asked to close (⌘W, or "Close" in the tab's "⋯" menu).
@@ -1217,6 +1265,7 @@ impl AppController {
         }
         self.refresh_sidebar();
         self.update_title(); // the active tab's name may have just changed under the window title
+        self.update_header(); // a plain `cd` reaches here and changes nothing else
     }
 
     /// Rename a tab (committed after double-click in-place editing in the sidebar).
@@ -1442,6 +1491,7 @@ impl AppController {
            // `panic = "abort"` a RefCell clash is the whole process, not one bad tab.
         if changed {
             self.refresh_sidebar();
+            self.update_header(); // the active session may have just started or finished a job
         }
     }
 

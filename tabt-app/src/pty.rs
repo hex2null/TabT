@@ -18,10 +18,14 @@ use std::sync::Once;
 /// the rest of the app (existing tabs keep running).
 /// The pid is the shell's own pid *and* its process group id (it calls `setsid()`), letting the
 /// caller compare against `tcgetpgrp` to detect a foreground job (see `has_foreground_job`).
-pub fn spawn(cols: u16, rows: u16, cwd: &str) -> Option<(RawFd, libc::pid_t)> {
+/// The third element is the shell that was actually exec'd. The caller cannot re-derive it later:
+/// `resolve_shell` reads the *current* Settings value, which is what the next tab will use, not
+/// what this one is running — changing the setting deliberately leaves existing shells alone.
+pub fn spawn(cols: u16, rows: u16, cwd: &str) -> Option<(RawFd, libc::pid_t, String)> {
     install_reaper();
     let shell = resolve_shell()?;
-    unsafe { spawn_inner(cols, rows, cwd, &shell) }
+    let (fd, pid) = unsafe { spawn_inner(cols, rows, cwd, &shell)? };
+    Some((fd, pid, shell))
 }
 
 /// Fallback shell, used when nothing is configured and `$SHELL` is unset. Every macOS install has

@@ -22,6 +22,8 @@ pub const HEADER_H: f64 = 44.0; // toolbar band height; the top strip (traffic l
 
 pub struct HeaderIvars {
     title: RefCell<String>,
+    /// The dimmed line after the name: where the session is and what it is running.
+    meta: RefCell<String>,
     font: Retained<NSFont>,     // session name (semibold)
     font_sub: Retained<NSFont>, // meta / "running"
     // Left inset for the title. When the sidebar is collapsed the traffic lights + toggle
@@ -86,6 +88,7 @@ impl HeaderView {
             title: RefCell::new(String::new()),
             font,
             font_sub,
+            meta: RefCell::new(String::new()),
             left_inset: Cell::new(16.0),
             center_y: Cell::new(HEADER_H / 2.0),
         });
@@ -95,6 +98,16 @@ impl HeaderView {
     /// Update the active session name shown on the left.
     pub fn set_title(&self, name: &str) {
         *self.ivars().title.borrow_mut() = name.to_string();
+        unsafe { self.setNeedsDisplay(true) };
+    }
+
+    /// Update the dimmed meta line after the name. Separate from `set_title` because it changes far
+    /// more often — every `cd` — and must not drag the window's title bar along with it.
+    pub fn set_meta(&self, meta: &str) {
+        if *self.ivars().meta.borrow() == meta {
+            return;
+        }
+        *self.ivars().meta.borrow_mut() = meta.to_string();
         unsafe { self.setNeedsDisplay(true) };
     }
 
@@ -140,9 +153,10 @@ impl HeaderView {
         unsafe { name.drawAtPoint_withAttributes(NSPoint::new(lx, cy - 8.0), Some(&name_attrs)) };
         let name_w = unsafe { name.sizeWithAttributes(Some(&name_attrs)).width };
 
-        // Meta string (`~ · zsh`) after the name (dimmed toward the background).
+        // Meta string after the name (dimmed toward the background): the session's directory and
+        // shell, or that it has ended. Was a hard-coded "~ · zsh" until the app tracked either.
         let meta_attrs = make_attrs(&self.ivars().font_sub, Some(&ns_color(theme::mix(t.fg, t.bg, 0.50))));
-        let meta = NSString::from_str("~ · zsh");
+        let meta = NSString::from_str(&self.ivars().meta.borrow());
         unsafe { meta.drawAtPoint_withAttributes(NSPoint::new(lx + name_w + 10.0, cy - 7.5), Some(&meta_attrs)) };
     }
 }
