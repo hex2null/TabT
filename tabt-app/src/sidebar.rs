@@ -145,6 +145,9 @@ struct Row {
     state: SessionState, // tab rows: what the session is doing (drives the dot's form)
     activity: bool,      // tab rows: unseen output (brightens the label)
     bell: bool,          // tab rows: unseen BEL (shows a bell glyph)
+    /// Group rows: how many sessions the group is hiding. 0 when it is expanded — the rows are
+    /// right there to be counted — so this doubles as "should a count be drawn".
+    count: usize,
     locked: bool,    // tab rows: whether the tab is locked (protected from close)
 }
 
@@ -496,11 +499,11 @@ impl SidebarView {
         let mut rows = Vec::new();
         let mut y = TOP_INSET;
         // Search box (label holds the current query; drawn specially in render).
-        rows.push(Row { top: y, h: SEARCH_H, indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false });
+        rows.push(Row { top: y, h: SEARCH_H, indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
         y += SEARCH_H + GAP;
 
         // Side-by-side "Terminal" and "Group" buttons, occupying one row.
-        rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false });
+        rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
         y += BTN_H + GAP;
 
         // Ungrouped tabs, rendered at the top with a shallow indent.
@@ -511,11 +514,11 @@ impl SidebarView {
         // no session matches, matching how empty groups drop out of the filtered list.
         if q.is_empty() || !matched_ung.is_empty() {
             // "Sessions" section label above the tabs (matches the GROUP labels below).
-            rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false });
+            rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
             y += SECTION_H;
             for t in matched_ung {
                 let selected = snap.active == Some(t.id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: t.title.clone(), kind: Press::Tab(t.id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: t.dot, locked: t.locked, state: t.state, activity: t.activity, bell: t.bell });
+                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: t.title.clone(), kind: Press::Tab(t.id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: t.dot, locked: t.locked, state: t.state, activity: t.activity, bell: t.bell, count: 0 });
                 y += ROW_H;
             }
         }
@@ -527,7 +530,11 @@ impl SidebarView {
             if !q.is_empty() && matched.is_empty() {
                 continue;
             }
-            rows.push(Row { top: y - scroll, h: ROW_H, indent: PAD, label: g.name.clone(), kind: Press::Group(gi), selected: false, collapsed: g.collapsed, group: gi, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false });
+            // A count only while the group is actually hiding something. During a search its
+            // matches are listed underneath it regardless of collapsed state, so a count there
+            // would contradict what is on screen.
+            let hidden = if g.collapsed && q.is_empty() { g.tabs.len() } else { 0 };
+            rows.push(Row { top: y - scroll, h: ROW_H, indent: PAD, label: g.name.clone(), kind: Press::Group(gi), selected: false, collapsed: g.collapsed, group: gi, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: hidden });
             y += ROW_H;
             // Hide tabs when collapsed and not in search state; while searching, always show matches (to make collapsed tabs findable).
             if g.collapsed && q.is_empty() {
@@ -535,7 +542,7 @@ impl SidebarView {
             }
             for t in matched {
                 let selected = snap.active == Some(t.id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: t.title.clone(), kind: Press::Tab(t.id, gi), selected, collapsed: false, group: gi, dot: t.dot, locked: t.locked, state: t.state, activity: t.activity, bell: t.bell });
+                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: t.title.clone(), kind: Press::Tab(t.id, gi), selected, collapsed: false, group: gi, dot: t.dot, locked: t.locked, state: t.state, activity: t.activity, bell: t.bell, count: 0 });
                 y += ROW_H;
             }
         }
@@ -564,6 +571,7 @@ impl SidebarView {
             state: SessionState::Idle,
             activity: false,
             bell: false,
+            count: 0,
         }]
     }
 
@@ -723,8 +731,12 @@ impl SidebarView {
             draw_symbol(folder, rect(row.indent, vmid(12.0), 14.0, 12.0), text_placeholder());
             let label_x = row.indent + 20.0;
             draw_truncated(&row.label, rect(label_x, vmid(13.0), (w - 34.0 - label_x).max(0.0), 15.0), &self.ivars().font_section, text_placeholder());
+            // The "⋯" takes the slot on hover, the same way a session row's lock glyph yields to
+            // it: the count is a standing fact and can wait until the pointer leaves.
             if hovered {
                 draw_symbol("ellipsis", rect(w - 28.0, vmid(11.0), 16.0, 11.0), text_placeholder());
+            } else if row.count > 0 {
+                self.draw_badge(&row.count.to_string(), w - HPAD - 8.0, row.top + row.h / 2.0);
             }
             return;
         }
