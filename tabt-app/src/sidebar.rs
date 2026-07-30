@@ -41,6 +41,7 @@ const PAD: f64 = 14.0; // content left inset
 /// edge already sits CARD_INSET below the window's, so this is that much shorter than HEADER_H.
 const TOP_INSET: f64 = HEADER_H - CARD_INSET;
 const HPAD: f64 = 10.0; // row background (selected/hover/search box) inset from the sidebar's left and right edges
+const ACTIONS_GAP: f64 = 8.0; // between the two halves of the "Terminal"/"Group" button row
 /// The "chip" fill shared by the search box, the two action buttons and the selected session row,
 /// so a selected session and a button read as the same surface. `CHIP_HOVER` is the same chip under
 /// the pointer. `ROW_HOVER` is every *list* row's hover wash — one step below the chip, so hovering
@@ -114,6 +115,18 @@ enum Press {
     StyleMenu,        // bottom style row; click to pop up the color scheme menu
 }
 
+/// What the pointer is over, as far as *drawing* is concerned.
+///
+/// AppKit delivers mouse motion per pixel, but the sidebar's appearance depends only on which row
+/// the cursor is in — plus, on the dual-button row, which half of it. Comparing this between two
+/// motion events is what keeps a mouse sweep from repainting the whole card (and re-running
+/// `snapshot()`, which clones every title) once per pixel.
+#[derive(Clone, Copy, PartialEq)]
+struct HoverKey {
+    row: Press,
+    half: u8, // dual-button row only: 0 = "Terminal" (left), 1 = "Group" (right)
+}
+
 /// A single laid-out row.
 struct Row {
     top: f64,
@@ -143,6 +156,7 @@ pub struct SidebarIvars {
     hover_x: Cell<f64>,
     hover_y: Cell<f64>,
     hovering: Cell<bool>,
+    hover_key: Cell<HoverKey>, // what the last motion event resolved to; see HoverKey
     tracking_added: Cell<bool>,
     // Search: query string + whether in search (focused) state.
     query: RefCell<String>,
@@ -266,6 +280,9 @@ declare_class!(
         #[method(mouseExited:)]
         fn mouse_exited(&self, _event: &NSEvent) {
             self.ivars().hovering.set(false);
+            // Forget the cached row, or re-entering onto the same one would look unchanged and skip
+            // the redraw that has to bring its hover wash back.
+            self.ivars().hover_key.set(HoverKey { row: Press::None, half: 0 });
             unsafe { self.setNeedsDisplay(true) };
         }
 
@@ -386,6 +403,7 @@ impl SidebarView {
             hover_x: Cell::new(-1.0),
             hover_y: Cell::new(-1.0),
             hovering: Cell::new(false),
+            hover_key: Cell::new(HoverKey { row: Press::None, half: 0 }),
             tracking_added: Cell::new(false),
             query: RefCell::new(String::new()),
             searching: Cell::new(false),
@@ -415,18 +433,48 @@ impl SidebarView {
     }
 
     /// y coordinate within the view (already a flipped coordinate system, origin at top-left).
-    /// Record the hover point (x/y) and request a redraw.
+    /// Record the hover point (x/y) and request a redraw — but only when the pointer actually
+    /// moved onto something else, since nothing about the drawing changes within a row (see
+    /// [`HoverKey`]). The point itself is always stored: `draw_actions` and `open_context_menu`
+    /// read the raw x/y, and the cache has to keep following the pointer across skipped frames.
     fn set_hover(&self, event: &NSEvent) {
         let p = self.convertPoint_fromView(unsafe { event.locationInWindow() }, None);
         self.ivars().hover_x.set(p.x);
         self.ivars().hover_y.set(p.y);
-        self.ivars().hovering.set(true);
-        unsafe { self.setNeedsDisplay(true) };
+        let entered = !self.ivars().hovering.replace(true); // the overlay scrollbar appears on entry
+        let key = self.hover_key_at(p.x, p.y);
+        let moved = self.ivars().hover_key.replace(key) != key;
+        if entered || moved {
+            unsafe { self.setNeedsDisplay(true) };
+        }
+    }
+
+    /// Resolve a point to its [`HoverKey`]. Deliberately built on `row_at`, the same hit test a
+    /// press uses: it rejects list rows scrolled out of the visible band, and those are exactly the
+    /// rows `render` clips away — so a hover that lands on one changes nothing on screen.
+    fn hover_key_at(&self, x: f64, y: f64) -> HoverKey {
+        let snap = match self.controller() {
+            Some(c) => c.snapshot(),
+            None => return HoverKey { row: Press::None, half: 0 },
+        };
+        let (w, h) = (self.bounds().size.width, self.bounds().size.height);
+        let query = self.ivars().query.borrow().clone();
+        let row = self.row_at(&snap, y, h, &query);
+        HoverKey { row, half: u8::from(row == Press::Actions && x >= Self::actions_split_x(w)) }
     }
 
     fn point_y(&self, event: &NSEvent) -> f64 {
         let p = unsafe { event.locationInWindow() };
         self.convertPoint_fromView(p, None).y
+    }
+
+    /// The x that separates the dual-button row's two halves. Shared by the press split in
+    /// `on_down`, the hover split in `draw_actions` and the hover key, so the three cannot drift.
+    /// Note it splits the whole row width, not just the buttons: a press in the left margin still
+    /// lands on "Terminal", which is what makes the pair feel like one control.
+    fn actions_split_x(w: f64) -> f64 {
+        let bw = (w - 2.0 * HPAD - ACTIONS_GAP) / 2.0;
+        HPAD + bw + ACTIONS_GAP / 2.0
     }
 
     /// Top y of the group/tab list area (below the search box + the two buttons). Above this is the fixed area, which does not scroll.
@@ -735,11 +783,10 @@ impl SidebarView {
         let hx = self.ivars().hover_x.get();
         let hy = self.ivars().hover_y.get();
         let in_row = hovering && hy >= row.top && hy < row.top + row.h;
-        let gap = 8.0;
-        let bw = (w - 2.0 * HPAD - gap) / 2.0;
+        let bw = (w - 2.0 * HPAD - ACTIONS_GAP) / 2.0;
         let left = rect(HPAD, row.top, bw, row.h);
-        let right = rect(HPAD + bw + gap, row.top, bw, row.h);
-        let hover_left = in_row && hx < HPAD + bw + gap / 2.0;
+        let right = rect(HPAD + bw + ACTIONS_GAP, row.top, bw, row.h);
+        let hover_left = in_row && hx < Self::actions_split_x(w);
         let hover_right = in_row && !hover_left;
 
         // Both buttons share the same neutral low-opacity wash as a selected session row (no accent
@@ -1060,9 +1107,7 @@ impl SidebarView {
         }
         // Dual-button row: by x, land on "Terminal" (left) or "Group" (right).
         if press == Press::Actions {
-            let gap = 8.0;
-            let bw = (w - 2.0 * HPAD - gap) / 2.0;
-            press = if x < HPAD + bw + gap / 2.0 { Press::NewTab } else { Press::NewGroup };
+            press = if x < Self::actions_split_x(w) { Press::NewTab } else { Press::NewGroup };
         }
         // When hitting the "⋯" area at the right of a group/tab row, pop up the corresponding more menu instead.
         if x >= w - 28.0 {
@@ -1094,6 +1139,10 @@ impl SidebarView {
             let y = self.point_y(event);
             if (y - self.ivars().start_y.get()).abs() > 4.0 {
                 self.ivars().dragging.set(true);
+                // A drag suppresses the hover wash entirely, and no motion event arrives while it
+                // runs — so drop the cached row, or a gesture that ends where it began would leave
+                // the pointer's row looking un-hovered until it moves to a different one.
+                self.ivars().hover_key.set(HoverKey { row: Press::None, half: 0 });
             }
             self.ivars().cur_y.set(y);
             unsafe { self.setNeedsDisplay(true) };
