@@ -41,6 +41,25 @@ const SIDEBAR_ANIM: f64 = 0.22;
 /// completes a cycle in twice this. Matches the pace of the system's own text carets.
 const BLINK_MS: u64 = 530;
 
+/// What a session is doing, as far as the sidebar is concerned.
+///
+/// Sampled on a timer rather than computed on demand: `Running` comes from a `tcgetpgrp` syscall,
+/// and the sidebar redraws far too often — once per hovered row, once per keystroke that changes a
+/// title — to afford one per tab per frame.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SessionState {
+    /// A foreground job other than the shell itself owns the terminal — a build, an editor, ssh.
+    Running,
+    /// The shell is sitting at its prompt.
+    Idle,
+    /// The shell exited and has not been restarted; the tab is a placeholder (see `end_tab_session`).
+    Ended,
+}
+
+/// How often each session's state is sampled. Slow enough that a machine full of idle tabs costs
+/// nothing measurable, fast enough that starting a build marks its tab before you look away.
+const SAMPLE_MS: u64 = 800;
+
 struct Tab {
     id: u64,
     /// The name the user gave this tab with ⌘R. Only meaningful when `pinned`; otherwise the
@@ -58,6 +77,8 @@ struct Tab {
     shell_pid: libc::pid_t, // the shell's own pid/pgid; used to detect a foreground job (pty::has_foreground_job)
     reader: view::ReaderToken,
     spawn_cwd: String, // working directory at spawn time: cwd fallback when OSC 7 has not reported
+    /// Last sampled state; see `sample_states`. Kept on the tab rather than recomputed per draw.
+    state: SessionState,
 }
 
 impl Tab {
@@ -175,6 +196,10 @@ pub struct AppController {
     animating: Cell<bool>, // a collapse/expand is in flight: frame changes animate instead of snapping
     settings_dialog: RefCell<Option<Retained<SettingsDialog>>>, // lazily built settings panel
     blink_timer: RefCell<Option<view::TimerToken>>, // running only while the cursor blinks
+    // Samples every session's running state. Unlike the blink timer this runs for the controller's
+    // whole life: the blink is opt-in (Settings → Terminal) and off by default, so there would be
+    // no timer at all to hang this off.
+    state_timer: RefCell<Option<view::TimerToken>>,
     mtm: MainThreadMarker,
 }
 
@@ -231,6 +256,7 @@ impl AppController {
             animating: Cell::new(false),
             settings_dialog: RefCell::new(None),
             blink_timer: RefCell::new(None),
+            state_timer: RefCell::new(None),
             mtm,
         });
         // The sidebar / toggle button / divider get the controller's raw pointer (the controller lives in an Rc, so its address is stable).
@@ -594,6 +620,7 @@ impl AppController {
         }
         self.save(); // persist once, ensuring ~/.tabt exists and reflects the current layout
         self.refresh_sidebar();
+        self.start_state_timer();
     }
 
     /// Current window content size (width, height), persisted so the next launch reopens at the same size.
@@ -649,6 +676,9 @@ impl AppController {
             master_fd: fd,
             shell_pid,
             reader,
+            // Assume idle until the first sample: a tab that has only just spawned is at a prompt,
+            // and guessing Running would flash every new tab.
+            state: SessionState::Idle,
             // Record where the shell actually starts, not what was requested: `pty::spawn` falls
             // back to HOME on an empty cwd, and leaving that blank here would leave a fresh tab
             // with no directory to be named after or revealed in Finder until OSC 7 reports one —
@@ -1024,13 +1054,21 @@ impl AppController {
     /// tab and its view — TermView shows a "session ended" placeholder (see `view::TermView::restart`)
     /// until the user restarts it (Enter) or closes the tab explicitly (⌘W).
     fn end_tab_session(&self, id: u64) {
-        let mut m = self.model.borrow_mut();
-        if let Some(t) = m.tabs.iter_mut().find(|t| t.id == id) {
+        {
+            let mut m = self.model.borrow_mut();
+            let Some(t) = m.tabs.iter_mut().find(|t| t.id == id) else {
+                return;
+            };
             view::cancel_reader(&t.reader);
             unsafe { libc::close(t.master_fd) };
             t.master_fd = -1;
             t.shell_pid = -1; // tcgetpgrp(-1) fails, so has_foreground_job reports false
+            t.state = SessionState::Ended;
         }
+        // Marked here rather than left to the next sample: a session that just died should not go
+        // on looking alive for the best part of a second. The borrow above is scoped for the same
+        // reason `sample_states` scopes its own — `refresh_sidebar` takes the model again.
+        self.refresh_sidebar();
     }
 
     /// Respawn a fresh shell into a tab whose previous one already ended (see `end_tab_session`),
@@ -1045,16 +1083,23 @@ impl AppController {
             Some(v) => v,
             None => return, // out of fds/process table etc.: leave the tab ended, nothing else to do
         };
-        let mut m = self.model.borrow_mut();
-        match m.tabs.iter_mut().find(|t| t.id == id) {
-            Some(t) => {
-                t.master_fd = fd;
-                t.shell_pid = shell_pid;
-                t.reader = view::attach_reader(&t.view);
-                t.view.restart(fd, cols, rows);
+        {
+            let mut m = self.model.borrow_mut();
+            match m.tabs.iter_mut().find(|t| t.id == id) {
+                Some(t) => {
+                    t.master_fd = fd;
+                    t.shell_pid = shell_pid;
+                    t.reader = view::attach_reader(&t.view);
+                    t.view.restart(fd, cols, rows);
+                    t.state = SessionState::Idle; // a fresh shell comes up at its prompt
+                }
+                None => {
+                    unsafe { libc::close(fd) }; // tab closed meanwhile: don't leak the new pty
+                    return;
+                }
             }
-            None => unsafe { libc::close(fd); }, // tab closed meanwhile: don't leak the new pty
         }
+        self.refresh_sidebar(); // clear the "ended" mark now, not on the next sample
     }
 
     /// Close a tab the user explicitly asked to close (⌘W, or "Close" in the tab's "⋯" menu).
@@ -1301,6 +1346,50 @@ impl AppController {
     /// mounted, so that is the only one whose cursor is on screen, and a per-tab timer would have
     /// to be torn down on every close. The token lives as long as the controller, which outlives
     /// the run loop, so there is no teardown path that can leave it firing on freed state.
+    /// Start the session-state sampler. Runs for the controller's whole life, so nothing has to
+    /// tear it down — and nothing can leave it firing against a dropped controller, which is the
+    /// failure the blink timer's start/stop dance has to be careful about.
+    fn start_state_timer(&self) {
+        extern "C" fn tick(ctx: *mut c_void) {
+            let c: &AppController = unsafe { &*(ctx as *const AppController) };
+            c.sample_states();
+        }
+        let ctx = self as *const AppController as *mut c_void;
+        *self.state_timer.borrow_mut() = Some(view::attach_timer(SAMPLE_MS, ctx, tick));
+    }
+
+    /// Re-read every session's state, and redraw the sidebar only if one of them moved.
+    ///
+    /// The "only if" is the whole design. An unconditional redraw here would repaint the entire
+    /// sidebar once a second forever, which is worse for the battery than the wrong status dot this
+    /// exists to fix.
+    fn sample_states(&self) {
+        let changed = {
+            let mut m = self.model.borrow_mut();
+            let mut changed = false;
+            for t in &mut m.tabs {
+                // An ended session costs nothing to classify: `end_tab_session` closes the fd and
+                // sets shell_pid to -1, so there is no syscall left to make.
+                let now = if t.master_fd < 0 {
+                    SessionState::Ended
+                } else if pty::has_foreground_job(t.master_fd, t.shell_pid) {
+                    SessionState::Running
+                } else {
+                    SessionState::Idle
+                };
+                if t.state != now {
+                    t.state = now;
+                    changed = true;
+                }
+            }
+            changed
+        }; // the model borrow ends here — refresh_sidebar borrows it again, and under
+           // `panic = "abort"` a RefCell clash is the whole process, not one bad tab.
+        if changed {
+            self.refresh_sidebar();
+        }
+    }
+
     fn sync_blink_timer(&self) {
         let running = self.blink_timer.borrow().is_some();
         match (settings::cursor_blink(), running) {
