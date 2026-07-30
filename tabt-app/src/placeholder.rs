@@ -13,7 +13,7 @@ use objc2_foundation::{
 };
 
 use crate::theme;
-use crate::view::{make_attrs, ns_color};
+use crate::view::{make_attrs, ns_color, ns_color_bg};
 
 /// App-icon size in the empty state, and its gap above the title.
 const LOGO: f64 = 64.0;
@@ -59,7 +59,7 @@ impl PlaceholderView {
         let (w, h) = (b.size.width, b.size.height);
         let t = theme::current();
         unsafe {
-            ns_color(t.bg).set();
+            ns_color_bg(t.bg).set();
             NSRectFill(b);
         }
 

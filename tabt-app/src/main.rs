@@ -22,6 +22,7 @@ mod settings;
 mod settings_dialog;
 mod sidebar;
 mod theme;
+mod theme_grid;
 mod toggle;
 mod view;
 

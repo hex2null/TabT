@@ -16,7 +16,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontWeightRegular,
+    NSBezierPath, NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontWeightRegular,
     NSForegroundColorAttributeName, NSImage, NSImageSymbolConfiguration, NSImageSymbolScale,
     NSLineBreakMode, NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard,
     NSPasteboardTypeString, NSRectFill, NSResponder, NSStringDrawing, NSTextInputClient,
@@ -53,8 +53,14 @@ fn mouse_mods(event: &NSEvent) -> MouseMods {
     }
 }
 
-/// Text padding relative to the view's edges (logical points).
-pub(crate) const PAD: f64 = 10.0;
+/// Text padding relative to the view's edges (logical points): the Settings → Appearance →
+/// Padding value, read on demand like the font metrics. Changing it changes how many cols/rows
+/// fit, so `AppController` reflows every grid and re-sends TIOCSWINSZ after a change.
+fn pad() -> f64 {
+    settings::pad()
+}
+/// Thickness of the bar and underline cursors (logical points).
+const CARET_W: f64 = 2.0;
 /// Extra vertical space added to each row on top of the natural glyph height (line spacing).
 /// Glyphs are centered within the taller row, so half the gap sits above and half below.
 /// Zero means the standard/default line height (the font's own natural glyph height).
@@ -153,6 +159,8 @@ declare_class!(
 
         #[method(keyDown:)]
         fn key_down(&self, event: &NSEvent) {
+            // Typing always shows the cursor (and restarts the blink cycle from visible).
+            settings::show_cursor_phase();
             // Session already ended: there is no shell to type into. Only Enter/Return means
             // anything here — it restarts a fresh shell in place; every other key is a no-op.
             if self.ivars().ended.get() {
@@ -520,7 +528,7 @@ declare_class!(
             }
             let (cw, lh) = (settings::cell_w(), settings::line_h());
             let (cc, cr) = self.ivars().grid.borrow().cursor; // (usize, usize) is Copy: borrow drops here
-            let cell = rect(PAD + cc as f64 * cw, PAD + cr as f64 * lh, cw, lh);
+            let cell = rect(pad() + cc as f64 * cw, pad() + cr as f64 * lh, cw, lh);
             match self.window() {
                 Some(win) => {
                     let in_window = self.convertRect_toView(cell, None);
@@ -578,6 +586,17 @@ impl TermView {
     /// Current working directory (reported via OSC 7, used for "Open in Finder" and session restore).
     pub fn cwd(&self) -> String {
         self.ivars().grid.borrow().cwd().to_string()
+    }
+
+    /// Apply the configured scrollback depth to this tab's grid (Settings → Terminal → Scrollback).
+    ///
+    /// Clears the selection for the same reason `resize_grid` does: lowering the cap evicts the
+    /// oldest history while `scrolled` stays monotonic, so `buf_top()` rises and a selection
+    /// anchored in the evicted rows now names rows that are gone — and `selected_text` would walk
+    /// them. Under `panic = "abort"` that is the whole process, not one tab.
+    pub fn set_scrollback(&self, lines: usize) {
+        self.ivars().grid.borrow_mut().set_history_max(lines);
+        self.clear_selection();
     }
 
     /// Re-lay-out the grid to new cols/rows (called by the controller after a font change).
@@ -638,6 +657,9 @@ impl TermView {
     pub fn restart(&self, fd: RawFd, cols: usize, rows: usize) {
         self.ivars().master_fd.set(fd);
         *self.ivars().grid.borrow_mut() = Grid::new(cols, rows);
+        // A fresh Grid starts at the built-in history cap, so the configured depth has to be
+        // re-applied — otherwise restarting an ended shell silently resets the user's scrollback.
+        self.set_scrollback(settings::scrollback());
         self.clear_selection();
         self.ivars().ended.set(false);
         unsafe { self.setNeedsDisplay(true) };
@@ -719,6 +741,9 @@ impl TermView {
             }
         }
         if dirty {
+            // Output means the cursor is where the eye is: show it, whatever half of the blink
+            // cycle the timer left it in.
+            settings::show_cursor_phase();
             unsafe { self.setNeedsDisplay(true) };
         }
     }
@@ -727,8 +752,8 @@ impl TermView {
     /// to tell the PTY the new size (the shell receives SIGWINCH and redraws).
     fn on_resize(&self, size: NSSize) {
         let ivars = self.ivars();
-        let cols = (((size.width - 2.0 * PAD) / settings::cell_w()).floor() as i64).max(1) as usize;
-        let rows = (((size.height - 2.0 * PAD) / settings::line_h()).floor() as i64).max(1) as usize;
+        let cols = (((size.width - 2.0 * pad()) / settings::cell_w()).floor() as i64).max(1) as usize;
+        let rows = (((size.height - 2.0 * pad()) / settings::line_h()).floor() as i64).max(1) as usize;
 
         {
             let mut grid = ivars.grid.borrow_mut();
@@ -776,8 +801,8 @@ impl TermView {
         let ivars = self.ivars();
         let grid = ivars.grid.borrow();
         let (cols, rows) = (grid.cols as i64, grid.rows as i64);
-        let col = (((lp.x - PAD) / settings::cell_w()).floor() as i64).clamp(0, cols - 1);
-        let row = (((lp.y - PAD) / settings::line_h()).floor() as i64).clamp(0, rows - 1);
+        let col = (((lp.x - pad()) / settings::cell_w()).floor() as i64).clamp(0, cols - 1);
+        let row = (((lp.y - pad()) / settings::line_h()).floor() as i64).clamp(0, rows - 1);
         (col as usize, grid.view_base() + row as usize)
     }
 
@@ -790,8 +815,8 @@ impl TermView {
         let (cols, rows) = (grid.cols as i64, grid.rows as i64);
         // Clamped, not just cast: a drag can leave the view entirely, and a negative or oversized
         // index would be a panic (which aborts the process under `panic="abort"`) or a bogus report.
-        let col = (((lp.x - PAD) / settings::cell_w()).floor() as i64).clamp(0, cols - 1);
-        let row = (((lp.y - PAD) / settings::line_h()).floor() as i64).clamp(0, rows - 1);
+        let col = (((lp.x - pad()) / settings::cell_w()).floor() as i64).clamp(0, cols - 1);
+        let row = (((lp.y - pad()) / settings::line_h()).floor() as i64).clamp(0, rows - 1);
         (col as usize, row as usize)
     }
 
@@ -981,9 +1006,10 @@ impl TermView {
         let t = theme::current();
         let default_bg = t.bg;
 
-        // Whole-window background (uses the current theme's background color).
+        // Whole-window background (the current theme's background color, carrying the opacity
+        // setting — see ns_color_bg; everything drawn over it stays opaque).
         unsafe {
-            ns_color(default_bg).set();
+            ns_color_bg(default_bg).set();
             NSRectFill(self.bounds());
         }
 
@@ -1005,14 +1031,14 @@ impl TermView {
                 if c0 > c1 {
                     continue;
                 }
-                let x = PAD + c0 as f64 * cw;
+                let x = pad() + c0 as f64 * cw;
                 let width = (c1 - c0 + 1) as f64 * cw;
-                unsafe { NSRectFill(rect(x, PAD + (r - base) as f64 * lh, width, lh)) };
+                unsafe { NSRectFill(rect(x, pad() + (r - base) as f64 * lh, width, lh)) };
             }
         }
 
         for r in 0..rows {
-            let y = PAD + r as f64 * lh;
+            let y = pad() + r as f64 * lh;
             let mut c = 0;
             while c < cols {
                 // Merge adjacent cells starting at c with identical attributes into a single run.
@@ -1031,7 +1057,7 @@ impl TermView {
                     continue;
                 }
 
-                let run_x = PAD + start as f64 * cw;
+                let run_x = pad() + start as f64 * cw;
                 // A wide lead char is always the last cell of its run (its trailer has distinct attrs),
                 // so if the cell just past the run is a trailer, extend the fill by one column to cover it.
                 let trailing = c < cols && grid.view_cell(c, r).flags & WIDE_TRAILER != 0;
@@ -1072,27 +1098,42 @@ impl TermView {
         }
 
 
-        // Cursor: an inverse-video block (fill with the cursor cell's foreground color, then redraw the character in its background color).
+        // Cursor. A block is inverse video: fill the cell with the character's foreground color and
+        // redraw the character in its background color. A bar or an underline is a thin slice at
+        // the cell's leading/bottom edge instead, drawn over the character, which stays as it was.
         // Hidden while scrolled back into the scrollback: the cursor lives on the live screen, and
         // painting it at the same row of a history viewport would mark an unrelated line.
-        if grid.cursor_visible() && grid.view_offset() == 0 {
+        if grid.cursor_visible() && grid.view_offset() == 0 && settings::cursor_phase_on() {
             let (cc, cr) = grid.cursor;
             if cc < cols && cr < rows {
-                let x = PAD + cc as f64 * cw;
-                let y = PAD + cr as f64 * lh;
+                let x = pad() + cc as f64 * cw;
+                let y = pad() + cr as f64 * lh;
                 let cell = grid.view_cell(cc, cr);
                 let (fg, bg, _) = eff(cell, &t);
-                // A wide glyph occupies two columns; the cursor block covers both.
+                // A wide glyph occupies two columns; the cursor covers both.
                 let cur_w = if char_width(cell.ch) == 2 { 2.0 * cw } else { cw };
-                unsafe {
-                    ns_color(fg).set();
-                    NSRectFill(rect(x, y, cur_w, lh));
-                }
-                if cell.ch != ' ' {
-                    let color = ns_color(bg);
-                    let attrs = make_attrs(&font, Some(&color));
-                    let ns = NSString::from_str(&cell.ch.to_string());
-                    unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(x, y + LINE_GAP / 2.0), Some(&attrs)) };
+                match settings::cursor_shape() {
+                    settings::CursorShape::Block => {
+                        unsafe {
+                            ns_color(fg).set();
+                            NSRectFill(rect(x, y, cur_w, lh));
+                        }
+                        if cell.ch != ' ' {
+                            let color = ns_color(bg);
+                            let attrs = make_attrs(&font, Some(&color));
+                            let ns = NSString::from_str(&cell.ch.to_string());
+                            unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(x, y + LINE_GAP / 2.0), Some(&attrs)) };
+                        }
+                    }
+                    // The view is flipped, so the cell's bottom edge is its largest y.
+                    settings::CursorShape::Bar => unsafe {
+                        ns_color(fg).set();
+                        NSRectFill(rect(x, y, CARET_W, lh));
+                    },
+                    settings::CursorShape::Underline => unsafe {
+                        ns_color(fg).set();
+                        NSRectFill(rect(x, y + lh - CARET_W, cur_w, CARET_W));
+                    },
                 }
             }
         }
@@ -1103,8 +1144,8 @@ impl TermView {
         if !marked.is_empty() && grid.view_offset() == 0 {
             let (cc, cr) = grid.cursor;
             if cc < cols && cr < rows {
-                let x = PAD + cc as f64 * cw;
-                let y = PAD + cr as f64 * lh;
+                let x = pad() + cc as f64 * cw;
+                let y = pad() + cr as f64 * lh;
                 let n = marked.chars().count();
                 // Clamp the width to the row's remaining cells so it can't overflow the view.
                 let w = (n as f64 * cw).min((cols - cc) as f64 * cw);
@@ -1180,6 +1221,15 @@ fn palette(n: u8, t: &Theme) -> (u8, u8, u8) {
 
 pub(crate) fn ns_color(rgb: Rgb) -> Retained<NSColor> {
     unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(rgb.0, rgb.1, rgb.2, 1.0) }
+}
+
+/// The same color carrying the window-opacity setting — for **background fills only**: the
+/// terminal's default background, the header/placeholder behind it, the sidebar card and the
+/// window's own color. Everything drawn on top (glyphs, the card hairline, a cell's explicit SGR
+/// background) keeps [`ns_color`] and stays opaque, which is what keeps a translucent window
+/// readable. `AppController::sync_window_chrome` also flips `setOpaque:` to match.
+pub(crate) fn ns_color_bg(rgb: Rgb) -> Retained<NSColor> {
+    unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(rgb.0, rgb.1, rgb.2, settings::opacity()) }
 }
 
 /// Extract the plain string from an `insertText:`/`setMarkedText:` argument, which AppKit hands over
@@ -1268,6 +1318,25 @@ pub(crate) fn make_attrs(
     dict
 }
 
+/// Fill a rounded rectangle.
+pub(crate) fn round_fill(r: NSRect, radius: f64, color: &NSColor) {
+    unsafe {
+        color.set();
+        let p = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r, radius, radius);
+        p.fill();
+    }
+}
+
+/// Stroke a rounded rectangle.
+pub(crate) fn round_stroke(r: NSRect, radius: f64, width: f64, color: &NSColor) {
+    unsafe {
+        color.set();
+        let p = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r, radius, radius);
+        p.setLineWidth(width);
+        p.stroke();
+    }
+}
+
 /// Draw a single line of text truncated with a tail ellipsis (`…`) to fit `rect`'s width.
 /// Used for tab/group names so long labels never overflow their row.
 pub(crate) fn draw_truncated(text: &str, rect: NSRect, font: &Retained<NSFont>, fg: Rgb) {
@@ -1311,6 +1380,38 @@ pub fn cancel_reader(t: &ReaderToken) {
     unsafe { dispatch::dispatch_source_cancel(t.0) };
 }
 
+/// Handle on a repeating main-queue timer; cancel it to stop the callbacks (see [`attach_timer`]).
+pub struct TimerToken(dispatch::Source);
+
+/// A repeating timer on the main queue, calling `handler(ctx)` every `interval_ms`.
+///
+/// Deliberately a GCD source rather than an `NSTimer`: the only sensible owner here is
+/// `AppController`, which is a plain Rust struct and cannot be an Objective-C target, and making a
+/// `TermView` the target instead would have the timer retain a view the controller is supposed to
+/// be free to drop when its tab closes. `ctx` must outlive the timer — the caller cancels it
+/// through the returned token.
+pub fn attach_timer(interval_ms: u64, ctx: *mut c_void, handler: extern "C" fn(*mut c_void)) -> TimerToken {
+    unsafe {
+        let queue: dispatch::Queue = &dispatch::_dispatch_main_q as *const _ as *mut _;
+        let ty: dispatch::SourceType = &dispatch::_dispatch_source_type_timer;
+        let src = dispatch::dispatch_source_create(ty, 0, 0, queue);
+        let ns = interval_ms as i64 * 1_000_000;
+        let start = dispatch::dispatch_time(dispatch::TIME_NOW, ns);
+        // A generous leeway: blinking a cursor is the least urgent thing the app does, and it lets
+        // the system coalesce the wakeup with others rather than spinning the CPU on its own.
+        dispatch::dispatch_source_set_timer(src, start, ns as u64, (ns / 10) as u64);
+        dispatch::dispatch_set_context(src, ctx);
+        dispatch::dispatch_source_set_event_handler_f(src, handler);
+        dispatch::dispatch_resume(src);
+        TimerToken(src)
+    }
+}
+
+/// Stop a repeating timer.
+pub fn cancel_timer(t: &TimerToken) {
+    unsafe { dispatch::dispatch_source_cancel(t.0) };
+}
+
 unsafe fn write_all(fd: RawFd, mut data: &[u8]) {
     while !data.is_empty() {
         let w = libc::write(fd, data.as_ptr().cast(), data.len());
@@ -1349,9 +1450,15 @@ pub(crate) mod dispatch {
     pub type SourceType = *const Object;
     pub type FunctionT = extern "C" fn(*mut c_void);
 
+    /// `DISPATCH_TIME_NOW`, the base `dispatch_time` offsets are measured from.
+    pub const TIME_NOW: u64 = 0;
+
     extern "C" {
         pub static _dispatch_source_type_read: Object;
+        pub static _dispatch_source_type_timer: Object;
         pub static _dispatch_main_q: Object;
+        pub fn dispatch_time(when: u64, delta: i64) -> u64;
+        pub fn dispatch_source_set_timer(source: Source, start: u64, interval: u64, leeway: u64);
         pub fn dispatch_source_create(
             type_: SourceType,
             handle: usize,

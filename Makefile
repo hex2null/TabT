@@ -54,6 +54,9 @@ bundle: build
 	# directory on first run. Must land before codesign — a file added to Contents/Resources
 	# afterwards invalidates the signature.
 	cp bundle/themes.conf "$(BUNDLE)/Resources/"
+	# Credits shown by the standard About panel (the app menu's "About"); carries the repository
+	# link. Same rule as above: it has to land before codesign.
+	cp bundle/Credits.rtf "$(BUNDLE)/Resources/"
 	@if security find-certificate -c "$(CERT_NAME)" >/dev/null 2>&1; then \
 		codesign --force --sign "$(CERT_NAME)" "$(APP)"; \
 	else \

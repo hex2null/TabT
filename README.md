@@ -19,8 +19,12 @@ sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT
    Solarized Light, GitHub Light, Ayu Light); the whole UI derives from the active theme, staying
    legible on light and dark alike. They are plain data, not code: edit `~/.tabt/themes.conf` to
    change one or add your own.
-5. **Fonts** — 10 classic monospace families, adjustable live with ⌘= / ⌘- / ⌘0.
-6. **Settings dialog** (⌘,) — theme, font, sidebar side, border visibility, all applied live.
+5. **Fonts** — 9 classic monospace families, adjustable live with ⌘= / ⌘- / ⌘0.
+6. **Settings dialog** (⌘,) — four panes, everything applied live and saved at once: *Theme*
+   (a grid of preview cards, each a miniature of the app in that theme rather than a name in a
+   list), *Appearance* (font, size, sidebar side, border, padding, background opacity),
+   *Terminal* (cursor shape, blink, scrollback depth) and *Shell* (which shell to run, and whether
+   a new tab opens in your home directory or the active tab's).
 7. **Per-tab status dot** — click a tab's dot to give it a color.
 8. **Persistence** — layout, groups, tabs, theme, font, and window size are restored on launch.
 9. **Mouse support in TUIs** — clicks, drags and the wheel are reported to the running application
@@ -59,8 +63,9 @@ This builds a release binary, bundles it into `dist/TabT Dev.app`, code-signs it
 | ⌘T | New terminal | | ⌘F | Search sessions |
 | ⇧⌘N | New group | | ⌘B | Toggle sidebar |
 | ⌘W | Close tab | | ⌘K | Clear screen |
-| ⇧⌘R | Reveal cwd in Finder | | ⌘= / ⌘- / ⌘0 | Font size ± / reset |
+| ⌘R | Rename session | | ⌘= / ⌘- / ⌘0 | Font size ± / reset |
 | ⌘, | Settings | | ⌘C / ⌘V / ⌘A | Copy / paste / select all |
+| ⇧⌘R | Reveal cwd in Finder | | ⌃↩ | Session context menu |
 
 Also: double-click the header to zoom the window, double-click a tab/group name to rename it,
 and click a tab's status dot to set its color. While an application is using the mouse itself,

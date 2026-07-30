@@ -28,7 +28,7 @@
 //!   - IRM (ANSI mode 4), where printing opens a gap instead of overwriting.
 //!
 //!   - a scrollback buffer: lines that scroll off the top of the main screen are kept in
-//!     `history` (capped at `HISTORY_MAX`), and the renderer reads through `view_cell()` so the
+//!     `history` (capped at `DEFAULT_HISTORY_MAX`), and the renderer reads through `view_cell()` so the
 //!     viewport can be scrolled back with `scroll_view()`.
 //!
 //! Still not implemented (left for later milestones): reflowing the scrollback when the window is
@@ -163,9 +163,11 @@ pub enum MouseEvent {
     Motion(Option<MouseButton>),
 }
 
-/// Maximum number of scrolled-off lines retained per grid. Rows are stored with their trailing
-/// blank cells trimmed, so a typical shell session costs far less than `HISTORY_MAX * cols`.
-pub const HISTORY_MAX: usize = 5000;
+/// Default number of scrolled-off lines retained per grid, and the cap a fresh [`Grid`] starts
+/// with. Rows are stored with their trailing blank cells trimmed, so a typical shell session costs
+/// far less than `DEFAULT_HISTORY_MAX * cols`. The live cap is per-grid and settable — see
+/// [`Grid::set_history_max`].
+pub const DEFAULT_HISTORY_MAX: usize = 5000;
 
 // Cell attribute bits.
 pub const BOLD: u8 = 1 << 0;
@@ -269,13 +271,15 @@ pub struct Grid {
     scroll_bot: usize,
 
     // ---- Scrollback ----
-    // Lines that scrolled off the top of the main screen, oldest first, capped at HISTORY_MAX.
+    // Lines that scrolled off the top of the main screen, oldest first, capped at history_max.
     // Rows are trimmed of trailing blank cells; `view_cell` substitutes BLANK past a row's end.
     // The alt screen never contributes here (vim/less redraw themselves; their scrolling is not history).
     history: VecDeque<Vec<Cell>>,
+    // Cap on `history`, settable per grid (the app's `scrollback` setting); see `set_history_max`.
+    history_max: usize,
     // Total number of lines that have ever scrolled off the top, *including* those since evicted
     // from the capped deque. Monotonic — it is what makes `buf_cell`'s coordinates stable: the
-    // deque's own indices shift down by one on every eviction at HISTORY_MAX, so a coordinate
+    // deque's own indices shift down by one on every eviction at the cap, so a coordinate
     // stored by the caller (the mouse selection) would silently slide onto other text.
     // `history[i]` is absolute row `scrolled - history.len() + i`; screen row `r` is `scrolled + r`.
     scrolled: usize,
@@ -367,6 +371,7 @@ impl Grid {
             scroll_top: 0,
             scroll_bot: rows.saturating_sub(1),
             history: VecDeque::new(),
+            history_max: DEFAULT_HISTORY_MAX,
             scrolled: 0,
             view_offset: 0,
             autowrap: true,
@@ -426,6 +431,21 @@ impl Grid {
     /// Number of lines retained in the scrollback.
     pub fn history_len(&self) -> usize {
         self.history.len()
+    }
+
+    /// Set how many scrolled-off lines this grid keeps (the app's `scrollback` setting).
+    ///
+    /// Lowering it drops the oldest lines immediately rather than waiting for new output, and pulls
+    /// the viewport back up with them — `view_offset` must stay within `history`, or `view_cell`
+    /// would index past its end. `scrolled` is deliberately untouched: it counts lines that have
+    /// left the screen, evicted or not, and the mouse selection's absolute coordinates are built on
+    /// it staying monotonic.
+    pub fn set_history_max(&mut self, max: usize) {
+        self.history_max = max;
+        while self.history.len() > max {
+            self.history.pop_front();
+        }
+        self.view_offset = self.view_offset.min(self.history.len());
     }
 
     /// First virtual-buffer row still retained: rows below this scrolled off and were evicted from
@@ -1249,11 +1269,20 @@ impl Grid {
     /// every visible line up by one, so `view_offset` grows to compensate. Once history is at cap
     /// the oldest line is evicted, and the clamp against the (unchanged) length keeps the top of
     /// the scrollback from scrolling out from under the viewport.
+    ///
+    /// `scrolled` counts the line either way: it is the absolute-coordinate base, so it must keep
+    /// up with the screen even when the line is dropped rather than kept.
     fn push_history(&mut self, r: usize) {
+        if self.history_max == 0 {
+            self.scrolled += 1;
+            return;
+        }
         let base = r * self.cols;
         let row = &self.cells[base..base + self.cols];
         let end = row.iter().rposition(|c| *c != BLANK).map_or(0, |i| i + 1);
-        if self.history.len() == HISTORY_MAX {
+        // `while`/`>=` rather than a single `==` pop: the cap is settable, so the deque can be over
+        // it when this runs (a lowered cap trims lazily as new lines arrive).
+        while self.history.len() >= self.history_max {
             self.history.pop_front();
         }
         self.history.push_back(row[..end].to_vec());
@@ -1877,19 +1906,46 @@ mod tests {
     #[test]
     fn history_is_capped_and_the_viewport_survives_eviction() {
         let mut g = Grid::new(6, 2);
-        for i in 0..HISTORY_MAX + 10 {
+        for i in 0..DEFAULT_HISTORY_MAX + 10 {
             g.feed(format!("{i}\r\n").as_bytes());
         }
-        assert_eq!(g.history_len(), HISTORY_MAX);
+        assert_eq!(g.history_len(), DEFAULT_HISTORY_MAX);
 
         // Scrolled fully back, the oldest surviving line is on top; further output evicts from the
         // front, and the clamp keeps the offset legal rather than reading past the end.
-        g.scroll_view(HISTORY_MAX as isize);
-        assert_eq!(g.view_offset(), HISTORY_MAX);
+        g.scroll_view(DEFAULT_HISTORY_MAX as isize);
+        assert_eq!(g.view_offset(), DEFAULT_HISTORY_MAX);
         g.feed(b"tail\r\n");
-        assert_eq!(g.view_offset(), HISTORY_MAX);
-        assert_eq!(g.history_len(), HISTORY_MAX);
+        assert_eq!(g.view_offset(), DEFAULT_HISTORY_MAX);
+        assert_eq!(g.history_len(), DEFAULT_HISTORY_MAX);
         let _ = view_lines(&g); // must not panic on the evicted front
+    }
+
+    /// Lowering the cap (Settings → Terminal → Scrollback) must drop the oldest lines right away
+    /// and drag a scrolled-back viewport down with them, since `view_offset` indexes `history`.
+    #[test]
+    fn lowering_the_history_cap_evicts_from_the_front_and_clamps_the_viewport() {
+        let mut g = Grid::new(6, 2);
+        for i in 0..100 {
+            g.feed(format!("{i}\r\n").as_bytes());
+        }
+        let kept = g.history_len(); // one line is still on screen, so this is 99, not 100
+        g.scroll_view(kept as isize); // fully scrolled back
+        assert_eq!(g.view_offset(), kept);
+
+        g.set_history_max(10);
+        assert_eq!(g.history_len(), 10, "the oldest lines go immediately, not on the next output");
+        assert_eq!(g.view_offset(), 10, "the viewport cannot sit above the surviving history");
+        // The survivors are the newest ten, so the top of the viewport is the tenth line from the end.
+        assert_eq!(view_lines(&g)[0], format!("{}", kept - 10));
+
+        // The lowered cap holds as new lines arrive.
+        g.feed(b"next\r\n");
+        assert_eq!(g.history_len(), 10);
+
+        // Raising it again keeps what is left rather than resurrecting anything.
+        g.set_history_max(DEFAULT_HISTORY_MAX);
+        assert_eq!(g.history_len(), 10);
     }
 
     #[test]
@@ -2302,16 +2358,16 @@ mod tests {
         assert_eq!(g.buf_cell(99, g.buf_top()), &BLANK); // past the end of a trimmed history line
     }
 
-    /// The bug the absolute coordinates exist to prevent: at HISTORY_MAX every new line evicts one
+    /// The bug the absolute coordinates exist to prevent: at DEFAULT_HISTORY_MAX every new line evicts one
     /// from the front, so a deque-relative row would slide onto different text once per line.
     #[test]
     fn buf_cell_coordinates_survive_history_eviction() {
-        const LINES: usize = HISTORY_MAX + 10;
+        const LINES: usize = DEFAULT_HISTORY_MAX + 10;
         let mut g = Grid::new(10, 2);
         for i in 0..LINES {
             g.feed(format!("line{i}\r\n").as_bytes());
         }
-        assert_eq!(g.history_len(), HISTORY_MAX, "history must be at the cap for this to bite");
+        assert_eq!(g.history_len(), DEFAULT_HISTORY_MAX, "history must be at the cap for this to bite");
 
         // Pin a coordinate to a known line, then push enough output to evict a chunk of the front.
         let row = g.buf_end() - 3; // the newest line that has scrolled off

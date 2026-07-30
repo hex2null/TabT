@@ -1,43 +1,105 @@
-//! Settings dialog: a small native panel with standard AppKit controls (theme + font
-//! family pop-ups, a font-size stepper/field, and a "sidebar on right" checkbox).
+//! Settings dialog: a small native panel with standard AppKit controls, split into tabs
+//! (Theme / Appearance / Terminal / Shell).
 //!
 //! It replaces the old bottom-of-sidebar pop-up menu. The controls read/write through the
 //! [`AppController`], so every change applies live and is persisted immediately. The panel
 //! object is kept alive by the controller (it holds the `Retained<SettingsDialog>`); the
 //! dialog holds only a raw pointer back to the controller, so there is no reference cycle.
+//!
+//! Rows are laid out by [`Rows`], a cursor that walks down a pane one `ROW_H` at a time: adding a
+//! setting is one `rows.next()`, not a re-tune of a column of hand-computed constants. The panes
+//! are sized to the tallest one (`MAX_ROWS`), so switching tabs never resizes the window.
 
 use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSPopUpButton,
-    NSStepper, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSApplication, NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSBackingStoreType,
+    NSAutoresizingMaskOptions, NSColor, NSPopUpButton, NSScrollView, NSSegmentedControl,
+    NSSegmentStyle, NSStepper, NSTabView, NSTabViewItem, NSTabViewType, NSTextField, NSView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 
 use crate::app::AppController;
 use crate::settings;
 use crate::theme;
+use crate::theme_grid::ThemeGrid;
 
-const W: f64 = 340.0;
-const H: f64 = 228.0;
-const LABEL_X: f64 = 22.0;
-const CTRL_X: f64 = 96.0;
-const CTRL_W: f64 = 200.0;
+/// Window content width. The panes are the same, less `MARGIN` on each side. Sized for the theme
+/// grid — two preview cards wide — rather than for the control rows, which need far less.
+const W: f64 = 524.0;
+/// Gap between the window edge and the tab view.
+const MARGIN: f64 = 12.0;
+/// Vertical distance between two rows.
+const ROW_H: f64 = 38.0;
+/// Height of every pane's content area — one size for all of them, so switching tabs never
+/// resizes the window. Set by the theme grid, which wants the room; the control panes hold far
+/// fewer points of content and center it (see [`Rows::new`]).
+const PANE_H: f64 = 384.0;
+
+/// The panes, in order — the segmented switcher's labels and the tab view's items.
+const PANES: [&str; 4] = ["Theme", "Appearance", "Terminal", "Shell"];
+/// The switcher's own strip above the panes.
+const SWITCHER_H: f64 = 34.0;
+const SWITCHER_W: f64 = 340.0;
+
+const LABEL_X: f64 = 26.0;
+const LABEL_W: f64 = 100.0;
+const CTRL_X: f64 = 134.0;
+const CTRL_W: f64 = 250.0;
+
+/// A downward cursor over one pane's rows: `next()` yields the next row's baseline y. Panes are
+/// non-flipped (y grows upward), so it counts down from the top.
+struct Rows {
+    y: f64,
+}
+
+impl Rows {
+    /// Start a pane of `count` rows, vertically centered: every pane is as tall as the theme grid
+    /// needs, which is far more than any of the control panes fill, and rows pinned to the top of
+    /// that would sit above a void.
+    fn new(count: usize) -> Self {
+        Rows { y: (PANE_H + count as f64 * ROW_H) / 2.0 }
+    }
+
+    fn next(&mut self) -> f64 {
+        self.y -= ROW_H;
+        self.y
+    }
+}
 
 pub struct DialogIvars {
     controller: Cell<*const AppController>,
     window: RefCell<Option<Retained<NSWindow>>>,
-    theme_pop: RefCell<Option<Retained<NSPopUpButton>>>,
+    tabs: RefCell<Option<Retained<NSTabView>>>,
+    theme_grid: RefCell<Option<Retained<ThemeGrid>>>,
     fam_pop: RefCell<Option<Retained<NSPopUpButton>>>,
     size_field: RefCell<Option<Retained<NSTextField>>>,
     size_stepper: RefCell<Option<Retained<NSStepper>>>,
     side_pop: RefCell<Option<Retained<NSPopUpButton>>>,
     border_pop: RefCell<Option<Retained<NSPopUpButton>>>,
+    pad_field: RefCell<Option<Retained<NSTextField>>>,
+    pad_stepper: RefCell<Option<Retained<NSStepper>>>,
+    cursor_pop: RefCell<Option<Retained<NSPopUpButton>>>,
+    scrollback_pop: RefCell<Option<Retained<NSPopUpButton>>>,
+    scrollback_items: RefCell<Vec<usize>>, // the pop-up's values, in item order
+    shell_field: RefCell<Option<Retained<NSTextField>>>,
+    new_tab_pop: RefCell<Option<Retained<NSPopUpButton>>>,
+    blink_pop: RefCell<Option<Retained<NSPopUpButton>>>,
+    opacity_pop: RefCell<Option<Retained<NSPopUpButton>>>,
 }
+
+/// Opacity steps the pop-up offers, as percentages, opaque first.
+const OPACITY_PERCENTS: [u32; 11] = [100, 95, 90, 85, 80, 75, 70, 65, 60, 55, 50];
+
+/// Scrollback depths the pop-up offers. A hand-edited `layout.conf` may hold something else, in
+/// which case that value is spliced in (see `scrollback_items`) rather than silently rounded.
+const SCROLLBACK_PRESETS: [usize; 8] = [500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000];
 
 declare_class!(
     pub struct SettingsDialog;
@@ -54,12 +116,25 @@ declare_class!(
 
     unsafe impl NSObjectProtocol for SettingsDialog {}
 
+    unsafe impl NSWindowDelegate for SettingsDialog {
+        /// Closing the panel tears down the field editor without committing it, so a value typed
+        /// into one of the text fields and *not* followed by Return would otherwise be dropped on
+        /// the floor — while every pop-up beside it applies the moment it changes. Read the fields
+        /// out here instead of trusting AppKit's action to have fired.
+        #[method(windowWillClose:)]
+        fn window_will_close(&self, _notification: &NSNotification) {
+            self.commit_fields();
+        }
+    }
+
     unsafe impl SettingsDialog {
-        #[method(themeChanged:)]
-        fn theme_changed(&self, sender: &NSPopUpButton) {
-            let idx = unsafe { sender.indexOfSelectedItem() } as usize;
-            if let Some(c) = self.controller() {
-                c.set_style(idx);
+        /// The pane switcher. The tab view itself draws no tabs (see `show`), so this segmented
+        /// control is the whole of the switching UI.
+        #[method(panePicked:)]
+        fn pane_picked(&self, sender: &NSSegmentedControl) {
+            let idx = unsafe { sender.selectedSegment() };
+            if let Some(t) = self.ivars().tabs.borrow().as_ref() {
+                unsafe { t.selectTabViewItemAtIndex(idx) };
             }
         }
 
@@ -107,6 +182,79 @@ declare_class!(
                 c.set_show_border(shown);
             }
         }
+
+        #[method(padStepped:)]
+        fn pad_stepped(&self, sender: &NSStepper) {
+            let v = unsafe { sender.doubleValue() };
+            if let Some(f) = self.ivars().pad_field.borrow().as_ref() {
+                unsafe { f.setStringValue(&NSString::from_str(&format!("{}", v as i64))) };
+            }
+            if let Some(c) = self.controller() {
+                c.set_padding(v);
+            }
+        }
+
+        #[method(padEdited:)]
+        fn pad_edited(&self, sender: &NSTextField) {
+            let v = unsafe { sender.doubleValue() }.clamp(0.0, settings::MAX_PAD);
+            unsafe { sender.setStringValue(&NSString::from_str(&format!("{}", v as i64))) };
+            if let Some(s) = self.ivars().pad_stepper.borrow().as_ref() {
+                unsafe { s.setDoubleValue(v) };
+            }
+            if let Some(c) = self.controller() {
+                c.set_padding(v);
+            }
+        }
+
+        #[method(cursorChanged:)]
+        fn cursor_changed(&self, sender: &NSPopUpButton) {
+            let idx = unsafe { sender.indexOfSelectedItem() } as usize;
+            if let Some(c) = self.controller() {
+                c.set_cursor_shape(idx);
+            }
+        }
+
+        #[method(scrollbackChanged:)]
+        fn scrollback_changed(&self, sender: &NSPopUpButton) {
+            let idx = unsafe { sender.indexOfSelectedItem() } as usize;
+            let lines = self.ivars().scrollback_items.borrow().get(idx).copied();
+            if let (Some(c), Some(lines)) = (self.controller(), lines) {
+                c.set_scrollback(lines);
+            }
+        }
+
+        // Shell path edited (Enter): applies to tabs opened from now on.
+        #[method(shellEdited:)]
+        fn shell_edited(&self, sender: &NSTextField) {
+            let path = unsafe { sender.stringValue() }.to_string();
+            if let Some(c) = self.controller() {
+                c.set_shell(&path);
+            }
+        }
+
+        #[method(blinkChanged:)]
+        fn blink_changed(&self, sender: &NSPopUpButton) {
+            let on = unsafe { sender.indexOfSelectedItem() } == 1; // 0 = Off, 1 = On
+            if let Some(c) = self.controller() {
+                c.set_cursor_blink(on);
+            }
+        }
+
+        #[method(opacityChanged:)]
+        fn opacity_changed(&self, sender: &NSPopUpButton) {
+            let idx = unsafe { sender.indexOfSelectedItem() } as usize;
+            if let (Some(c), Some(p)) = (self.controller(), OPACITY_PERCENTS.get(idx)) {
+                c.set_opacity(*p as f64 / 100.0);
+            }
+        }
+
+        #[method(newTabDirChanged:)]
+        fn new_tab_dir_changed(&self, sender: &NSPopUpButton) {
+            let idx = unsafe { sender.indexOfSelectedItem() } as usize;
+            if let Some(c) = self.controller() {
+                c.set_new_tab_dir(idx);
+            }
+        }
     }
 );
 
@@ -116,12 +264,22 @@ impl SettingsDialog {
         let this = this.set_ivars(DialogIvars {
             controller: Cell::new(std::ptr::null()),
             window: RefCell::new(None),
-            theme_pop: RefCell::new(None),
+            tabs: RefCell::new(None),
+            theme_grid: RefCell::new(None),
             fam_pop: RefCell::new(None),
             size_field: RefCell::new(None),
             size_stepper: RefCell::new(None),
             side_pop: RefCell::new(None),
             border_pop: RefCell::new(None),
+            pad_field: RefCell::new(None),
+            pad_stepper: RefCell::new(None),
+            cursor_pop: RefCell::new(None),
+            scrollback_pop: RefCell::new(None),
+            scrollback_items: RefCell::new(Vec::new()),
+            shell_field: RefCell::new(None),
+            new_tab_pop: RefCell::new(None),
+            blink_pop: RefCell::new(None),
+            opacity_pop: RefCell::new(None),
         });
         unsafe { msg_send_id![super(this), init] }
     }
@@ -145,11 +303,24 @@ impl SettingsDialog {
         }
     }
 
+    /// Match the panel's appearance to the theme, so the standard controls render light on a light
+    /// theme and dark on a dark one (the main window does the same in `sync_window_chrome`).
+    /// Public because a theme switch with the panel open has to re-apply it.
+    pub fn sync_appearance(&self) {
+        let name = unsafe {
+            if theme::current().is_dark() { NSAppearanceNameDarkAqua } else { NSAppearanceNameAqua }
+        };
+        if let (Some(w), Some(ap)) = (self.ivars().window.borrow().as_ref(), NSAppearance::appearanceNamed(name)) {
+            let _: () = unsafe { msg_send![&**w, setAppearance: &*ap] };
+        }
+    }
+
     /// Build the panel (if needed) and bring it to front, seeded with the current settings.
     pub fn show(&self, mtm: MainThreadMarker) {
         // Already built: just refresh values and re-show.
         if self.ivars().window.borrow().is_some() {
             self.seed_values();
+            self.sync_appearance();
             if let Some(w) = self.ivars().window.borrow().as_ref() {
                 w.center();
                 w.makeKeyAndOrderFront(None);
@@ -161,7 +332,9 @@ impl SettingsDialog {
         }
 
         let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable;
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(W, H));
+        // Provisional height; the real one depends on how much chrome the tab view adds around a
+        // PANE_H content area, which only the built tab view can answer (see below).
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(W, PANE_H + 80.0));
         let window: Retained<NSWindow> = unsafe {
             msg_send_id![
                 mtm.alloc::<NSWindow>(),
@@ -173,91 +346,262 @@ impl SettingsDialog {
         };
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(&NSString::from_str("Settings"));
-        // Dark appearance so the standard controls render to match the app's dark UI.
-        if let Some(ap) = objc2_app_kit::NSAppearance::appearanceNamed(unsafe {
-            objc2_app_kit::NSAppearanceNameDarkAqua
-        }) {
-            let _: () = unsafe { msg_send![&*window, setAppearance: &*ap] };
-        }
+        // The dialog is the window's delegate purely to catch the close (see `windowWillClose:`).
+        // The window is owned by the dialog, which the controller owns, so this is not a cycle
+        // AppKit can trip over: `setDelegate:` does not retain.
+        window.setDelegate(Some(ProtocolObject::from_ref(self)));
 
         let content = window.contentView().expect("content view");
 
-        // Row y-positions (content view is non-flipped: y grows upward).
-        let theme_y = H - 52.0;
-        let font_y = theme_y - 38.0;
-        let size_y = font_y - 38.0;
-        let side_y = size_y - 40.0;
-        let border_y = side_y - 38.0;
+        // ---- Panes: a borderless tab view driven by a segmented control ----
+        // `NSNoTabsNoBorder` drops both the tab strip and the box AppKit draws around the content;
+        // the pills below replace the strip, and the panel is left as one flat surface.
+        let tab_w = W - 2.0 * MARGIN;
+        let tabs: Retained<NSTabView> = unsafe {
+            msg_send_id![mtm.alloc::<NSTabView>(), initWithFrame: NSRect::new(
+                NSPoint::new(MARGIN, MARGIN), NSSize::new(tab_w, PANE_H))]
+        };
+        unsafe { tabs.setTabViewType(NSTabViewType::NSNoTabsNoBorder) };
+        // Even borderless the content rect is inset a little, so measure the overhead rather than
+        // hard-coding it, and grow the view until its *content* is exactly PANE_H.
+        let inner = unsafe { tabs.contentRect() };
+        let chrome_h = PANE_H - inner.size.height;
+        let chrome_w = tab_w - inner.size.width;
+        let tab_h = PANE_H + chrome_h;
+        unsafe {
+            tabs.setFrame(NSRect::new(NSPoint::new(MARGIN, MARGIN), NSSize::new(tab_w, tab_h)));
+        }
+        let pane_w = tab_w - chrome_w;
+        window.setContentSize(NSSize::new(W, tab_h + SWITCHER_H + 2.0 * MARGIN));
 
-        // ---- Theme pop-up ----
-        add_label(&content, "Theme", theme_y, mtm);
-        // The theme list is read from themes.conf, so it is owned data rather than a static table.
-        let theme_names = theme::names();
-        let theme_pop =
-            self.make_popup(theme_names.iter().map(|s| s.as_str()), theme_y - 3.0, sel!(themeChanged:), mtm);
-        unsafe { content.addSubview(&theme_pop) };
+        unsafe {
+            add_pane(&tabs, PANES[0], self.build_theme(pane_w, mtm), mtm);
+            add_pane(&tabs, PANES[1], self.build_appearance(pane_w, mtm), mtm);
+            add_pane(&tabs, PANES[2], self.build_terminal(pane_w, mtm), mtm);
+            add_pane(&tabs, PANES[3], self.build_shell(pane_w, mtm), mtm);
+            content.addSubview(&tabs);
+        }
 
-        // ---- Font family pop-up ----
-        add_label(&content, "Font", font_y, mtm);
-        let fam_pop =
-            self.make_popup(settings::FAMILIES.iter().copied(), font_y - 3.0, sel!(fontFamilyChanged:), mtm);
-        unsafe { content.addSubview(&fam_pop) };
-
-        // ---- Font size: editable field + stepper ----
-        add_label(&content, "Size", size_y, mtm);
-        let field: Retained<NSTextField> = unsafe {
-            msg_send_id![mtm.alloc::<NSTextField>(), initWithFrame: NSRect::new(
-                NSPoint::new(CTRL_X, size_y - 2.0), NSSize::new(52.0, 22.0))]
+        // The switcher, centered above the panes.
+        let seg: Retained<NSSegmentedControl> = unsafe {
+            msg_send_id![mtm.alloc::<NSSegmentedControl>(), initWithFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0), NSSize::new(SWITCHER_W, 24.0))]
         };
         unsafe {
-            field.setEditable(true);
-            field.setBezeled(true);
-            let _: () = msg_send![&field, setTarget: self];
-            field.setAction(Some(sel!(sizeEdited:)));
+            seg.setSegmentStyle(NSSegmentStyle::TexturedRounded);
+            seg.setSegmentCount(PANES.len() as isize);
+            for (i, title) in PANES.iter().enumerate() {
+                seg.setLabel_forSegment(&NSString::from_str(title), i as isize);
+                seg.setWidth_forSegment(SWITCHER_W / PANES.len() as f64, i as isize);
+            }
+            seg.setSelectedSegment(0);
+            let _: () = msg_send![&seg, setTarget: self];
+            seg.setAction(Some(sel!(panePicked:)));
+            let y = tab_h + 2.0 * MARGIN - 6.0;
+            seg.setFrame(NSRect::new(NSPoint::new((W - SWITCHER_W) / 2.0, y), NSSize::new(SWITCHER_W, 24.0)));
+            content.addSubview(&seg);
         }
-        let stepper: Retained<NSStepper> = unsafe {
-            msg_send_id![mtm.alloc::<NSStepper>(), initWithFrame: NSRect::new(
-                NSPoint::new(CTRL_X + 58.0, size_y - 3.0), NSSize::new(19.0, 25.0))]
-        };
-        unsafe {
-            stepper.setMinValue(8.0);
-            stepper.setMaxValue(40.0);
-            stepper.setIncrement(1.0);
-            stepper.setValueWraps(false);
-            let _: () = msg_send![&stepper, setTarget: self];
-            stepper.setAction(Some(sel!(sizeStepped:)));
-        }
-        unsafe { content.addSubview(&field) };
-        unsafe { content.addSubview(&stepper) };
-        *self.ivars().size_field.borrow_mut() = Some(field);
-        *self.ivars().size_stepper.borrow_mut() = Some(stepper);
-
-        // ---- Sidebar position pop-up (Left / Right) ----
-        add_label(&content, "Sidebar", side_y, mtm);
-        let side_pop = self.make_popup(["Left", "Right"].into_iter(), side_y - 3.0, sel!(sidebarChanged:), mtm);
-        unsafe { content.addSubview(&side_pop) };
-
-        // ---- Border visibility pop-up (Hidden / Shown) ----
-        add_label(&content, "Border", border_y, mtm);
-        let border_pop = self.make_popup(["Hidden", "Shown"].into_iter(), border_y - 3.0, sel!(borderChanged:), mtm);
-        unsafe { content.addSubview(&border_pop) };
+        *self.ivars().tabs.borrow_mut() = Some(tabs.clone());
 
         // No explicit Done button: the window's title-bar close button dismisses the panel.
 
-        // Remember control references we need to re-seed later.
-        *self.ivars().theme_pop.borrow_mut() = Some(theme_pop);
-        *self.ivars().fam_pop.borrow_mut() = Some(fam_pop);
-        *self.ivars().side_pop.borrow_mut() = Some(side_pop);
-        *self.ivars().border_pop.borrow_mut() = Some(border_pop);
-
         *self.ivars().window.borrow_mut() = Some(window.clone());
         self.seed_values();
+        self.sync_appearance();
 
         window.center();
         window.makeKeyAndOrderFront(None);
         let app = NSApplication::sharedApplication(mtm);
         #[allow(deprecated)]
         app.activateIgnoringOtherApps(true);
+    }
+
+    /// Appearance: theme, font family, font size, sidebar side, border.
+    fn build_appearance(&self, pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
+        let pane = new_pane(pane_w, mtm);
+        let mut rows = Rows::new(6); // font, size, sidebar, border, padding, opacity
+
+        let y = rows.next();
+        add_label(&pane, "Font", y, mtm);
+        let fam_pop = self.make_popup(settings::FAMILIES.iter().copied(), y - 3.0, sel!(fontFamilyChanged:), mtm);
+        unsafe { pane.addSubview(&fam_pop) };
+
+        // Font size: editable field + stepper.
+        let y = rows.next();
+        add_label(&pane, "Size", y, mtm);
+        let (field, stepper) =
+            self.make_number_row(&pane, y, 8.0, 40.0, sel!(sizeEdited:), sel!(sizeStepped:), mtm);
+        *self.ivars().size_field.borrow_mut() = Some(field);
+        *self.ivars().size_stepper.borrow_mut() = Some(stepper);
+
+        let y = rows.next();
+        add_label(&pane, "Sidebar", y, mtm);
+        let side_pop = self.make_popup(["Left", "Right"].into_iter(), y - 3.0, sel!(sidebarChanged:), mtm);
+        unsafe { pane.addSubview(&side_pop) };
+
+        let y = rows.next();
+        add_label(&pane, "Border", y, mtm);
+        let border_pop = self.make_popup(["Hidden", "Shown"].into_iter(), y - 3.0, sel!(borderChanged:), mtm);
+        unsafe { pane.addSubview(&border_pop) };
+
+        // Padding: the inset around the terminal text, in points.
+        let y = rows.next();
+        add_label(&pane, "Padding", y, mtm);
+        let (pad_field, pad_stepper) =
+            self.make_number_row(&pane, y, 0.0, settings::MAX_PAD, sel!(padEdited:), sel!(padStepped:), mtm);
+        *self.ivars().pad_field.borrow_mut() = Some(pad_field);
+        *self.ivars().pad_stepper.borrow_mut() = Some(pad_stepper);
+
+        // Opacity: the background alpha, in whole percent.
+        let y = rows.next();
+        add_label(&pane, "Opacity", y, mtm);
+        let labels: Vec<String> = OPACITY_PERCENTS.iter().map(|p| format!("{p}%")).collect();
+        let opacity_pop =
+            self.make_popup(labels.iter().map(|s| s.as_str()), y - 3.0, sel!(opacityChanged:), mtm);
+        unsafe { pane.addSubview(&opacity_pop) };
+        *self.ivars().opacity_pop.borrow_mut() = Some(opacity_pop);
+
+        // Remember the control references we need to re-seed later.
+        *self.ivars().fam_pop.borrow_mut() = Some(fam_pop);
+        *self.ivars().side_pop.borrow_mut() = Some(side_pop);
+        *self.ivars().border_pop.borrow_mut() = Some(border_pop);
+        pane
+    }
+
+    /// Theme: the preview grid, scrolling because `themes.conf` can hold any number of themes.
+    fn build_theme(&self, pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
+        let pane = new_pane(pane_w, mtm);
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(pane_w, PANE_H));
+        let scroll: Retained<NSScrollView> = unsafe { msg_send_id![mtm.alloc::<NSScrollView>(), initWithFrame: frame] };
+        // The grid paints every card itself, so the scroll view must not paint a slab of system
+        // background behind them — the pane's own color is what the gaps should show.
+        unsafe {
+            scroll.setDrawsBackground(false);
+            scroll.setHasVerticalScroller(true);
+        }
+        // Size the grid to the *clip* view, not to the pane: a legacy (non-overlay) scroller eats
+        // width, and a grid built at the pane's width would put its last column under it.
+        let inner_w = unsafe { scroll.contentSize() }.width;
+        let grid = ThemeGrid::new(mtm, inner_w);
+        if let Some(c) = self.controller() {
+            grid.set_controller(c as *const AppController);
+        }
+        unsafe {
+            // Follow the clip view if the scroller comes and goes (it does, with "when scrolling").
+            grid.setAutoresizingMask(NSAutoresizingMaskOptions::NSViewWidthSizable);
+            scroll.setDocumentView(Some(&grid));
+            pane.addSubview(&scroll);
+        }
+        *self.ivars().theme_grid.borrow_mut() = Some(grid);
+        pane
+    }
+
+    /// Terminal: cursor shape, scrollback depth.
+    fn build_terminal(&self, pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
+        let pane = new_pane(pane_w, mtm);
+        let mut rows = Rows::new(3); // cursor, blink, scrollback
+
+        let y = rows.next();
+        add_label(&pane, "Cursor", y, mtm);
+        let cursor_pop = self.make_popup(
+            settings::CursorShape::ALL.iter().map(|c| c.label()),
+            y - 3.0,
+            sel!(cursorChanged:),
+            mtm,
+        );
+        unsafe { pane.addSubview(&cursor_pop) };
+
+        let y = rows.next();
+        add_label(&pane, "Blink", y, mtm);
+        let blink_pop = self.make_popup(["Off", "On"].into_iter(), y - 3.0, sel!(blinkChanged:), mtm);
+        unsafe { pane.addSubview(&blink_pop) };
+        *self.ivars().blink_pop.borrow_mut() = Some(blink_pop);
+
+        let y = rows.next();
+        add_label(&pane, "Scrollback", y, mtm);
+        let items = scrollback_items(settings::scrollback());
+        let labels: Vec<String> = items.iter().map(|n| format!("{n} lines")).collect();
+        let scrollback_pop =
+            self.make_popup(labels.iter().map(|s| s.as_str()), y - 3.0, sel!(scrollbackChanged:), mtm);
+        unsafe { pane.addSubview(&scrollback_pop) };
+        *self.ivars().scrollback_items.borrow_mut() = items;
+
+        *self.ivars().cursor_pop.borrow_mut() = Some(cursor_pop);
+        *self.ivars().scrollback_pop.borrow_mut() = Some(scrollback_pop);
+        pane
+    }
+
+    /// Shell: which shell to run, and where a new tab starts.
+    fn build_shell(&self, pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
+        let pane = new_pane(pane_w, mtm);
+        let mut rows = Rows::new(2); // shell, new tab in
+
+        let y = rows.next();
+        add_label(&pane, "Shell", y, mtm);
+        let field: Retained<NSTextField> = unsafe {
+            msg_send_id![mtm.alloc::<NSTextField>(), initWithFrame: NSRect::new(
+                NSPoint::new(CTRL_X, y - 2.0), NSSize::new(CTRL_W, 22.0))]
+        };
+        unsafe {
+            field.setEditable(true);
+            field.setBezeled(true);
+            // Empty means "whatever $SHELL says", which is what the placeholder has to convey.
+            let _: () = msg_send![&field, setPlaceholderString: &*NSString::from_str("$SHELL")];
+            let _: () = msg_send![&field, setTarget: self];
+            field.setAction(Some(sel!(shellEdited:)));
+            pane.addSubview(&field);
+        }
+        commit_on_end_editing(&field);
+        *self.ivars().shell_field.borrow_mut() = Some(field);
+
+        let y = rows.next();
+        add_label(&pane, "New tab in", y, mtm);
+        let new_tab_pop = self.make_popup(
+            settings::NewTabDir::ALL.iter().map(|d| d.label()),
+            y - 3.0,
+            sel!(newTabDirChanged:),
+            mtm,
+        );
+        unsafe { pane.addSubview(&new_tab_pop) };
+        *self.ivars().new_tab_pop.borrow_mut() = Some(new_tab_pop);
+        pane
+    }
+
+    /// An editable number field plus its stepper, both wired to this dialog, added to `pane`.
+    fn make_number_row(
+        &self,
+        pane: &NSView,
+        y: f64,
+        min: f64,
+        max: f64,
+        field_action: objc2::runtime::Sel,
+        stepper_action: objc2::runtime::Sel,
+        mtm: MainThreadMarker,
+    ) -> (Retained<NSTextField>, Retained<NSStepper>) {
+        let field: Retained<NSTextField> = unsafe {
+            msg_send_id![mtm.alloc::<NSTextField>(), initWithFrame: NSRect::new(
+                NSPoint::new(CTRL_X, y - 2.0), NSSize::new(52.0, 22.0))]
+        };
+        let stepper: Retained<NSStepper> = unsafe {
+            msg_send_id![mtm.alloc::<NSStepper>(), initWithFrame: NSRect::new(
+                NSPoint::new(CTRL_X + 58.0, y - 3.0), NSSize::new(19.0, 25.0))]
+        };
+        unsafe {
+            field.setEditable(true);
+            field.setBezeled(true);
+            let _: () = msg_send![&field, setTarget: self];
+            field.setAction(Some(field_action));
+            stepper.setMinValue(min);
+            stepper.setMaxValue(max);
+            stepper.setIncrement(1.0);
+            stepper.setValueWraps(false);
+            let _: () = msg_send![&stepper, setTarget: self];
+            stepper.setAction(Some(stepper_action));
+            pane.addSubview(&field);
+            pane.addSubview(&stepper);
+        }
+        commit_on_end_editing(&field);
+        (field, stepper)
     }
 
     /// Build a pop-up button filled with `titles`, wired to `action`, positioned at `y`.
@@ -281,6 +625,35 @@ impl SettingsDialog {
         pop
     }
 
+    /// Apply whatever is currently typed in the text fields, skipping values that already match —
+    /// the size and padding setters reflow every grid and re-send `TIOCSWINSZ`, which is not
+    /// something to do on every close for no change.
+    fn commit_fields(&self) {
+        let store = self.ivars();
+        let ctrl = match self.controller() {
+            Some(c) => c,
+            None => return,
+        };
+        if let Some(f) = store.size_field.borrow().as_ref() {
+            let v = unsafe { f.doubleValue() }.clamp(8.0, 40.0);
+            if v != settings::size() {
+                ctrl.set_font_size(v);
+            }
+        }
+        if let Some(f) = store.pad_field.borrow().as_ref() {
+            let v = unsafe { f.doubleValue() }.clamp(0.0, settings::MAX_PAD);
+            if v != settings::pad() {
+                ctrl.set_padding(v);
+            }
+        }
+        if let Some(f) = store.shell_field.borrow().as_ref() {
+            let path = unsafe { f.stringValue() }.to_string();
+            if path.trim() != settings::shell() {
+                ctrl.set_shell(&path);
+            }
+        }
+    }
+
     /// Re-read the current settings into the controls.
     fn seed_values(&self) {
         let ctrl = match self.controller() {
@@ -288,8 +661,8 @@ impl SettingsDialog {
             None => return,
         };
         let store = self.ivars();
-        if let Some(pop) = store.theme_pop.borrow().as_ref() {
-            unsafe { pop.selectItemAtIndex(ctrl.snapshot().style as isize) };
+        if let Some(g) = store.theme_grid.borrow().as_ref() {
+            g.set_selected(ctrl.snapshot().style);
         }
         if let Some(pop) = store.fam_pop.borrow().as_ref() {
             let cur = settings::family();
@@ -310,17 +683,89 @@ impl SettingsDialog {
         if let Some(p) = store.border_pop.borrow().as_ref() {
             unsafe { p.selectItemAtIndex(if settings::show_border() { 1 } else { 0 }) };
         }
+        let pad = settings::pad();
+        if let Some(f) = store.pad_field.borrow().as_ref() {
+            unsafe { f.setStringValue(&NSString::from_str(&format!("{}", pad as i64))) };
+        }
+        if let Some(s) = store.pad_stepper.borrow().as_ref() {
+            unsafe { s.setDoubleValue(pad) };
+        }
+        if let Some(p) = store.cursor_pop.borrow().as_ref() {
+            unsafe { p.selectItemAtIndex(settings::cursor_shape().index() as isize) };
+        }
+        if let Some(p) = store.scrollback_pop.borrow().as_ref() {
+            // The list was built to contain the current value, so a miss can only mean the setting
+            // changed behind the dialog's back; leaving the selection alone is the honest response.
+            if let Some(i) = store.scrollback_items.borrow().iter().position(|n| *n == settings::scrollback()) {
+                unsafe { p.selectItemAtIndex(i as isize) };
+            }
+        }
+        if let Some(f) = store.shell_field.borrow().as_ref() {
+            unsafe { f.setStringValue(&NSString::from_str(&settings::shell())) };
+        }
+        if let Some(p) = store.new_tab_pop.borrow().as_ref() {
+            unsafe { p.selectItemAtIndex(settings::new_tab_dir().index() as isize) };
+        }
+        if let Some(p) = store.blink_pop.borrow().as_ref() {
+            unsafe { p.selectItemAtIndex(if settings::cursor_blink() { 1 } else { 0 }) };
+        }
+        if let Some(p) = store.opacity_pop.borrow().as_ref() {
+            // Percentages are what the pop-up offers, so round to the nearest one rather than
+            // requiring an exact float match on a value that came back through a config file.
+            let pct = (settings::opacity() * 100.0).round() as u32;
+            if let Some(i) = OPACITY_PERCENTS.iter().position(|p| *p == pct) {
+                unsafe { p.selectItemAtIndex(i as isize) };
+            }
+        }
     }
 }
 
-/// A non-editable, borderless label added to `content` at `y`.
-fn add_label(content: &NSView, text: &str, y: f64, mtm: MainThreadMarker) {
+/// The scrollback pop-up's values: the presets, plus `current` if a hand-edited config put it
+/// somewhere between them (so the pop-up can show what is actually in force).
+fn scrollback_items(current: usize) -> Vec<usize> {
+    let mut items = SCROLLBACK_PRESETS.to_vec();
+    if !items.contains(&current) {
+        items.push(current);
+        items.sort_unstable();
+    }
+    items
+}
+
+/// Make an editable field commit when editing *ends*, not only on Return.
+///
+/// Without this a field's action fires on Return alone, so typing a value and then closing the
+/// panel — or just clicking another control — silently throws it away, while every pop-up next to
+/// it applies instantly. Closing the window ends editing (`NSWindow` calls `endEditingFor:`), so
+/// this is what makes the obvious gesture work. The flag lives on the cell, not the field.
+fn commit_on_end_editing(field: &NSTextField) {
+    unsafe {
+        let cell: Retained<AnyObject> = msg_send_id![field, cell];
+        let _: () = msg_send![&cell, setSendsActionOnEndEditing: true];
+    }
+}
+
+/// An empty pane view, sized to the tab view's content area.
+fn new_pane(pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
+    unsafe {
+        msg_send_id![mtm.alloc::<NSView>(), initWithFrame: NSRect::new(
+            NSPoint::new(0.0, 0.0), NSSize::new(pane_w, PANE_H))]
+    }
+}
+
+/// Append one titled tab holding `pane`.
+unsafe fn add_pane(tabs: &NSTabView, title: &str, pane: Retained<NSView>, mtm: MainThreadMarker) {
+    let item: Retained<NSTabViewItem> = msg_send_id![mtm.alloc::<NSTabViewItem>(), initWithIdentifier: std::ptr::null::<objc2::runtime::AnyObject>()];
+    item.setLabel(&NSString::from_str(title));
+    item.setView(Some(&pane));
+    tabs.addTabViewItem(&item);
+}
+
+/// A non-editable, borderless label added to `pane` at `y`.
+fn add_label(pane: &NSView, text: &str, y: f64, mtm: MainThreadMarker) {
     let label = unsafe { NSTextField::labelWithString(&NSString::from_str(text), mtm) };
     unsafe {
-        label.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
-            0.72, 0.72, 0.76, 1.0,
-        )));
-        label.setFrame(NSRect::new(NSPoint::new(LABEL_X, y - 1.0), NSSize::new(64.0, 18.0)));
-        content.addSubview(&label);
+        label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        label.setFrame(NSRect::new(NSPoint::new(LABEL_X, y - 1.0), NSSize::new(LABEL_W, 18.0)));
+        pane.addSubview(&label);
     }
 }

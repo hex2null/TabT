@@ -31,11 +31,15 @@ use crate::settings_dialog::SettingsDialog;
 use crate::sidebar::{SidebarView, MAX_SIDEBAR_W, MIN_SIDEBAR_W, SIDEBAR_W};
 use crate::theme;
 use crate::toggle::{ToggleButton, TOGGLE_W};
-use crate::view::{self, ns_color, TermView};
+use crate::view::{self, TermView};
 
 /// Duration of the sidebar collapse/expand slide. Matches the pace of the system's own sidebar
 /// animations — long enough to read as motion, short enough not to sit in the way.
 const SIDEBAR_ANIM: f64 = 0.22;
+
+/// Half-period of the cursor blink, in milliseconds: the phase flips on every tick, so the cursor
+/// completes a cycle in twice this. Matches the pace of the system's own text carets.
+const BLINK_MS: u64 = 530;
 
 struct Tab {
     id: u64,
@@ -99,6 +103,7 @@ pub struct AppController {
     light_x0: Cell<Option<[f64; 3]>>,
     animating: Cell<bool>, // a collapse/expand is in flight: frame changes animate instead of snapping
     settings_dialog: RefCell<Option<Retained<SettingsDialog>>>, // lazily built settings panel
+    blink_timer: RefCell<Option<view::TimerToken>>, // running only while the cursor blinks
     mtm: MainThreadMarker,
 }
 
@@ -153,6 +158,7 @@ impl AppController {
             light_x0: Cell::new(None),
             animating: Cell::new(false),
             settings_dialog: RefCell::new(None),
+            blink_timer: RefCell::new(None),
             mtm,
         });
         // The sidebar / toggle button / divider get the controller's raw pointer (the controller lives in an Rc, so its address is stable).
@@ -298,7 +304,10 @@ impl AppController {
     /// (Same reason the header/placeholder track the theme, and the settings dialog pins its own.)
     fn sync_window_chrome(&self) {
         let t = theme::current();
-        self.window.setBackgroundColor(Some(&ns_color(t.bg)));
+        // Translucency is per-fill: the window's own color carries the alpha and `setOpaque:` has
+        // to agree with it, but nothing here touches `setAlphaValue`, which would fade the text too.
+        self.window.setBackgroundColor(Some(&view::ns_color_bg(t.bg)));
+        self.window.setOpaque(settings::opacity() >= 1.0);
         let name = unsafe {
             if t.is_dark() { NSAppearanceNameDarkAqua } else { NSAppearanceNameAqua }
         };
@@ -308,6 +317,11 @@ impl AppController {
         // The card's fill/border/shadow live on a layer, so they hold concrete colors and have to
         // be repainted here rather than re-read during a `drawRect:`.
         card::apply_theme(&self.card);
+        // The settings panel pins its own appearance to the theme as well, and it is very likely
+        // to be open right now — the theme pop-up lives in it.
+        if let Some(d) = self.settings_dialog.borrow().as_ref() {
+            d.sync_appearance();
+        }
     }
 
     /// Set `view`'s frame — animated while a sidebar collapse/expand is in flight, instant
@@ -447,21 +461,32 @@ impl AppController {
     /// Load the layout from ~/.tabt and spawn a new shell for each tab.
     pub fn bootstrap(&self) {
         let layout = config::load();
+        let cfg = &layout.settings;
         // Apply the color theme + font (both must be set before spawning tabs and computing cols/rows).
-        let idx = theme::index_of(&layout.style);
+        let idx = theme::index_of(&cfg.style);
         self.style.set(idx);
         theme::set(theme::by_index(idx));
         self.sync_window_chrome();
-        settings::set(&layout.font_family, layout.font_size);
+        settings::set(&cfg.font_family, cfg.font_size);
         // The sidebar width/position must be set before spawning tabs and computing host dimensions.
-        self.sidebar_w.set(layout.sidebar_w.clamp(MIN_SIDEBAR_W, MAX_SIDEBAR_W));
-        self.sidebar_right.set(layout.sidebar_right);
-        settings::set_show_border(layout.show_border);
+        self.sidebar_w.set(cfg.sidebar_w.clamp(MIN_SIDEBAR_W, MAX_SIDEBAR_W));
+        self.sidebar_right.set(cfg.sidebar_right);
+        settings::set_show_border(cfg.show_border);
+        // Terminal/shell preferences: padding feeds `dims()` below, and scrollback/shell are read
+        // by each `spawn_tab`, so all of it has to be in place before the tabs are restored.
+        settings::set_cursor_shape(cfg.cursor_shape);
+        settings::set_cursor_blink(cfg.cursor_blink);
+        settings::set_scrollback(cfg.scrollback);
+        settings::set_shell(&cfg.shell);
+        settings::set_new_tab_dir(cfg.new_tab_dir);
+        settings::set_pad(cfg.padding);
+        settings::set_opacity(cfg.opacity);
+        self.sync_blink_timer();
         // Restore the saved window size (clamped to a sane range) before laying out / spawning
         // tabs. The upper bound guards against a corrupted config producing an unusable
         // off-screen window; it's a generous cap, not a real display-size limit.
-        if layout.window_w > 0.0 && layout.window_h > 0.0 {
-            let sz = NSSize::new(layout.window_w.clamp(480.0, 6000.0), layout.window_h.clamp(320.0, 4000.0));
+        if cfg.window_w > 0.0 && cfg.window_h > 0.0 {
+            let sz = NSSize::new(cfg.window_w.clamp(480.0, 6000.0), cfg.window_h.clamp(320.0, 4000.0));
             self.window.setContentSize(sz);
             self.window.center();
         }
@@ -508,8 +533,8 @@ impl AppController {
     /// instead of a view resize) would set a row count that doesn't fit the visible area.
     fn dims(&self) -> (usize, usize) {
         let b = self.host.bounds();
-        let w = b.size.width - 2.0 * view::PAD;
-        let h = b.size.height - HEADER_H - 2.0 * view::PAD;
+        let w = b.size.width - 2.0 * settings::pad();
+        let h = b.size.height - HEADER_H - 2.0 * settings::pad();
         let cols = ((w / settings::cell_w()).floor() as i64).max(1) as usize;
         let rows = ((h / settings::line_h()).floor() as i64).max(1) as usize;
         (cols, rows)
@@ -530,6 +555,7 @@ impl AppController {
         let (fd, shell_pid) = pty::spawn(cols as u16, rows as u16, cwd)?;
         let frame = self.host.bounds();
         let v = TermView::new(self.mtm, frame, fd, cols, rows);
+        v.set_scrollback(settings::scrollback());
         v.attach(self as *const AppController as *const c_void, id, end_cb, restart_cb, toggle_cb);
         let reader = view::attach_reader(&v);
 
@@ -660,7 +686,7 @@ impl AppController {
         };
         let n = self.model.borrow().next_id;
         let (group, cwd) = match &anchor {
-            Some((_, g, cwd)) => (*g, cwd.clone()),
+            Some((_, g, cwd)) => (*g, self.new_tab_cwd(cwd.clone())),
             None => (None, String::new()),
         };
         match self.spawn_tab(group, format!("Terminal {}", n), &cwd, 0, false) {
@@ -694,6 +720,7 @@ impl AppController {
                 })
                 .unwrap_or_default()
         };
+        let cwd = self.new_tab_cwd(cwd);
         let n = self.model.borrow().next_id;
         match self.spawn_tab(Some(gi), format!("Terminal {}", n), &cwd, 0, false) {
             Some(id) => {
@@ -730,9 +757,17 @@ impl AppController {
         let alert = unsafe { NSAlert::new(self.mtm) };
         unsafe {
             alert.setMessageText(&NSString::from_str("Couldn’t open a new terminal"));
-            alert.setInformativeText(&NSString::from_str(
-                "The system refused to create a new session (it may be low on resources). Your other tabs are unaffected.",
-            ));
+            // Two causes now: the configured shell (much the likelier one, and the user's to fix)
+            // and the system refusing a new PTY. Name the shell when there is one to name.
+            let shell = settings::shell();
+            let text = if shell.is_empty() {
+                "The system refused to create a new session (it may be low on resources). Your other tabs are unaffected.".to_string()
+            } else {
+                format!(
+                    "“{shell}” could not be run — check Settings → Shell. Your other tabs are unaffected."
+                )
+            };
+            alert.setInformativeText(&NSString::from_str(&text));
             alert.addButtonWithTitle(&NSString::from_str("OK"));
             alert.runModal();
         }
@@ -1117,6 +1152,113 @@ impl AppController {
         self.save();
     }
 
+    /// Settings → Terminal → Cursor: block, bar or underline. Only the drawing changes, so a
+    /// redraw of the active tab is the whole of it.
+    pub fn set_cursor_shape(&self, idx: usize) {
+        settings::set_cursor_shape(settings::CursorShape::from_index(idx));
+        self.redraw_active();
+        self.save();
+    }
+
+    /// Settings → Terminal → Blink: start or stop the blink timer.
+    pub fn set_cursor_blink(&self, on: bool) {
+        settings::set_cursor_blink(on);
+        self.sync_blink_timer();
+        self.redraw_active();
+        self.save();
+    }
+
+    /// Create the blink timer when blinking is on and it isn't running, cancel it when it is off.
+    ///
+    /// One timer for the whole app, owned here rather than per tab: only the active view is
+    /// mounted, so that is the only one whose cursor is on screen, and a per-tab timer would have
+    /// to be torn down on every close. The token lives as long as the controller, which outlives
+    /// the run loop, so there is no teardown path that can leave it firing on freed state.
+    fn sync_blink_timer(&self) {
+        let running = self.blink_timer.borrow().is_some();
+        match (settings::cursor_blink(), running) {
+            (true, false) => {
+                extern "C" fn tick(ctx: *mut c_void) {
+                    let c: &AppController = unsafe { &*(ctx as *const AppController) };
+                    settings::toggle_cursor_phase();
+                    c.redraw_active();
+                }
+                let ctx = self as *const AppController as *mut c_void;
+                *self.blink_timer.borrow_mut() = Some(view::attach_timer(BLINK_MS, ctx, tick));
+            }
+            (false, true) => {
+                if let Some(t) = self.blink_timer.borrow_mut().take() {
+                    view::cancel_timer(&t);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Settings → Appearance → Opacity: the background alpha. Every surface that paints the theme
+    /// background has to be repainted, and the window itself stops being opaque.
+    pub fn set_opacity(&self, v: f64) {
+        settings::set_opacity(v);
+        self.sync_window_chrome(); // window color + `setOpaque:` + the card's layer colors
+        self.redraw_active();
+        unsafe { self.header.setNeedsDisplay(true) };
+        unsafe { self.placeholder.setNeedsDisplay(true) };
+        self.refresh_sidebar();
+        self.save();
+    }
+
+    /// Settings → Terminal → Scrollback: apply the new depth to every open tab, not just new ones.
+    /// Lowering it drops history immediately (`Grid::set_history_max`), which can move a
+    /// scrolled-back viewport, so the tabs are redrawn.
+    pub fn set_scrollback(&self, lines: usize) {
+        settings::set_scrollback(lines);
+        let m = self.model.borrow();
+        for tab in &m.tabs {
+            tab.view.set_scrollback(lines);
+            unsafe { tab.view.setNeedsDisplay(true) };
+        }
+        drop(m);
+        self.save();
+    }
+
+    /// Settings → Shell → Shell: the program each *new* tab execs. Running shells are left alone —
+    /// killing someone's session to apply a preference would be worse than the inconsistency.
+    pub fn set_shell(&self, path: &str) {
+        settings::set_shell(path);
+        self.save();
+    }
+
+    /// Settings → Shell → New tab in: home, or the active tab's directory.
+    pub fn set_new_tab_dir(&self, idx: usize) {
+        settings::set_new_tab_dir(settings::NewTabDir::from_index(idx));
+        self.save();
+    }
+
+    /// Settings → Appearance → Padding: the inset around the terminal text. It changes how many
+    /// cells fit, so every grid reflows and every shell gets a new window size.
+    pub fn set_padding(&self, v: f64) {
+        settings::set_pad(v);
+        self.reflow_all();
+        self.save();
+    }
+
+    /// Redraw the active tab (the only one mounted; the rest repaint when switched to).
+    fn redraw_active(&self) {
+        let m = self.model.borrow();
+        if let Some(tab) = m.active.and_then(|a| m.tabs.iter().find(|t| t.id == a)) {
+            unsafe { tab.view.setNeedsDisplay(true) };
+        }
+    }
+
+    /// Where a new tab should start: the active tab's directory, or empty for "let the shell pick"
+    /// (which `pty::spawn` turns into `$HOME`). See Settings → Shell → New tab in.
+    fn new_tab_cwd(&self, inherited: String) -> String {
+        match settings::new_tab_dir() {
+            settings::NewTabDir::Active => inherited,
+            settings::NewTabDir::Home => String::new(),
+        }
+    }
+
     /// Toggle whether the sidebar/header separator borders are drawn (Settings → Border).
     pub fn set_show_border(&self, on: bool) {
         settings::set_show_border(on);
@@ -1191,6 +1333,15 @@ impl AppController {
             self.toggle_sidebar();
         }
         self.sidebar.open_context_menu();
+    }
+
+    /// ⌘R: rename the active session in place (expand the sidebar first if collapsed — the edit
+    /// box lives in the row, and there is nothing to type into while the sidebar is off screen).
+    pub fn rename_active_tab(&self) {
+        if self.collapsed.get() {
+            self.toggle_sidebar();
+        }
+        self.sidebar.begin_rename_active();
     }
 
     /// ⌘,: open the settings dialog (built lazily, then reused).
@@ -1287,8 +1438,8 @@ impl AppController {
                 (t.title.clone(), cwd, t.dot, t.locked)
             })
         };
-        let ungrouped: Vec<(String, String, u8, bool)> = m.ungrouped.iter().filter_map(tab_state).collect();
-        let groups: Vec<(String, bool, Vec<(String, String, u8, bool)>)> = m
+        let ungrouped: Vec<config::SavedTab> = m.ungrouped.iter().filter_map(tab_state).collect();
+        let groups: Vec<config::SavedGroup> = m
             .groups
             .iter()
             .map(|g| {
@@ -1297,15 +1448,25 @@ impl AppController {
             })
             .collect();
         drop(m);
+        let (window_w, window_h) = self.window_size();
         config::save(
-            &theme::name_of(self.style.get()),
-            &settings::family(),
-            settings::size(),
-            self.sidebar_w.get(),
-            self.sidebar_right.get(),
-            settings::show_border(),
-            self.window_size().0,
-            self.window_size().1,
+            &config::Settings {
+                style: theme::name_of(self.style.get()),
+                font_family: settings::family(),
+                font_size: settings::size(),
+                sidebar_w: self.sidebar_w.get(),
+                sidebar_right: self.sidebar_right.get(),
+                show_border: settings::show_border(),
+                window_w,
+                window_h,
+                cursor_shape: settings::cursor_shape(),
+                cursor_blink: settings::cursor_blink(),
+                scrollback: settings::scrollback(),
+                shell: settings::shell(),
+                new_tab_dir: settings::new_tab_dir(),
+                padding: settings::pad(),
+                opacity: settings::opacity(),
+            },
             &ungrouped,
             &groups,
         );

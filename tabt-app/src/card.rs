@@ -25,7 +25,7 @@ use objc2_app_kit::{NSAutoresizingMaskOptions, NSColor, NSView};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
 
 use crate::theme;
-use crate::view::ns_color;
+use crate::view::{ns_color, ns_color_bg};
 
 // Spacing sits on AppKit's usual 4/8/12 scale: an 8pt gutter all round, and the same 8pt between
 // the card and the terminal, so the card reads as floating without opening a wide moat.
@@ -87,7 +87,7 @@ pub fn apply_theme(card: &NSView) {
         // Unmasked on purpose: the clip that keeps the sidebar's drawing inside the corners is on
         // the content layer (see `new`), because masking here would cut the shadow off.
         let _: () = msg_send![layer, setMasksToBounds: false];
-        let _: () = msg_send![layer, setBackgroundColor: cg(&ns_color(t.card_bg()))];
+        let _: () = msg_send![layer, setBackgroundColor: cg(&ns_color_bg(t.card_bg()))];
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
         let _: () = msg_send![layer, setBorderColor: cg(&ns_color(t.card_border()))];
         // Weak and tight, offset a hair downward: enough to lift the card, not enough to darken the

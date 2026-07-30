@@ -25,7 +25,7 @@ use crate::card::CARD_INSET;
 use crate::header::HEADER_H;
 use crate::settings;
 use crate::theme;
-use crate::view::{draw_symbol, draw_truncated, make_attrs, ns_color, rect};
+use crate::view::{draw_symbol, draw_truncated, make_attrs, ns_color, rect, round_fill, round_stroke};
 
 /// Default sidebar width; `MIN_SIDEBAR_W`..`MAX_SIDEBAR_W` bound the divider drag. These mirror the
 /// system sidebar metrics a `NavigationSplitView` asks for (`columnWidth(min: 200, ideal: 240)`).
@@ -954,10 +954,36 @@ impl SidebarView {
         {
             return;
         }
-        let active = match snap.active {
-            Some(a) => a,
-            None => return,
-        };
+        match self.reveal_active_row() {
+            Some((active, top)) => {
+                self.ivars().cur_x.set(PAD + 30.0);
+                self.ivars().cur_y.set(top + ROW_H);
+                self.open_tab_menu(active);
+            }
+            None => {}
+        }
+    }
+
+    /// ⌘R: rename the active session in place. Unlike ⌃↩ this ignores the pointer — a rename is a
+    /// deliberate edit of one thing, and having it land on whatever the mouse happens to rest over
+    /// would be a nasty surprise.
+    pub fn begin_rename_active(&self) {
+        if let Some((active, _)) = self.reveal_active_row() {
+            self.start_edit(Editing::Tab(active));
+        }
+    }
+
+    /// Bring the active tab's row on screen — expanding a collapsed group, scrolling the list, and
+    /// flushing the redraw — and return its id with its top in view coordinates.
+    ///
+    /// Shared by ⌃↩ and ⌘R because both anchor UI to that row (a menu, an edit box) and both would
+    /// otherwise anchor to a clipped coordinate. The redraw is flushed rather than merely
+    /// invalidated: `popUpMenuPositioning…` runs its own modal loop, so an invalidated view would
+    /// still show the pre-scroll rows underneath the menu.
+    fn reveal_active_row(&self) -> Option<(u64, f64)> {
+        let ctrl = self.controller()?;
+        let snap = ctrl.snapshot();
+        let active = snap.active?;
         let query = self.ivars().query.borrow().clone();
         // Outside search, a collapsed group hides its tabs entirely: expand it so the active row exists.
         if query.is_empty() {
@@ -971,11 +997,8 @@ impl SidebarView {
         }
         let snap = ctrl.snapshot();
         let rows = Self::build_rows(&snap, &query, 0.0);
-        let top = match rows.iter().find(|r| matches!(r.kind, Press::Tab(id, _) if id == active)) {
-            Some(r) => r.top,
-            None => return, // filtered out by the search query
-        };
-        // Scroll the row into the visible band, then anchor the menu to its bottom-left.
+        // None = filtered out by the search query.
+        let top = rows.iter().find(|r| matches!(r.kind, Press::Tab(id, _) if id == active))?.top;
         let h = self.bounds().size.height;
         let (list_top, footer_top) = (Self::list_top(), h - Self::footer_height());
         let mut s = self.scroll();
@@ -987,15 +1010,11 @@ impl SidebarView {
         }
         let s = s.clamp(0.0, Self::max_scroll_of(&rows, h));
         self.ivars().scroll.set(s);
-        // Flush the scroll before popping the menu: popUpMenuPositioning… runs its own modal loop,
-        // so a merely-invalidated view would still show the pre-scroll rows underneath it.
         unsafe {
             self.setNeedsDisplay(true);
             self.displayIfNeeded();
         }
-        self.ivars().cur_x.set(PAD + 30.0);
-        self.ivars().cur_y.set(top - s + ROW_H);
-        self.open_tab_menu(active);
+        Some((active, top - s))
     }
 
     /// Scroll the list to the bottom (called after creating a group, so the new group at the end is visible).
@@ -1804,22 +1823,3 @@ fn rgba(r: f64, g: f64, b: f64, a: f64) -> Retained<NSColor> {
 
 // ---- Accent color: amber #f0b15a, used only for the search/rename focus rings ----
 const ACCENT_ICON: (f64, f64, f64) = (240.0 / 255.0, 177.0 / 255.0, 90.0 / 255.0);
-
-/// Fill a rounded rectangle.
-fn round_fill(r: NSRect, radius: f64, color: &NSColor) {
-    unsafe {
-        color.set();
-        let p = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r, radius, radius);
-        p.fill();
-    }
-}
-
-/// Stroke a rounded rectangle.
-fn round_stroke(r: NSRect, radius: f64, width: f64, color: &NSColor) {
-    unsafe {
-        color.set();
-        let p = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r, radius, radius);
-        p.setLineWidth(width);
-        p.stroke();
-    }
-}

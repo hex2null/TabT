@@ -14,7 +14,7 @@ use objc2_app_kit::{NSEvent, NSFont, NSRectFill, NSStringDrawing, NSView};
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSString};
 
 use crate::theme;
-use crate::view::{make_attrs, ns_color, rect};
+use crate::view::{make_attrs, ns_color, ns_color_bg, rect};
 
 pub const HEADER_H: f64 = 44.0; // toolbar band height; the top strip (traffic lights, collapse
                                 // toggle, title) is centered in the part of it the card covers,
@@ -122,7 +122,7 @@ impl HeaderView {
         let t = theme::current();
         unsafe {
             // Background matches the terminal exactly (theme bg); an optional 1px bottom border (Settings → Border).
-            ns_color(t.bg).set();
+            ns_color_bg(t.bg).set();
             NSRectFill(b);
             if crate::settings::show_border() {
                 ns_color(t.border()).set();

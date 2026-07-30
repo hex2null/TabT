@@ -70,6 +70,10 @@ declare_class!(
         fn toggle_sidebar(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.toggle_sidebar());
         }
+        #[method(renameSession:)]
+        fn rename_session(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.rename_active_tab());
+        }
         #[method(revealInFinder:)]
         fn reveal_in_finder(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.reveal_in_finder());
@@ -240,6 +244,7 @@ pub fn build_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarge
     add(mtm, &shell, "New Terminal", Some(sel!(newTerminal:)), Some(target), "t", false);
     add(mtm, &shell, "New Group", Some(sel!(newGroup:)), Some(target), "n", true);
     shell.addItem(&NSMenuItem::separatorItem(mtm));
+    add(mtm, &shell, "Rename Session", Some(sel!(renameSession:)), Some(target), "r", false);
     add(mtm, &shell, "Reveal in Finder", Some(sel!(revealInFinder:)), Some(target), "r", true);
     shell.addItem(&NSMenuItem::separatorItem(mtm));
     add(mtm, &shell, "Close Tab", Some(sel!(closeTab:)), Some(target), "w", false);

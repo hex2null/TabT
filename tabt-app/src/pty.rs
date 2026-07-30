@@ -2,7 +2,7 @@
 //!
 //! Brings over the openpty / fork / exec details verified one by one in step 1's `pty-echo`,
 //! but no longer takes over stdin — the GUI process has no controlling terminal of its own. This only
-//! spawns a PTY running a login zsh and returns the master-side fd for the GUI to read/write. SIGWINCH/window-size following
+//! spawns a PTY running a login shell and returns the master-side fd for the GUI to read/write. SIGWINCH/window-size following
 //! is left to a later milestone (the window size is fixed for now, cols/rows computed once).
 
 use std::ffi::CString;
@@ -11,15 +11,53 @@ use std::process::exit;
 use std::ptr;
 use std::sync::Once;
 
-/// Spawns a PTY running a login zsh and returns the master fd (already set to non-blocking) plus
+/// Spawns a PTY running a login shell and returns the master fd (already set to non-blocking) plus
 /// the shell's pid, or `None` if the PTY/process itself could not be created (`openpty`/`fork`
-/// failed — e.g. the process is out of file descriptors). A `None` here means only this one new
-/// tab fails to open; it must never bring down the rest of the app (existing tabs keep running).
+/// failed — e.g. the process is out of file descriptors — or the configured shell is not an
+/// executable). A `None` here means only this one new tab fails to open; it must never bring down
+/// the rest of the app (existing tabs keep running).
 /// The pid is the shell's own pid *and* its process group id (it calls `setsid()`), letting the
 /// caller compare against `tcgetpgrp` to detect a foreground job (see `has_foreground_job`).
 pub fn spawn(cols: u16, rows: u16, cwd: &str) -> Option<(RawFd, libc::pid_t)> {
     install_reaper();
-    unsafe { spawn_inner(cols, rows, cwd) }
+    let shell = resolve_shell()?;
+    unsafe { spawn_inner(cols, rows, cwd, &shell) }
+}
+
+/// Fallback shell, used when nothing is configured and `$SHELL` is unset. Every macOS install has
+/// it, and it is what the app shipped with before the setting existed.
+const DEFAULT_SHELL: &str = "/bin/zsh";
+
+/// The shell to exec: the Settings → Shell value, else `$SHELL`, else [`DEFAULT_SHELL`].
+///
+/// A *configured* shell that is not executable is an error the user can see and fix, so it fails
+/// the tab (and raises the caller's alert) instead of quietly falling back to zsh — a silent
+/// fallback would look like the setting was ignored. An unusable `$SHELL`, which the user did not
+/// choose here, does fall back.
+fn resolve_shell() -> Option<String> {
+    let configured = crate::settings::shell();
+    if !configured.is_empty() {
+        return executable(&configured).then_some(configured);
+    }
+    match std::env::var("SHELL") {
+        Ok(s) if !s.is_empty() && executable(&s) => Some(s),
+        _ => Some(DEFAULT_SHELL.to_string()),
+    }
+}
+
+/// Whether `path` exists and is executable by this process.
+fn executable(path: &str) -> bool {
+    match CString::new(path) {
+        Ok(c) => unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 },
+        Err(_) => false, // an interior NUL: not a path we can exec
+    }
+}
+
+/// argv[0] for a login shell: the shell's own basename with a `-` prefix, which is how a shell is
+/// told it is a login shell (`-zsh` loads ~/.zprofile, `-bash` loads ~/.bash_profile).
+fn login_argv0(shell: &str) -> String {
+    let base = shell.rsplit('/').next().unwrap_or(shell);
+    format!("-{base}")
 }
 
 /// Install a SIGCHLD handler (once) that reaps any exited child shell. Without this, closing a
@@ -45,7 +83,7 @@ extern "C" fn reap_children(_sig: i32) {
     }
 }
 
-unsafe fn spawn_inner(cols: u16, rows: u16, cwd: &str) -> Option<(RawFd, libc::pid_t)> {
+unsafe fn spawn_inner(cols: u16, rows: u16, cwd: &str, shell: &str) -> Option<(RawFd, libc::pid_t)> {
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
 
     let (mut master, mut slave): (RawFd, RawFd) = (0, 0);
@@ -67,6 +105,15 @@ unsafe fn spawn_inner(cols: u16, rows: u16, cwd: &str) -> Option<(RawFd, libc::p
     // prefer the restored cwd, fall back to HOME.
     let home = std::env::var("HOME").ok().and_then(|h| CString::new(h).ok());
     let start = if cwd.is_empty() { None } else { CString::new(cwd).ok() };
+    // The shell path and argv[0] too: `resolve_shell` already proved the path execs, and building
+    // the CStrings here keeps the child free of allocation after the fork.
+    let (path, argv0) = match (CString::new(shell), CString::new(login_argv0(shell))) {
+        (Ok(p), Ok(a)) => (p, a),
+        _ => {
+            warn("shell path");
+            return None;
+        }
+    };
 
     match libc::fork() {
         -1 => {
@@ -102,12 +149,10 @@ unsafe fn spawn_inner(cols: u16, rows: u16, cwd: &str) -> Option<(RawFd, libc::p
                 }
             }
             // TERM is set by the parent before starting AppKit (see main); the child inherits it directly.
-            // argv[0] with a "-" prefix → zsh starts as a login shell, loading ~/.zprofile.
-            let path = CString::new("/bin/zsh").unwrap();
-            let argv0 = CString::new("-zsh").unwrap();
+            // argv[0] carries the "-" prefix, so the shell starts as a login shell (see login_argv0).
             let argv = [argv0.as_ptr(), ptr::null()];
             libc::execv(path.as_ptr(), argv.as_ptr());
-            die("execv(/bin/zsh)");
+            die("execv(shell)");
         }
         child_pid => {
             // ---- Parent process (GUI): keep master, hand slave to the child ----
