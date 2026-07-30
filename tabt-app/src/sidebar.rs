@@ -20,7 +20,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
-use crate::app::{AppController, Snapshot, TabSnap};
+use crate::app::{AppController, SessionState, Snapshot, TabSnap};
 use crate::card::CARD_INSET;
 use crate::config;
 use crate::header::HEADER_H;
@@ -58,7 +58,10 @@ const UNGROUPED: usize = usize::MAX - 1;
 /// How many ⌘Z steps the search/rename boxes keep (they hold one short line, so this is plenty).
 const UNDO_DEPTH: usize = 64;
 
+/// Hue of a default-colored dot, by state: green while a job is running, neutral otherwise. A tab
+/// with an explicit color of its own keeps that instead — only the *form* then tracks the state.
 const DOT_RUNNING: (f64, f64, f64) = (52.0 / 255.0, 199.0 / 255.0, 89.0 / 255.0); // #34c759
+const DOT_IDLE: (f64, f64, f64) = (0.37, 0.37, 0.40);
 
 // ---- Text hierarchy: derived from the active theme so it stays legible on light and dark themes.
 // The primary color is the theme foreground; weaker tiers blend it toward the background.
@@ -139,6 +142,7 @@ struct Row {
     collapsed: bool, // only meaningful for group rows: collapsed state
     group: usize,    // the group this row belongs to (usize::MAX for button rows)
     dot: u8,         // tab rows: status-dot color index (0 = default/auto)
+    state: SessionState, // tab rows: what the session is doing (drives the dot's form)
     locked: bool,    // tab rows: whether the tab is locked (protected from close)
 }
 
@@ -490,11 +494,11 @@ impl SidebarView {
         let mut rows = Vec::new();
         let mut y = TOP_INSET;
         // Search box (label holds the current query; drawn specially in render).
-        rows.push(Row { top: y, h: SEARCH_H, indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
+        rows.push(Row { top: y, h: SEARCH_H, indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle });
         y += SEARCH_H + GAP;
 
         // Side-by-side "Terminal" and "Group" buttons, occupying one row.
-        rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
+        rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle });
         y += BTN_H + GAP;
 
         // Ungrouped tabs, rendered at the top with a shallow indent.
@@ -505,11 +509,11 @@ impl SidebarView {
         // no session matches, matching how empty groups drop out of the filtered list.
         if q.is_empty() || !matched_ung.is_empty() {
             // "Sessions" section label above the tabs (matches the GROUP labels below).
-            rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
+            rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle });
             y += SECTION_H;
             for t in matched_ung {
                 let selected = snap.active == Some(t.id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: t.title.clone(), kind: Press::Tab(t.id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: t.dot, locked: t.locked });
+                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: t.title.clone(), kind: Press::Tab(t.id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: t.dot, locked: t.locked, state: t.state });
                 y += ROW_H;
             }
         }
@@ -521,7 +525,7 @@ impl SidebarView {
             if !q.is_empty() && matched.is_empty() {
                 continue;
             }
-            rows.push(Row { top: y - scroll, h: ROW_H, indent: PAD, label: g.name.clone(), kind: Press::Group(gi), selected: false, collapsed: g.collapsed, group: gi, dot: 0, locked: false });
+            rows.push(Row { top: y - scroll, h: ROW_H, indent: PAD, label: g.name.clone(), kind: Press::Group(gi), selected: false, collapsed: g.collapsed, group: gi, dot: 0, locked: false, state: SessionState::Idle });
             y += ROW_H;
             // Hide tabs when collapsed and not in search state; while searching, always show matches (to make collapsed tabs findable).
             if g.collapsed && q.is_empty() {
@@ -529,7 +533,7 @@ impl SidebarView {
             }
             for t in matched {
                 let selected = snap.active == Some(t.id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: t.title.clone(), kind: Press::Tab(t.id, gi), selected, collapsed: false, group: gi, dot: t.dot, locked: t.locked });
+                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: t.title.clone(), kind: Press::Tab(t.id, gi), selected, collapsed: false, group: gi, dot: t.dot, locked: t.locked, state: t.state });
                 y += ROW_H;
             }
         }
@@ -555,6 +559,7 @@ impl SidebarView {
             group: usize::MAX,
             dot: 0,
             locked: false,
+            state: SessionState::Idle,
         }]
     }
 
@@ -745,16 +750,7 @@ impl SidebarView {
         } else if hovered {
             round_fill(inset, 7.0, &overlay(ROW_HOVER));
         }
-        // Status dot: an explicit per-tab color if set, else auto (active = green, otherwise = gray).
-        // Index defensively (the dot index comes from the on-disk layout file and may be out of range).
-        let dot = if let Some((_, c)) = DOT_COLORS.get(row.dot as usize).filter(|_| row.dot != 0) {
-            *c
-        } else if row.selected {
-            DOT_RUNNING
-        } else {
-            (0.37, 0.37, 0.40)
-        };
-        round_fill(rect(row.indent, vmid(6.0), 6.0, 6.0), 3.0, &ns_color(dot));
+        Self::draw_status_dot(row);
         // Small terminal icon + session name.
         let fg = if row.selected { text_primary() } else { text_secondary() };
         draw_symbol("terminal", rect(row.indent + 12.0, vmid(12.0), 14.0, 12.0), fg);
@@ -769,6 +765,48 @@ impl SidebarView {
             draw_symbol("lock.fill", rect(w - 26.0, vmid(12.0), 11.0, 12.0), text_placeholder());
         } else if row.selected {
             draw_symbol("ellipsis", rect(w - 28.0, vmid(11.0), 16.0, 11.0), text_placeholder());
+        }
+    }
+
+    /// The status dot at the left of a session row.
+    ///
+    /// Two independent axes, which is what lets it carry both meanings without either winning:
+    ///
+    /// - **Hue is the user's**: an explicit dot color is drawn as chosen, whatever the session is
+    ///   doing. Only a tab left on the default color takes its hue from the state.
+    /// - **Form is the session's**: a running job is solid, an idle prompt is dimmed, and an ended
+    ///   session is a hollow ring.
+    ///
+    /// So a blue dot on a dead session is a blue *ring* — the color survives and "dead" still
+    /// reads, and there is never a question of which one outranks the other.
+    ///
+    /// Note what is absent: selection. It used to make the dot green, which is why green has always
+    /// meant "the tab you are looking at" rather than "running". The row is already marked as
+    /// selected three other ways — its chip, its brighter label, its persistent "⋯".
+    fn draw_status_dot(row: &Row) {
+        // Index defensively: the dot index comes from the on-disk layout file and may be anything.
+        let hue = match DOT_COLORS.get(row.dot as usize).filter(|_| row.dot != 0) {
+            Some((_, c)) => *c,
+            None if row.state == SessionState::Running => DOT_RUNNING,
+            None => DOT_IDLE,
+        };
+        match row.state {
+            // A ring, not a disc. Sized and placed on whole/half points: at 7pt an unsnapped
+            // stroke straddles two device pixels and comes out as a smudge rather than a ring.
+            SessionState::Ended => {
+                let r = rect(row.indent - 0.5, row.top + ((row.h - 7.0) / 2.0).round() - 0.5, 7.0, 7.0);
+                round_stroke(r, 3.5, 1.2, &ns_color(hue));
+            }
+            // Idle is the same dot as running, just quieter: a prompt is not an event, and a
+            // sidebar of solid dots would say nothing about which session is actually working.
+            SessionState::Idle => {
+                let r = rect(row.indent, row.top + ((row.h - 6.0) / 2.0).round(), 6.0, 6.0);
+                round_fill(r, 3.0, &rgba(hue.0, hue.1, hue.2, 0.55));
+            }
+            SessionState::Running => {
+                let r = rect(row.indent, row.top + ((row.h - 6.0) / 2.0).round(), 6.0, 6.0);
+                round_fill(r, 3.0, &ns_color(hue));
+            }
         }
     }
 

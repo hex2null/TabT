@@ -154,6 +154,7 @@ pub struct TabSnap {
     pub title: String,
     pub dot: u8,      // status-dot color index (0 = default/auto)
     pub locked: bool, // protected from user-initiated close
+    pub state: SessionState,
 }
 
 /// Group snapshot used by the sidebar for drawing.
@@ -1283,7 +1284,10 @@ impl AppController {
     pub fn snapshot(&self) -> Snapshot {
         let m = self.model.borrow();
         let snap_of = |id: &u64| {
-            m.tabs.iter().find(|t| t.id == *id).map(|t| TabSnap { id: t.id, title: t.display_title(), dot: t.dot, locked: t.locked })
+            m.tabs
+                .iter()
+                .find(|t| t.id == *id)
+                .map(|t| TabSnap { id: t.id, title: t.display_title(), dot: t.dot, locked: t.locked, state: t.state })
         };
         let ungrouped = m.ungrouped.iter().filter_map(snap_of).collect();
         let groups = m
