@@ -16,8 +16,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSBackingStoreType,
-    NSAutoresizingMaskOptions, NSColor, NSPopUpButton, NSScrollView, NSSegmentedControl,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSPopUpButton,
+    NSScrollView, NSSegmentedControl,
     NSSegmentStyle, NSStepper, NSTabView, NSTabViewItem, NSTabViewType, NSTextField, NSView,
     NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
@@ -27,7 +27,6 @@ use objc2_foundation::{
 
 use crate::app::AppController;
 use crate::settings;
-use crate::theme;
 use crate::theme_grid::ThemeGrid;
 
 /// Window content width. The panes are the same, less `MARGIN` on each side. Sized for the theme
@@ -38,9 +37,11 @@ const MARGIN: f64 = 12.0;
 /// Vertical distance between two rows.
 const ROW_H: f64 = 38.0;
 /// Height of every pane's content area — one size for all of them, so switching tabs never
-/// resizes the window. Set by the theme grid, which wants the room; the control panes hold far
-/// fewer points of content and center it (see [`Rows::new`]).
+/// resizes the window. Set by the theme grid, which wants the room; the control panes hold less
+/// and simply leave the rest empty, their rows starting at the same top edge in every pane.
 const PANE_H: f64 = 384.0;
+/// Gap between the top of a pane and its first row.
+const PANE_TOP: f64 = 20.0;
 
 /// The panes, in order — the segmented switcher's labels and the tab view's items.
 const PANES: [&str; 4] = ["Theme", "Appearance", "Terminal", "Shell"];
@@ -60,11 +61,10 @@ struct Rows {
 }
 
 impl Rows {
-    /// Start a pane of `count` rows, vertically centered: every pane is as tall as the theme grid
-    /// needs, which is far more than any of the control panes fill, and rows pinned to the top of
-    /// that would sit above a void.
-    fn new(count: usize) -> Self {
-        Rows { y: (PANE_H + count as f64 * ROW_H) / 2.0 }
+    /// Start at the top of the pane. Every pane's first row lands on the same line, so switching
+    /// tabs moves the labels sideways and not up and down.
+    fn new() -> Self {
+        Rows { y: PANE_H - PANE_TOP }
     }
 
     fn next(&mut self) -> f64 {
@@ -303,24 +303,11 @@ impl SettingsDialog {
         }
     }
 
-    /// Match the panel's appearance to the theme, so the standard controls render light on a light
-    /// theme and dark on a dark one (the main window does the same in `sync_window_chrome`).
-    /// Public because a theme switch with the panel open has to re-apply it.
-    pub fn sync_appearance(&self) {
-        let name = unsafe {
-            if theme::current().is_dark() { NSAppearanceNameDarkAqua } else { NSAppearanceNameAqua }
-        };
-        if let (Some(w), Some(ap)) = (self.ivars().window.borrow().as_ref(), NSAppearance::appearanceNamed(name)) {
-            let _: () = unsafe { msg_send![&**w, setAppearance: &*ap] };
-        }
-    }
-
     /// Build the panel (if needed) and bring it to front, seeded with the current settings.
     pub fn show(&self, mtm: MainThreadMarker) {
         // Already built: just refresh values and re-show.
         if self.ivars().window.borrow().is_some() {
             self.seed_values();
-            self.sync_appearance();
             if let Some(w) = self.ivars().window.borrow().as_ref() {
                 w.center();
                 w.makeKeyAndOrderFront(None);
@@ -405,9 +392,11 @@ impl SettingsDialog {
 
         // No explicit Done button: the window's title-bar close button dismisses the panel.
 
+        // No appearance is set on this window: unlike the terminal, whose chrome is the theme's,
+        // the settings panel is a system panel and follows the system's light/dark setting. The
+        // theme is previewed inside it (the Theme pane's cards), not applied to it.
         *self.ivars().window.borrow_mut() = Some(window.clone());
         self.seed_values();
-        self.sync_appearance();
 
         window.center();
         window.makeKeyAndOrderFront(None);
@@ -419,7 +408,7 @@ impl SettingsDialog {
     /// Appearance: theme, font family, font size, sidebar side, border.
     fn build_appearance(&self, pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
         let pane = new_pane(pane_w, mtm);
-        let mut rows = Rows::new(6); // font, size, sidebar, border, padding, opacity
+        let mut rows = Rows::new();
 
         let y = rows.next();
         add_label(&pane, "Font", y, mtm);
@@ -499,7 +488,7 @@ impl SettingsDialog {
     /// Terminal: cursor shape, scrollback depth.
     fn build_terminal(&self, pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
         let pane = new_pane(pane_w, mtm);
-        let mut rows = Rows::new(3); // cursor, blink, scrollback
+        let mut rows = Rows::new();
 
         let y = rows.next();
         add_label(&pane, "Cursor", y, mtm);
@@ -534,7 +523,7 @@ impl SettingsDialog {
     /// Shell: which shell to run, and where a new tab starts.
     fn build_shell(&self, pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
         let pane = new_pane(pane_w, mtm);
-        let mut rows = Rows::new(2); // shell, new tab in
+        let mut rows = Rows::new();
 
         let y = rows.next();
         add_label(&pane, "Shell", y, mtm);

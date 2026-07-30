@@ -317,11 +317,6 @@ impl AppController {
         // The card's fill/border/shadow live on a layer, so they hold concrete colors and have to
         // be repainted here rather than re-read during a `drawRect:`.
         card::apply_theme(&self.card);
-        // The settings panel pins its own appearance to the theme as well, and it is very likely
-        // to be open right now — the theme pop-up lives in it.
-        if let Some(d) = self.settings_dialog.borrow().as_ref() {
-            d.sync_appearance();
-        }
     }
 
     /// Set `view`'s frame — animated while a sidebar collapse/expand is in flight, instant
