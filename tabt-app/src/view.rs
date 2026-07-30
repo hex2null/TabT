@@ -80,6 +80,11 @@ pub type RestartFn = fn(*const c_void, u64);
 /// Argument-less command callback (e.g. ⌘B to collapse the sidebar).
 pub type CmdFn = fn(*const c_void);
 
+/// Callback for a change in what the shell reports *about* the session rather than into it — its
+/// OSC title or its OSC 7 cwd — as (context, tab id). Fired only on an actual change, so the
+/// controller may treat every call as worth a sidebar refresh (see `on_readable`).
+pub type MetaFn = fn(*const c_void, u64);
+
 pub struct TermViewIvars {
     grid: RefCell<Grid>,
     // Mutable: `restart()` swaps in a fresh fd after the previous shell has ended.
@@ -91,6 +96,11 @@ pub struct TermViewIvars {
     end_fn: Cell<Option<EndFn>>,
     restart_fn: Cell<Option<RestartFn>>,
     toggle_fn: Cell<Option<CmdFn>>, // ⌘B to collapse the sidebar
+    meta_fn: Cell<Option<MetaFn>>,  // the shell reported a new title/cwd
+    // Last title/cwd handed to `meta_fn`, so a read that changed neither costs two string compares
+    // and no allocation. The PTY delivers output continuously; the title changes once in a while.
+    last_title: RefCell<String>,
+    last_cwd: RefCell<String>,
     // The shell exited (EOF/read error) and hasn't been restarted yet: input is ignored except
     // Enter, which triggers `restart_fn`. See `mark_ended`/`restart`.
     ended: Cell<bool>,
@@ -571,6 +581,9 @@ impl TermView {
             end_fn: Cell::new(None),
             restart_fn: Cell::new(None),
             toggle_fn: Cell::new(None),
+            meta_fn: Cell::new(None),
+            last_title: RefCell::new(String::new()),
+            last_cwd: RefCell::new(String::new()),
             ended: Cell::new(false),
             scroll_accum: Cell::new(0.0),
             mouse_held: RefCell::new(Vec::new()),
@@ -621,13 +634,48 @@ impl TermView {
         unsafe { self.setNeedsDisplay(true) };
     }
 
-    /// Bind the owning tab id, end/restart callbacks, and ⌘B collapse callback (called by AppController after creation).
-    pub fn attach(&self, ctx: *const c_void, tab_id: u64, end: EndFn, restart: RestartFn, toggle: CmdFn) {
+    /// Bind the owning tab id, end/restart callbacks, the ⌘B collapse callback and the title/cwd
+    /// change callback (called by AppController after creation).
+    pub fn attach(&self, ctx: *const c_void, tab_id: u64, end: EndFn, restart: RestartFn, toggle: CmdFn, meta: MetaFn) {
         self.ivars().tab_id.set(tab_id);
         self.ivars().close_ctx.set(ctx);
         self.ivars().end_fn.set(Some(end));
         self.ivars().restart_fn.set(Some(restart));
         self.ivars().toggle_fn.set(Some(toggle));
+        self.ivars().meta_fn.set(Some(meta));
+    }
+
+    /// The shell's last reported title (OSC 0/1/2); empty when it has never set one.
+    pub fn title(&self) -> String {
+        self.ivars().grid.borrow().title().to_string()
+    }
+
+    /// Fire `meta_fn` if the grid's title or cwd differs from what was last reported. Compares
+    /// borrowed strings, so a read that changed neither — the overwhelming majority — allocates
+    /// nothing.
+    fn notify_meta_if_changed(&self) {
+        let (title_changed, cwd_changed) = {
+            let grid = self.ivars().grid.borrow();
+            (*self.ivars().last_title.borrow() != grid.title(), *self.ivars().last_cwd.borrow() != grid.cwd())
+        };
+        if !title_changed && !cwd_changed {
+            return;
+        }
+        {
+            let grid = self.ivars().grid.borrow();
+            if title_changed {
+                *self.ivars().last_title.borrow_mut() = grid.title().to_string();
+            }
+            if cwd_changed {
+                *self.ivars().last_cwd.borrow_mut() = grid.cwd().to_string();
+            }
+        }
+        // The grid borrow is dropped before calling out: the controller reads this view back
+        // through `title()`/`cwd()`, and a live borrow here would be a RefCell panic — which
+        // `panic = "abort"` turns into a dead app rather than one bad tab.
+        if let Some(f) = self.ivars().meta_fn.get() {
+            f(self.ivars().close_ctx.get(), self.ivars().tab_id.get());
+        }
     }
 
     /// The shell exited (EOF or a fatal read error): print a status line into the grid, flip into
@@ -745,6 +793,7 @@ impl TermView {
             // cycle the timer left it in.
             settings::show_cursor_phase();
             unsafe { self.setNeedsDisplay(true) };
+            self.notify_meta_if_changed();
         }
     }
 

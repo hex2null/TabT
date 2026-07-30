@@ -29,7 +29,7 @@
 //! [group]
 //! name = Default
 //! collapsed = false
-//! tab = Terminal 1
+//! tab = tabt
 //! cwd = /Users/me/proj
 //! tab = server
 //!
@@ -290,7 +290,9 @@ pub fn parse(text: &str) -> Layout {
     // When entirely empty (no ungrouped tabs and no tabs inside groups), add one ungrouped tab so a terminal is available.
     let total_tabs = ungrouped.len() + groups.iter().map(|g| g.2.len()).sum::<usize>();
     if total_tabs == 0 {
-        ungrouped.push(TabState { title: "Terminal 1".to_string(), cwd: String::new(), dot: 0, locked: false });
+        // No title: the app derives one from where the shell lands. Naming it here would make a
+        // first-launch tab look like the user had chosen that name, and it would then be kept.
+        ungrouped.push(TabState { title: String::new(), cwd: String::new(), dot: 0, locked: false });
     }
 
     Layout { settings: s, ungrouped, groups }
@@ -323,6 +325,36 @@ fn read_tab_key(tabs: &mut Vec<TabState>, key: &str, value: &str) {
 /// A boolean value: `true` (any case) or `1`; anything else is false.
 fn truthy(value: &str) -> bool {
     value.eq_ignore_ascii_case("true") || value == "1"
+}
+
+/// The longest label kept. A title is drawn into a sidebar row a couple of hundred points wide, so
+/// anything beyond this is invisible either way; the cap exists to stop a remote host from writing
+/// an unbounded line into the config file.
+const MAX_LABEL: usize = 200;
+
+/// Whether a character may appear in a tab or group label.
+///
+/// Rejects control characters — a newline in a value would corrupt the config format, which does no
+/// escaping — and the private-use block AppKit maps its function keys into, so a stray arrow key
+/// cannot type a glyph into a rename box.
+pub fn is_typable(ch: char) -> bool {
+    !ch.is_control() && !('\u{E000}'..='\u{F8FF}').contains(&ch)
+}
+
+/// Reduce arbitrary text to something safe to store as a label and draw in a row.
+///
+/// Both label sources run through this: what the user types into the rename box, and the OSC 0/1/2
+/// title, which arrives from whatever is on the other end of the PTY — possibly a remote host over
+/// ssh — and is therefore untrusted input reaching both the sidebar and `layout.conf`.
+///
+/// Truncation counts **characters, not bytes**: the OSC payload is bytes repaired by
+/// `from_utf8_lossy`, and slicing that by byte offset would panic mid-character. Under
+/// `panic = "abort"` that is the whole app, not one tab.
+///
+/// An empty result means "no usable label", which every caller treats as absent rather than as a
+/// blank name.
+pub fn sanitize_label(s: &str) -> String {
+    s.chars().filter(|c| is_typable(*c)).take(MAX_LABEL).collect::<String>().trim().to_string()
 }
 
 /// Write the layout back.
@@ -391,6 +423,53 @@ mod tests {
 
     fn tab(title: &str, cwd: &str, dot: u8, locked: bool) -> SavedTab {
         (title.to_string(), cwd.to_string(), dot, locked)
+    }
+
+    /// A newline is the one character that would actually corrupt the format: `parse` splits on
+    /// lines, so the tail of a title would come back as a bogus key.
+    #[test]
+    fn sanitize_strips_control_characters() {
+        assert_eq!(sanitize_label("build\nlock = true"), "buildlock = true");
+        assert_eq!(sanitize_label("a\tb\rc"), "abc");
+        assert_eq!(sanitize_label("\u{1b}]0;nested"), "]0;nested");
+    }
+
+    /// `=`, `[` and `#` are safe in a *value* — `parse` splits on the first `=` and takes the rest
+    /// verbatim — so the sanitizer must not mangle a legitimate title that contains them.
+    #[test]
+    fn sanitize_keeps_punctuation_and_unicode() {
+        assert_eq!(sanitize_label("make test [2/3] #ci"), "make test [2/3] #ci");
+        assert_eq!(sanitize_label("中文 ~/项目"), "中文 ~/项目");
+    }
+
+    /// The cap counts characters, never bytes: an OSC title is bytes through `from_utf8_lossy`, and
+    /// byte-slicing one mid-character panics — which `panic = "abort"` turns into a dead app.
+    #[test]
+    fn sanitize_truncates_by_characters_not_bytes() {
+        let long = "中".repeat(500);
+        let out = sanitize_label(&long);
+        assert_eq!(out.chars().count(), MAX_LABEL);
+        assert!(out.chars().all(|c| c == '中'));
+    }
+
+    /// An unusable title has to come back empty so the caller can fall through to the next rung of
+    /// the naming chain rather than showing a blank row.
+    #[test]
+    fn sanitize_yields_empty_for_nothing_usable() {
+        assert_eq!(sanitize_label(""), "");
+        assert_eq!(sanitize_label("\n\t\r"), "");
+        assert_eq!(sanitize_label("   "), "");
+        assert_eq!(sanitize_label("\u{f8ff}"), ""); // the private-use block AppKit's function keys live in
+    }
+
+    /// A sanitized title has to survive the config round trip unchanged, since that is where it
+    /// goes next.
+    #[test]
+    fn sanitized_title_round_trips_through_the_config() {
+        let title = sanitize_label("deploy [prod] = go");
+        let text = render(&Settings::default(), &[tab(&title, "/tmp", 0, false)], &[]);
+        let back = parse(&text);
+        assert_eq!(back.ungrouped[0].title, title);
     }
 
     /// Everything written must come back, so a settings change survives the next launch. Goes
@@ -488,6 +567,8 @@ dot = 99
     fn empty_config_yields_one_tab() {
         let l = parse("");
         assert_eq!(l.ungrouped.len(), 1);
+        // Deliberately unnamed: the app names it after the directory the shell starts in.
+        assert_eq!(l.ungrouped[0].title, "");
         assert!(l.groups.is_empty());
         assert_eq!(l.settings.style, crate::theme::DEFAULT_NAME);
     }

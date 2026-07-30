@@ -22,6 +22,7 @@ use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSi
 
 use crate::app::{AppController, Snapshot, TabSnap};
 use crate::card::CARD_INSET;
+use crate::config;
 use crate::header::HEADER_H;
 use crate::settings;
 use crate::theme;
@@ -1684,7 +1685,7 @@ impl SidebarView {
             Some(s) => s.to_string(),
             None => return,
         };
-        let text: String = s.chars().filter(|c| is_typable(*c)).collect();
+        let text: String = s.chars().filter(|c| config::is_typable(*c)).collect();
         if text.is_empty() {
             return;
         }
@@ -1701,7 +1702,7 @@ impl SidebarView {
             Some(s) => s.to_string(),
             None => return,
         };
-        let text: String = s.chars().filter(|c| is_typable(*c)).collect();
+        let text: String = s.chars().filter(|c| config::is_typable(*c)).collect();
         if text.is_empty() {
             return;
         }
@@ -1823,10 +1824,6 @@ fn word_right(text: &str, at: usize) -> usize {
 /// Whether a character is typable text: excludes control characters and AppKit
 /// function-key private-use code points (U+E000..U+F8FF; arrow keys / Home / End /
 /// PageUp / forward-delete land here and must not leak into search/rename text).
-fn is_typable(ch: char) -> bool {
-    !ch.is_control() && !('\u{E000}'..='\u{F8FF}').contains(&ch)
-}
-
 /// sRGB color (with alpha).
 fn rgba(r: f64, g: f64, b: f64, a: f64) -> Retained<NSColor> {
     unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, a) }

@@ -43,7 +43,14 @@ const BLINK_MS: u64 = 530;
 
 struct Tab {
     id: u64,
+    /// The name the user gave this tab with ⌘R. Only meaningful when `pinned`; otherwise the
+    /// displayed name is derived (see `Tab::display_title`).
     title: String,
+    /// Whether `title` was chosen by the user and must not be overwritten by the shell.
+    pinned: bool,
+    /// Last title the shell reported via OSC 0/1/2, already sanitized; empty when it has reported
+    /// none, which is the common case — a stock zsh on macOS never sets one.
+    osc_title: String,
     dot: u8,      // status-dot color index (0 = default/auto; 1..=8 = classic colors, see sidebar::DOT_COLORS)
     locked: bool, // locked tabs are protected from being closed by the user (⌘W / the tab menu)
     view: Retained<TermView>,
@@ -64,6 +71,43 @@ impl Tab {
         } else {
             live
         }
+    }
+
+    /// The name to show for this tab.
+    ///
+    /// A ⌘R rename wins permanently; otherwise the shell's own OSC title does; otherwise the tab is
+    /// named after where it is. The last rung is only reached by a tab with no cwd at all, which in
+    /// practice means the spawn failed.
+    ///
+    /// The chain matters more than it looks: a stock macOS zsh reports no title, because
+    /// `/etc/zshrc` only sources a title-setting hook for Apple_Terminal and this app deliberately
+    /// identifies itself as TabT. So for most users the *directory* is the name, and OSC titles are
+    /// what ssh, tmux, vim and the like contribute on top.
+    fn display_title(&self) -> String {
+        if self.pinned && !self.title.is_empty() {
+            return self.title.clone();
+        }
+        if !self.osc_title.is_empty() {
+            return self.osc_title.clone();
+        }
+        let cwd = self.cwd();
+        if !cwd.is_empty() {
+            return abbreviate_dir(&cwd);
+        }
+        "Terminal".to_string()
+    }
+}
+
+/// The last component of a path, with `$HOME` itself shown as `~`. Used to name a tab after the
+/// directory it sits in — the leaf is what identifies it; the rest is noise in a 200pt-wide row.
+fn abbreviate_dir(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && path == home {
+        return "~".to_string();
+    }
+    match path.rsplit('/').find(|c| !c.is_empty()) {
+        Some(leaf) => leaf.to_string(),
+        None => "/".to_string(), // the root directory has no leaf
     }
 }
 
@@ -120,6 +164,9 @@ pub struct AppController {
     collapsed: Cell<bool>,     // whether the sidebar is collapsed/hidden
     sidebar_w: Cell<f64>,      // current sidebar width (draggable)
     sidebar_right: Cell<bool>, // whether the sidebar is docked on the right
+    // Last string handed to `setTitle:`, so `update_title` can skip a no-op call — it now runs on
+    // every OSC title/cwd report, and each `setTitle:` relays out the title bar.
+    last_window_title: RefCell<String>,
     // AppKit's own default x for the three traffic lights, captured the first time they are laid
     // out. `reposition_traffic_lights` shifts them right when the card is under them, and it can
     // run when AppKit has *not* reset the frames — offsetting the live x would then accumulate and
@@ -179,6 +226,7 @@ impl AppController {
             collapsed: Cell::new(false),
             sidebar_w: Cell::new(SIDEBAR_W),
             sidebar_right: Cell::new(false),
+            last_window_title: RefCell::new(String::new()),
             light_x0: Cell::new(None),
             animating: Cell::new(false),
             settings_dialog: RefCell::new(None),
@@ -462,12 +510,20 @@ impl AppController {
 
     /// The title bar always shows the current active tab's name; falls back to "TabT" when there is no active tab.
     fn update_title(&self) {
-        let m = self.model.borrow();
-        let title = m
-            .active
-            .and_then(|a| m.tabs.iter().find(|t| t.id == a))
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| crate::branding::APP_NAME.to_string());
+        let title = {
+            let m = self.model.borrow();
+            m.active
+                .and_then(|a| m.tabs.iter().find(|t| t.id == a))
+                .map(Tab::display_title)
+                .unwrap_or_else(|| crate::branding::APP_NAME.to_string())
+        };
+        // Bail out when nothing changed. This is now on the path of every OSC report, so a shell
+        // that retitles at each prompt — or a `cd`, which renames an underived tab — would
+        // otherwise call `setTitle:` continuously, and each call relays out the title bar.
+        if *self.last_window_title.borrow() == title {
+            return;
+        }
+        *self.last_window_title.borrow_mut() = title.clone();
         self.window.setTitle(&NSString::from_str(&title));
         // `setTitle:` relays out the title bar and puts the traffic lights back where AppKit wants
         // them, synchronously and right here. Re-center them before returning: the correction then
@@ -513,8 +569,11 @@ impl AppController {
         // Spawn ungrouped tabs first (rendered at the top), then each group. A tab that fails to
         // spawn (e.g. the system is out of file descriptors) is silently skipped — restore
         // whatever we can rather than aborting the whole session restore.
+        // A restored tab is pinned: layout.conf records one title per tab and nothing yet
+        // distinguishes a name the user chose from one that was derived, so keeping it is the
+        // choice that cannot lose a rename.
         for t in layout.ungrouped {
-            let _ = self.spawn_tab(None, t.title, &t.cwd, t.dot, t.locked);
+            let _ = self.spawn_tab(None, t.title, true, &t.cwd, t.dot, t.locked);
         }
         for (name, collapsed, tabs) in layout.groups {
             let gi = {
@@ -523,7 +582,7 @@ impl AppController {
                 m.groups.len() - 1
             };
             for t in tabs {
-                let _ = self.spawn_tab(Some(gi), t.title, &t.cwd, t.dot, t.locked);
+                let _ = self.spawn_tab(Some(gi), t.title, true, &t.cwd, t.dot, t.locked);
             }
         }
         let first = self.model.borrow().tabs.first().map(|t| t.id);
@@ -563,7 +622,7 @@ impl AppController {
     /// (for session restore, may be empty). When `group` is None it goes into the ungrouped list. Registered into the model.
     /// Returns `None` if the PTY/process itself couldn't be spawned (e.g. out of file
     /// descriptors) — the caller must skip creating this one tab without disturbing any others.
-    fn spawn_tab(&self, group: Option<usize>, title: String, cwd: &str, dot: u8, locked: bool) -> Option<u64> {
+    fn spawn_tab(&self, group: Option<usize>, title: String, pinned: bool, cwd: &str, dot: u8, locked: bool) -> Option<u64> {
         let id = {
             let mut m = self.model.borrow_mut();
             let id = m.next_id;
@@ -575,11 +634,27 @@ impl AppController {
         let frame = self.host.bounds();
         let v = TermView::new(self.mtm, frame, fd, cols, rows);
         v.set_scrollback(settings::scrollback());
-        v.attach(self as *const AppController as *const c_void, id, end_cb, restart_cb, toggle_cb);
+        v.attach(self as *const AppController as *const c_void, id, end_cb, restart_cb, toggle_cb, meta_cb);
         let reader = view::attach_reader(&v);
 
         let mut m = self.model.borrow_mut();
-        m.tabs.push(Tab { id, title, dot, locked, view: v, master_fd: fd, shell_pid, reader, spawn_cwd: cwd.to_string() });
+        m.tabs.push(Tab {
+            id,
+            title,
+            pinned,
+            osc_title: String::new(),
+            dot,
+            locked,
+            view: v,
+            master_fd: fd,
+            shell_pid,
+            reader,
+            // Record where the shell actually starts, not what was requested: `pty::spawn` falls
+            // back to HOME on an empty cwd, and leaving that blank here would leave a fresh tab
+            // with no directory to be named after or revealed in Finder until OSC 7 reports one —
+            // which a stock zsh never does.
+            spawn_cwd: if cwd.is_empty() { std::env::var("HOME").unwrap_or_default() } else { cwd.to_string() },
+        });
         match group {
             Some(gi) if gi < m.groups.len() => m.groups[gi].tabs.push(id),
             _ => m.ungrouped.push(id),
@@ -699,12 +774,11 @@ impl AppController {
                 Some((a, group, cwd))
             })
         };
-        let n = self.model.borrow().next_id;
         let (group, cwd) = match &anchor {
             Some((_, g, cwd)) => (*g, self.new_tab_cwd(cwd.clone())),
             None => (None, String::new()),
         };
-        match self.spawn_tab(group, format!("Terminal {}", n), &cwd, 0, false) {
+        match self.spawn_tab(group, String::new(), false, &cwd, 0, false) {
             Some(id) => {
                 if let Some((active_id, _, _)) = anchor {
                     self.place_tab_after(group, id, active_id);
@@ -733,8 +807,7 @@ impl AppController {
                 .unwrap_or_default()
         };
         let cwd = self.new_tab_cwd(cwd);
-        let n = self.model.borrow().next_id;
-        match self.spawn_tab(Some(gi), format!("Terminal {}", n), &cwd, 0, false) {
+        match self.spawn_tab(Some(gi), String::new(), false, &cwd, 0, false) {
             Some(id) => {
                 self.select(id); // expands `gi` if it was collapsed, so the new row is visible
                 self.save();
@@ -1060,12 +1133,31 @@ impl AppController {
         self.refresh_sidebar();
     }
 
+    /// The shell reported a new title or cwd for this tab (see `view::MetaFn`). Both feed the
+    /// sidebar row, so either is worth a refresh; the callback only fires on an actual change.
+    pub fn on_tab_meta(&self, id: u64) {
+        {
+            let mut m = self.model.borrow_mut();
+            let Some(t) = m.tabs.iter_mut().find(|t| t.id == id) else {
+                return;
+            };
+            // Sanitized here, at the boundary: past this point the title is stored, drawn, and
+            // written to layout.conf, and it arrived from whatever is on the far end of the PTY.
+            t.osc_title = config::sanitize_label(&t.view.title());
+        }
+        self.refresh_sidebar();
+        self.update_title(); // the active tab's name may have just changed under the window title
+    }
+
     /// Rename a tab (committed after double-click in-place editing in the sidebar).
     pub fn rename_tab(&self, id: u64, name: String) {
         {
             let mut m = self.model.borrow_mut();
             match m.tabs.iter_mut().find(|t| t.id == id) {
-                Some(t) => t.title = name,
+                Some(t) => {
+                    t.title = name;
+                    t.pinned = true; // an explicit rename outranks whatever the shell reports
+                }
                 None => return,
             }
         }
@@ -1104,7 +1196,7 @@ impl AppController {
 
     /// A tab's current title, as the rename box should seed itself with.
     pub fn tab_title(&self, id: u64) -> String {
-        self.model.borrow().tabs.iter().find(|t| t.id == id).map(|t| t.title.clone()).unwrap_or_default()
+        self.model.borrow().tabs.iter().find(|t| t.id == id).map(Tab::display_title).unwrap_or_default()
     }
 
     /// Whether a group is collapsed (its tabs hidden in the sidebar).
@@ -1146,7 +1238,7 @@ impl AppController {
     pub fn snapshot(&self) -> Snapshot {
         let m = self.model.borrow();
         let snap_of = |id: &u64| {
-            m.tabs.iter().find(|t| t.id == *id).map(|t| TabSnap { id: t.id, title: t.title.clone(), dot: t.dot, locked: t.locked })
+            m.tabs.iter().find(|t| t.id == *id).map(|t| TabSnap { id: t.id, title: t.display_title(), dot: t.dot, locked: t.locked })
         };
         let ungrouped = m.ungrouped.iter().filter_map(snap_of).collect();
         let groups = m
@@ -1463,7 +1555,7 @@ impl AppController {
         let m = self.model.borrow();
         // A single tab id -> (title, cwd, dot, locked).
         let tab_state = |id: &u64| {
-            m.tabs.iter().find(|t| t.id == *id).map(|t| (t.title.clone(), t.cwd(), t.dot, t.locked))
+            m.tabs.iter().find(|t| t.id == *id).map(|t| (t.display_title(), t.cwd(), t.dot, t.locked))
         };
         let ungrouped: Vec<config::SavedTab> = m.ungrouped.iter().filter_map(tab_state).collect();
         let groups: Vec<config::SavedGroup> = m
@@ -1527,6 +1619,12 @@ fn end_cb(ctx: *const c_void, id: u64) {
 fn restart_cb(ctx: *const c_void, id: u64) {
     let ctrl = unsafe { &*(ctx as *const AppController) };
     ctrl.restart_tab(id);
+}
+
+/// TermView calls back through this when the shell reported a new title or cwd (see `view::MetaFn`).
+fn meta_cb(ctx: *const c_void, id: u64) {
+    let ctrl = unsafe { &*(ctx as *const AppController) };
+    ctrl.on_tab_meta(id);
 }
 
 /// When TermView receives ⌘B it calls back into the controller to collapse the sidebar (see `view::CmdFn`).
