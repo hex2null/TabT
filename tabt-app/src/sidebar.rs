@@ -492,6 +492,18 @@ impl SidebarView {
         TOP_INSET + SEARCH_H + GAP + BTN_H + GAP
     }
 
+    /// Whether a session matches the search query: by name, or by the directory it is in.
+    ///
+    /// The directory is worth searching precisely because it is *not* drawn — most sessions are
+    /// distinguished by where they are rather than by a name anyone bothered to give them, and
+    /// "tabt" should find the one sitting in ~/Code/tabt whatever it happens to be called.
+    ///
+    /// `q` is already lowercased by the caller, and the empty case short-circuits before either
+    /// `to_lowercase` runs, so an unfiltered list allocates nothing here.
+    fn matches(t: &TabSnap, q: &str) -> bool {
+        q.is_empty() || t.title.to_lowercase().contains(q) || t.cwd.to_lowercase().contains(q)
+    }
+
     /// Build all rows. `scroll` only affects groups/tabs (the list area); search/buttons stay fixed.
     /// A list row's `top` is returned directly as a screen coordinate (scroll already subtracted), so hit testing and dragging need no further conversion.
     fn build_rows(snap: &Snapshot, query: &str, scroll: f64) -> Vec<Row> {
@@ -507,8 +519,7 @@ impl SidebarView {
         y += BTN_H + GAP;
 
         // Ungrouped tabs, rendered at the top with a shallow indent.
-        let matched_ung: Vec<&TabSnap> =
-            snap.ungrouped.iter().filter(|t| q.is_empty() || t.title.to_lowercase().contains(&q)).collect();
+        let matched_ung: Vec<&TabSnap> = snap.ungrouped.iter().filter(|t| Self::matches(t, &q)).collect();
         // The "Sessions" section label is always shown (even with no ungrouped tabs), so the session
         // list stays anchored and remains a visible drop target. During a search it's hidden only when
         // no session matches, matching how empty groups drop out of the filtered list.
@@ -525,8 +536,7 @@ impl SidebarView {
 
         for (gi, g) in snap.groups.iter().enumerate() {
             // Filter: when the query is non-empty, keep only tabs whose title matches, and hide groups with no match.
-            let matched: Vec<&TabSnap> =
-                g.tabs.iter().filter(|t| q.is_empty() || t.title.to_lowercase().contains(&q)).collect();
+            let matched: Vec<&TabSnap> = g.tabs.iter().filter(|t| Self::matches(t, &q)).collect();
             if !q.is_empty() && matched.is_empty() {
                 continue;
             }

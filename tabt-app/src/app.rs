@@ -165,6 +165,9 @@ pub struct TabSnap {
     pub state: SessionState,
     pub activity: bool, // unseen output
     pub bell: bool,     // unseen BEL
+    /// Absolute working directory; "" only if the shell never started. Not drawn — the sidebar
+    /// searches it, so a session can be found by where it is rather than only by what it is called.
+    pub cwd: String,
 }
 
 /// Group snapshot used by the sidebar for drawing.
@@ -1316,6 +1319,7 @@ impl AppController {
                     state: t.state,
                     activity: t.activity,
                     bell: t.bell,
+                    cwd: t.cwd(),
                 })
         };
         let ungrouped = m.ungrouped.iter().filter_map(snap_of).collect();
