@@ -79,6 +79,14 @@ struct Tab {
     spawn_cwd: String, // working directory at spawn time: cwd fallback when OSC 7 has not reported
     /// Last sampled state; see `sample_states`. Kept on the tab rather than recomputed per draw.
     state: SessionState,
+    /// This session printed something you have not looked at. Set by the sampler for background
+    /// tabs only, cleared by selecting the tab.
+    activity: bool,
+    /// This session rang the bell (BEL) and you have not looked at it since.
+    bell: bool,
+    /// `TermView::output_seq` as of the last sample, to spot new output without the PTY path
+    /// having to notify anyone.
+    last_seq: u64,
 }
 
 impl Tab {
@@ -155,6 +163,8 @@ pub struct TabSnap {
     pub dot: u8,      // status-dot color index (0 = default/auto)
     pub locked: bool, // protected from user-initiated close
     pub state: SessionState,
+    pub activity: bool, // unseen output
+    pub bell: bool,     // unseen BEL
 }
 
 /// Group snapshot used by the sidebar for drawing.
@@ -680,6 +690,9 @@ impl AppController {
             // Assume idle until the first sample: a tab that has only just spawned is at a prompt,
             // and guessing Running would flash every new tab.
             state: SessionState::Idle,
+            activity: false,
+            bell: false,
+            last_seq: 0,
             // Record where the shell actually starts, not what was requested: `pty::spawn` falls
             // back to HOME on an empty cwd, and leaving that blank here would leave a fresh tab
             // with no directory to be named after or revealed in Finder until OSC 7 reports one —
@@ -700,6 +713,14 @@ impl AppController {
                 return;
             }
             m.active = Some(id);
+            // Looking at a session is what "seen" means, so its marks clear here. `last_seq` is
+            // resynced at the same time: without that, output produced while it was in the
+            // background would re-mark it on the very next sample.
+            if let Some(t) = m.tabs.iter_mut().find(|t| t.id == id) {
+                t.activity = false;
+                t.bell = false;
+                t.last_seq = t.view.output_seq();
+            }
             // A collapsed group hides its tabs, so the tab just made active would have no row in
             // the sidebar and keystrokes would go to a terminal nothing marks as selected. The rule
             // lives here rather than at the callers because every path that activates a tab — new
@@ -1287,7 +1308,15 @@ impl AppController {
             m.tabs
                 .iter()
                 .find(|t| t.id == *id)
-                .map(|t| TabSnap { id: t.id, title: t.display_title(), dot: t.dot, locked: t.locked, state: t.state })
+                .map(|t| TabSnap {
+                    id: t.id,
+                    title: t.display_title(),
+                    dot: t.dot,
+                    locked: t.locked,
+                    state: t.state,
+                    activity: t.activity,
+                    bell: t.bell,
+                })
         };
         let ungrouped = m.ungrouped.iter().filter_map(snap_of).collect();
         let groups = m
@@ -1370,8 +1399,26 @@ impl AppController {
     fn sample_states(&self) {
         let changed = {
             let mut m = self.model.borrow_mut();
+            let active = m.active;
             let mut changed = false;
             for t in &mut m.tabs {
+                // Unseen output and an unseen bell, both only for a tab you are not looking at —
+                // marking the tab in front of you would be noise, and `select` clears them anyway.
+                let seq = t.view.output_seq();
+                let background = active != Some(t.id);
+                if seq != t.last_seq {
+                    t.last_seq = seq;
+                    if background && !t.activity {
+                        t.activity = true;
+                        changed = true;
+                    }
+                }
+                // Drained every sample whether or not it is used: the flag latches in the grid, so
+                // leaving it unread would ring the next time this tab happened to go background.
+                if t.view.take_bell() && background && !t.bell {
+                    t.bell = true;
+                    changed = true;
+                }
                 // An ended session costs nothing to classify: `end_tab_session` closes the fd and
                 // sets shell_pid to -1, so there is no syscall left to make.
                 let now = if t.master_fd < 0 {

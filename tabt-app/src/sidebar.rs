@@ -143,6 +143,8 @@ struct Row {
     group: usize,    // the group this row belongs to (usize::MAX for button rows)
     dot: u8,         // tab rows: status-dot color index (0 = default/auto)
     state: SessionState, // tab rows: what the session is doing (drives the dot's form)
+    activity: bool,      // tab rows: unseen output (brightens the label)
+    bell: bool,          // tab rows: unseen BEL (shows a bell glyph)
     locked: bool,    // tab rows: whether the tab is locked (protected from close)
 }
 
@@ -494,11 +496,11 @@ impl SidebarView {
         let mut rows = Vec::new();
         let mut y = TOP_INSET;
         // Search box (label holds the current query; drawn specially in render).
-        rows.push(Row { top: y, h: SEARCH_H, indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle });
+        rows.push(Row { top: y, h: SEARCH_H, indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false });
         y += SEARCH_H + GAP;
 
         // Side-by-side "Terminal" and "Group" buttons, occupying one row.
-        rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle });
+        rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false });
         y += BTN_H + GAP;
 
         // Ungrouped tabs, rendered at the top with a shallow indent.
@@ -509,11 +511,11 @@ impl SidebarView {
         // no session matches, matching how empty groups drop out of the filtered list.
         if q.is_empty() || !matched_ung.is_empty() {
             // "Sessions" section label above the tabs (matches the GROUP labels below).
-            rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle });
+            rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false });
             y += SECTION_H;
             for t in matched_ung {
                 let selected = snap.active == Some(t.id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: t.title.clone(), kind: Press::Tab(t.id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: t.dot, locked: t.locked, state: t.state });
+                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: t.title.clone(), kind: Press::Tab(t.id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: t.dot, locked: t.locked, state: t.state, activity: t.activity, bell: t.bell });
                 y += ROW_H;
             }
         }
@@ -525,7 +527,7 @@ impl SidebarView {
             if !q.is_empty() && matched.is_empty() {
                 continue;
             }
-            rows.push(Row { top: y - scroll, h: ROW_H, indent: PAD, label: g.name.clone(), kind: Press::Group(gi), selected: false, collapsed: g.collapsed, group: gi, dot: 0, locked: false, state: SessionState::Idle });
+            rows.push(Row { top: y - scroll, h: ROW_H, indent: PAD, label: g.name.clone(), kind: Press::Group(gi), selected: false, collapsed: g.collapsed, group: gi, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false });
             y += ROW_H;
             // Hide tabs when collapsed and not in search state; while searching, always show matches (to make collapsed tabs findable).
             if g.collapsed && q.is_empty() {
@@ -533,7 +535,7 @@ impl SidebarView {
             }
             for t in matched {
                 let selected = snap.active == Some(t.id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: t.title.clone(), kind: Press::Tab(t.id, gi), selected, collapsed: false, group: gi, dot: t.dot, locked: t.locked, state: t.state });
+                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: t.title.clone(), kind: Press::Tab(t.id, gi), selected, collapsed: false, group: gi, dot: t.dot, locked: t.locked, state: t.state, activity: t.activity, bell: t.bell });
                 y += ROW_H;
             }
         }
@@ -560,6 +562,8 @@ impl SidebarView {
             dot: 0,
             locked: false,
             state: SessionState::Idle,
+            activity: false,
+            bell: false,
         }]
     }
 
@@ -752,15 +756,21 @@ impl SidebarView {
         }
         Self::draw_status_dot(row);
         // Small terminal icon + session name.
-        let fg = if row.selected { text_primary() } else { text_secondary() };
+        // A session that printed something you have not seen is brightened to the primary color —
+        // the same weight a selected row gets. Deliberately not a third dot form: the dot already
+        // carries running/idle/ended, and a fourth variant there would be unreadable at 6pt.
+        let fg = if row.selected || row.activity { text_primary() } else { text_secondary() };
         draw_symbol("terminal", rect(row.indent + 12.0, vmid(12.0), 14.0, 12.0), fg);
         // Name truncates with an ellipsis; leaves room for the right-side meta / "⋯".
         let name_x = row.indent + 30.0;
         draw_truncated(&row.label, rect(name_x, vmid(16.0), (w - 40.0 - name_x).max(0.0), 18.0), &self.ivars().font, fg);
-        // Right side: "⋯" while hovered (so the menu — including Unlock — is reachable on any tab);
-        // otherwise a lock glyph for locked tabs, "⋯" for the selected tab, and nothing at rest.
+        // Right side, in priority order: "⋯" while hovered (so the menu — including Unlock — is
+        // reachable on any tab); then a bell, which is an event and outranks the standing facts;
+        // then a lock glyph for locked tabs, "⋯" for the selected tab, and nothing at rest.
         if hovered {
             draw_symbol("ellipsis", rect(w - 28.0, vmid(11.0), 16.0, 11.0), text_placeholder());
+        } else if row.bell {
+            draw_symbol("bell.fill", rect(w - 26.0, vmid(12.0), 12.0, 12.0), fg);
         } else if row.locked {
             draw_symbol("lock.fill", rect(w - 26.0, vmid(12.0), 11.0, 12.0), text_placeholder());
         } else if row.selected {

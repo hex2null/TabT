@@ -101,6 +101,10 @@ pub struct TermViewIvars {
     // and no allocation. The PTY delivers output continuously; the title changes once in a while.
     last_title: RefCell<String>,
     last_cwd: RefCell<String>,
+    // Bumped once per read that produced output. The controller samples it to notice that a
+    // background session has printed something; a counter rather than a flag so nothing has to be
+    // cleared on the PTY path, which is the hottest one in the app.
+    output_seq: Cell<u64>,
     // The shell exited (EOF/read error) and hasn't been restarted yet: input is ignored except
     // Enter, which triggers `restart_fn`. See `mark_ended`/`restart`.
     ended: Cell<bool>,
@@ -584,6 +588,7 @@ impl TermView {
             meta_fn: Cell::new(None),
             last_title: RefCell::new(String::new()),
             last_cwd: RefCell::new(String::new()),
+            output_seq: Cell::new(0),
             ended: Cell::new(false),
             scroll_accum: Cell::new(0.0),
             mouse_held: RefCell::new(Vec::new()),
@@ -643,6 +648,16 @@ impl TermView {
         self.ivars().restart_fn.set(Some(restart));
         self.ivars().toggle_fn.set(Some(toggle));
         self.ivars().meta_fn.set(Some(meta));
+    }
+
+    /// Counter of reads that produced output; see `output_seq` in the ivars.
+    pub fn output_seq(&self) -> u64 {
+        self.ivars().output_seq.get()
+    }
+
+    /// Whether a BEL arrived since this was last called, clearing the flag.
+    pub fn take_bell(&self) -> bool {
+        self.ivars().grid.borrow_mut().take_bell()
     }
 
     /// The shell's last reported title (OSC 0/1/2); empty when it has never set one.
@@ -789,6 +804,7 @@ impl TermView {
             }
         }
         if dirty {
+            self.ivars().output_seq.set(self.ivars().output_seq.get().wrapping_add(1));
             // Output means the cursor is where the eye is: show it, whatever half of the blink
             // cycle the timer left it in.
             settings::show_cursor_phase();
