@@ -16,6 +16,7 @@ use objc2::runtime::AnyObject;
 use objc2::{msg_send, msg_send_id};
 use objc2_app_kit::{
     NSAlert, NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+    NSModalResponseOK, NSSavePanel,
     NSAnimationContext, NSAutoresizingMaskOptions, NSView, NSWindow, NSWindowButton,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
@@ -30,12 +31,22 @@ use crate::settings;
 use crate::settings_dialog::SettingsDialog;
 use crate::sidebar::{SidebarView, MAX_SIDEBAR_W, MIN_SIDEBAR_W, SIDEBAR_W};
 use crate::theme;
-use crate::toggle::{ToggleButton, TOGGLE_W};
+use crate::toggle::{StripButton, TOGGLE_W};
+use crate::toolbar::Toolbar;
 use crate::view::{self, TermView};
 
 /// Duration of the sidebar collapse/expand slide. Matches the pace of the system's own sidebar
 /// animations — long enough to read as motion, short enough not to sit in the way.
 const SIDEBAR_ANIM: f64 = 0.22;
+
+/// Where the session name starts, measured from the terminal's own left edge.
+const TITLE_INSET: f64 = 16.0;
+
+/// Right edge of the toolbar's buttons (collapse + search), in window coordinates. AppKit places
+/// the items itself — leading edge of the toolbar, just past the traffic lights — so this is
+/// measured off a screenshot rather than derived, and it is what the session title has to clear
+/// whenever the sidebar is not sitting between the two.
+const TOOLBAR_ITEMS_RIGHT_X: f64 = 170.0;
 
 /// Half-period of the cursor blink, in milliseconds: the phase flips on every tick, so the cursor
 /// completes a cycle in twice this. Matches the pace of the system's own text carets.
@@ -210,8 +221,15 @@ pub struct AppController {
     sidebar: Retained<SidebarView>,
     card: Retained<NSView>, // floating rounded panel the sidebar is mounted in (see card.rs)
     host: Retained<NSView>,
-    toggle_btn: Retained<ToggleButton>,
+    // The card's own top-strip buttons (see toggle.rs): search, then collapse.
+    search_btn: Retained<StripButton>,
+    toggle_btn: Retained<StripButton>,
     divider: Retained<Divider>,
+    // The *collapsed* state's sidebar button, as a native toolbar item — while the sidebar is
+    // showing, `toggle_btn` above is the one on screen instead. `header` below is the theme-colored
+    // band both sit on, and draws the session name (see `toolbar.rs` for why the title is not an
+    // item of its own).
+    toolbar: Toolbar,
     header: Retained<HeaderView>, // terminal-pane header bar (top of host)
     placeholder: Retained<PlaceholderView>, // empty-state view shown when there are no sessions
     style: Cell<usize>,        // index of the current color theme (into theme::names())
@@ -226,6 +244,13 @@ pub struct AppController {
     // run when AppKit has *not* reset the frames — offsetting the live x would then accumulate and
     // walk the buttons across the title bar, so they are always placed from this baseline.
     light_x0: Cell<Option<[f64; 3]>>,
+    // Where the window was when it was last saved, read out of the config by `bootstrap` and put
+    // down by `place_window`. None (an older config, or a first run) means "center it".
+    saved_origin: Cell<Option<NSPoint>>,
+    // The tab that was active before the current one, for ⌘~. Written by `select` only when the
+    // selection actually moves, so repeatedly selecting the same tab cannot make it point at itself
+    // and turn the shortcut into a no-op.
+    prev_active: Cell<Option<u64>>,
     animating: Cell<bool>, // a collapse/expand is in flight: frame changes animate instead of snapping
     settings_dialog: RefCell<Option<Retained<SettingsDialog>>>, // lazily built settings panel
     blink_timer: RefCell<Option<view::TimerToken>>, // running only while the cursor blinks
@@ -243,12 +268,18 @@ impl AppController {
         sidebar: Retained<SidebarView>,
         card: Retained<NSView>,
         host: Retained<NSView>,
-        toggle_btn: Retained<ToggleButton>,
+        search_btn: Retained<StripButton>,
+        toggle_btn: Retained<StripButton>,
         divider: Retained<Divider>,
     ) -> Rc<Self> {
-        // Terminal-pane header bar: pinned to the top of host, full width. It spans the terminal
-        // rather than the window, so the title starts at the terminal's own left edge — the
-        // sidebar's top strip belongs to the sidebar, and holds the traffic lights and the toggle.
+        // The window's toolbar: the sidebar button, placed by AppKit at the leading edge of the
+        // title-bar band. Attached before anything is laid out, since its band is what `band_h`
+        // measures and every frame below the top strip starts under it.
+        let toolbar = Toolbar::attach(mtm, &window);
+        // The band it sits on: pinned to the top of host, full width. It paints the terminal's
+        // background under the toolbar and draws the session title, so it spans the terminal rather
+        // than the window — the title starts at the terminal's own left edge, and the sidebar's own
+        // top strip is the card's, holding the traffic lights.
         let hb = host.bounds();
         let header = HeaderView::new(
             mtm,
@@ -276,8 +307,10 @@ impl AppController {
             sidebar,
             card,
             host,
+            search_btn,
             toggle_btn,
             divider,
+            toolbar,
             header,
             placeholder,
             style: Cell::new(0),
@@ -286,14 +319,17 @@ impl AppController {
             sidebar_right: Cell::new(false),
             last_window_title: RefCell::new(String::new()),
             light_x0: Cell::new(None),
+            saved_origin: Cell::new(None),
+            prev_active: Cell::new(None),
             animating: Cell::new(false),
             settings_dialog: RefCell::new(None),
             blink_timer: RefCell::new(None),
             state_timer: RefCell::new(None),
             mtm,
         });
-        // The sidebar / toggle button / divider get the controller's raw pointer (the controller lives in an Rc, so its address is stable).
+        // The sidebar / strip buttons / divider get the controller's raw pointer (the controller lives in an Rc, so its address is stable).
         c.sidebar.set_controller(Rc::as_ptr(&c));
+        c.search_btn.set_controller(Rc::as_ptr(&c));
         c.toggle_btn.set_controller(Rc::as_ptr(&c));
         c.divider.set_controller(Rc::as_ptr(&c));
         c
@@ -325,6 +361,13 @@ impl AppController {
         self.set_sidebar_width(w);
     }
 
+    /// Point the toolbar's sidebar button at the menu target, which is what implements
+    /// `toggleSidebar:`. Called from `main` once that object exists — the toolbar is built with the
+    /// window, well before it.
+    pub fn set_toolbar_target(&self, target: &objc2::runtime::AnyObject) {
+        self.toolbar.set_target(target);
+    }
+
     /// Persist the current layout (called when a divider drag ends).
     pub fn save_layout(&self) {
         self.save();
@@ -345,14 +388,14 @@ impl AppController {
     }
 
     /// Centerline the top strip sits on, as a distance from the window's top edge — traffic lights,
-    /// collapse toggle, and header title all share it, so the row reads as one line.
+    /// toolbar toggle and session title all share it, so the row reads as one line.
     ///
-    /// Measured for the card, which starts CARD_INSET below the window's top edge: this centers
-    /// the cluster in the part of the band the card actually covers, instead of letting it ride
-    /// the card's rounded top edge. It is deliberately **not** conditional on whether the card is
-    /// currently showing — see [`Self::reposition_traffic_lights`].
+    /// The toolbar owns that row now, and it centers its items in the band, so this follows the
+    /// band rather than leading it: the lights and the title are placed onto the line the system
+    /// already put the toggle on. [`Self::band_h`]'s fallback is what makes the `unwrap`-free
+    /// arithmetic safe before the window can report a band at all.
     fn titlebar_center_y(&self) -> f64 {
-        (CARD_INSET + HEADER_H) / 2.0
+        self.band_h() / 2.0
     }
 
     /// x of the right edge of the traffic-light cluster, in window coordinates. AppKit lays the
@@ -445,9 +488,11 @@ impl AppController {
         if let Some(ap) = NSAppearance::appearanceNamed(name) {
             let _: () = unsafe { msg_send![&*self.window, setAppearance: &*ap] };
         }
-        // The card's fill/border/shadow live on a layer, so they hold concrete colors and have to
-        // be repainted here rather than re-read during a `drawRect:`.
+        // The card's fill/border/shadow live on a layer, and the toolbar's icons are baked images,
+        // so both hold concrete colors and have to be repainted here rather than re-read during a
+        // `drawRect:`.
         card::apply_theme(&self.card);
+        self.toolbar.apply_theme();
     }
 
     /// Set `view`'s frame — animated while a sidebar collapse/expand is in flight, instant
@@ -525,46 +570,113 @@ impl AppController {
                     NSSize::new(DIVIDER_W, fh),
                 ));
             }
+            // The band the toolbar's items sit on spans the terminal, and its height is the
+            // system's — see `band_h`, which reads it back off the window rather than assume it.
+            let hb = self.host.bounds();
+            let band = self.band_h();
+            self.header.setFrame(NSRect::new(
+                NSPoint::new(0.0, hb.size.height - band),
+                NSSize::new(hb.size.width, band),
+            ));
             // Top strip, arranged the way the system's sidebar apps do it: traffic lights at the
-            // sidebar's top-left, collapse toggle at its top-right, and the terminal's title at the
-            // terminal's own left edge. Collapsed, the sidebar is gone, so the toggle joins the
-            // lights at the window's top-left and the title moves clear of both.
+            // sidebar's top-left, its collapse button at the far end of the same strip, and the
+            // terminal's title at the terminal's own left edge.
+            //
+            // The two collapse buttons are deliberately separate. Expanded, the card carries its
+            // own (`toggle.rs`) and it rides the card: parked with it, it slides off screen instead
+            // of blinking away. Collapsed, there is no card to carry anything, so the toolbar's
+            // button (`toolbar.rs`) takes over, immediately left of the title.
             let (tw, th) = (TOGGLE_W + 12.0, TOGGLE_W);
-            let icon = 17.0; // toggle glyph size (see toggle.rs); centered within the button
-            let icon_pad = (tw - icon) / 2.0;
-            let gap = 14.0;
-            let (tx, title_inset) = if self.collapsed.get() {
-                let icon_left = self.lights_right_x() + gap;
-                (icon_left - icon_pad, icon_left + icon + gap)
+            let anchor = if self.collapsed.get() { parked } else { card };
+            // Search sits immediately left of the collapse button, the pair anchored to the end of
+            // the strip furthest from the traffic lights. Docked right, that end is the card's left
+            // one, so the pair mirrors onto it — and their order mirrors with it, keeping collapse
+            // outermost and search next to the list it filters.
+            let (sx, tx) = if right {
+                (anchor.origin.x + 8.0 + tw, anchor.origin.x + 8.0)
+            } else {
+                (anchor.origin.x + w - 2.0 * tw - 8.0, anchor.origin.x + w - tw - 8.0)
+            };
+            let cy = self.titlebar_center_y();
+            // Snapped to whole points. The buttons' content is a hairline symbol, and `draw_symbol`
+            // can only align it within the view's own coordinates — a frame at a half point moves
+            // the whole grid with it and every stroke goes back to straddling two pixels.
+            let y = (fh - cy - th / 2.0).round();
+            for (btn, x) in [(&self.search_btn, sx), (&self.toggle_btn, tx)] {
+                self.set_frame_maybe_animated(
+                    btn,
+                    NSRect::new(NSPoint::new(x.round(), y), NSSize::new(tw, th)),
+                );
+            }
+            self.toolbar.set_shown(self.collapsed.get());
+            let title_inset = if self.collapsed.get() {
+                // The toolbar's button now sits between the lights and the title.
+                TOOLBAR_ITEMS_RIGHT_X + 12.0
             } else if right {
                 // Sidebar docked right: the terminal is on the left, so the traffic lights sit at
                 // the window's top-left over the header — the title must clear them.
-                (card.origin.x + 8.0, self.lights_right_x() + gap)
+                self.lights_right_x() + 14.0
             } else {
-                (card.origin.x + w - tw - 8.0, 16.0)
+                TITLE_INSET
             };
-            let cy = self.titlebar_center_y();
-            // Snapped to whole points. The button's content is a hairline symbol, and `draw_symbol`
-            // can only align it within the view's own coordinates — a frame at a half point moves
-            // the whole grid with it and every stroke goes back to straddling two pixels. Collapsed
-            // is where this bites: that x is the traffic lights' edge plus a gap, minus the half-point
-            // pad that centers a 17pt glyph in a 34pt button.
-            self.set_frame_maybe_animated(
-                &self.toggle_btn,
-                NSRect::new(
-                    NSPoint::new(tx.round(), (fh - cy - th / 2.0).round()),
-                    NSSize::new(tw, th),
-                ),
-            );
             self.header.set_left_inset(title_inset);
             self.header.set_center_y(cy);
             self.card.setNeedsDisplay(true);
             self.sidebar.setNeedsDisplay(true);
+            self.search_btn.setNeedsDisplay(true);
             self.toggle_btn.setNeedsDisplay(true);
+            self.header.setNeedsDisplay(true);
         }
-        // The lights share that centerline, and shift with the card, so any layout change can
-        // invalidate their position.
+        // The lights share the toolbar's centerline and shift with the card, so any layout change
+        // can invalidate their position.
+        self.sync_top_strip();
+    }
+
+    /// The window delegate's hook for every event that relays the title-bar band out: a resize, the
+    /// window becoming key, its first exposure. AppKit puts the traffic lights back at its own
+    /// coordinates on each of those, so they have to be re-placed after it.
+    pub fn sync_top_strip(&self) {
         self.reposition_traffic_lights();
+    }
+
+    /// Put the window where it was left, or center it when there is nothing to restore.
+    ///
+    /// Called from `main` once, in place of the `center()` it used to do unconditionally. macOS's
+    /// own window restoration is deliberately off (`setRestorable: false` — it would override the
+    /// contentRect we just set), so without this the window is re-centered on every launch, and
+    /// "centered" means *the screen that happens to be active*, which on a multi-display setup is
+    /// not reliably the one it was on.
+    ///
+    /// A restored position is only trusted if the window lands on a screen that still exists:
+    /// displays get unplugged, and a frame that intersects nothing would put the window somewhere
+    /// the user cannot reach it. `NSWindow::screen` is the check — it answers None for a window on
+    /// no screen at all.
+    pub fn place_window(&self) {
+        let Some(origin) = self.saved_origin.get() else {
+            self.window.center();
+            return;
+        };
+        unsafe { self.window.setFrameOrigin(origin) };
+        if self.window.screen().is_none() {
+            self.window.center();
+        }
+    }
+
+    /// Height of the title-bar band, read back off the window: with a toolbar attached this is the
+    /// system's, not ours, and everything below it (the terminal, the empty-state placeholder) has
+    /// to start under it or the toolbar's items would sit over the first row of output.
+    ///
+    /// `contentLayoutRect` is the content view minus that band. It falls back to [`HEADER_H`] while
+    /// the window has no content view yet, and is clamped because a full-screen window reports no
+    /// band at all — the terminal would then run under the notch/menu bar on the way in.
+    fn band_h(&self) -> f64 {
+        let Some(cv) = self.window.contentView() else { return HEADER_H };
+        let band = cv.bounds().size.height - unsafe { self.window.contentLayoutRect() }.size.height;
+        if band.is_finite() && (8.0..=200.0).contains(&band) {
+            band
+        } else {
+            HEADER_H
+        }
     }
 
     /// The title bar always shows the current active tab's name; falls back to "TabT" when there is no active tab.
@@ -625,7 +737,6 @@ impl AppController {
         // The sidebar width/position must be set before spawning tabs and computing host dimensions.
         self.sidebar_w.set(cfg.sidebar_w.clamp(MIN_SIDEBAR_W, MAX_SIDEBAR_W));
         self.sidebar_right.set(cfg.sidebar_right);
-        settings::set_show_border(cfg.show_border);
         // Terminal/shell preferences: padding feeds `dims()` below, and scrollback/shell are read
         // by each `spawn_tab`, so all of it has to be in place before the tabs are restored.
         settings::set_cursor_shape(cfg.cursor_shape);
@@ -642,8 +753,13 @@ impl AppController {
         if cfg.window_w > 0.0 && cfg.window_h > 0.0 {
             let sz = NSSize::new(cfg.window_w.clamp(480.0, 6000.0), cfg.window_h.clamp(320.0, 4000.0));
             self.window.setContentSize(sz);
-            self.window.center();
         }
+        // The position is applied by `place_window`, from `main`, after the menus are built — a
+        // `center()` there would otherwise undo whatever this put down.
+        self.saved_origin.set(match (cfg.window_x, cfg.window_y) {
+            (Some(x), Some(y)) => Some(NSPoint::new(x, y)),
+            _ => None,
+        });
         self.relayout();
         // Spawn ungrouped tabs first (rendered at the top), then each group. A tab that fails to
         // spawn (e.g. the system is out of file descriptors) is silently skipped — restore
@@ -692,7 +808,7 @@ impl AppController {
     fn dims(&self) -> (usize, usize) {
         let b = self.host.bounds();
         let w = b.size.width - 2.0 * settings::pad();
-        let h = b.size.height - HEADER_H - 2.0 * settings::pad();
+        let h = b.size.height - self.band_h() - 2.0 * settings::pad();
         let cols = ((w / settings::cell_w()).floor() as i64).max(1) as usize;
         let rows = ((h / settings::line_h()).floor() as i64).max(1) as usize;
         (cols, rows)
@@ -755,6 +871,9 @@ impl AppController {
             if !m.tabs.iter().any(|t| t.id == id) {
                 return;
             }
+            if m.active != Some(id) {
+                self.prev_active.set(m.active);
+            }
             m.active = Some(id);
             // Looking at a session is what "seen" means, so its marks clear here. `last_seq` is
             // resynced at the same time: without that, output produced while it was in the
@@ -776,6 +895,19 @@ impl AppController {
         self.refresh_sidebar();
         self.update_title();
         self.update_header();
+    }
+
+    /// ⌘~: back to the session you were in before this one, and pressing it again returns — because
+    /// `select` records the outgoing tab as it goes, so the pair swaps each time.
+    ///
+    /// Does nothing when there is nothing to go back to, or when that tab has since been closed;
+    /// silently, since the shortcut is a convenience and an alert for "you have only opened one
+    /// session" would be worse than the no-op.
+    pub fn select_recent_tab(&self) {
+        let Some(prev) = self.prev_active.get() else { return };
+        if self.model.borrow().tabs.iter().any(|t| t.id == prev) {
+            self.select(prev);
+        }
     }
 
     /// Click the already-selected tab → deselect it; any other tab → select it.
@@ -818,11 +950,11 @@ impl AppController {
             Some(a) => a,
             None => return,
         };
-        // Terminal fills the host below the header bar (host is non-flipped: y=0 is the bottom).
+        // Terminal fills the host below the title-bar band (host is non-flipped: y=0 is the bottom).
         let hb = self.host.bounds();
         let bounds = NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(hb.size.width, (hb.size.height - HEADER_H).max(0.0)),
+            NSSize::new(hb.size.width, (hb.size.height - self.band_h()).max(0.0)),
         );
         unsafe { self.placeholder.removeFromSuperview() }; // hide the empty-state view when a session is active
         for t in &m.tabs {
@@ -847,7 +979,7 @@ impl AppController {
         let hb = self.host.bounds();
         let frame = NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(hb.size.width, (hb.size.height - HEADER_H).max(0.0)),
+            NSSize::new(hb.size.width, (hb.size.height - self.band_h()).max(0.0)),
         );
         unsafe {
             self.placeholder.setFrame(frame);
@@ -1402,7 +1534,7 @@ impl AppController {
                 unsafe { tab.view.setNeedsDisplay(true) };
             }
         }
-        unsafe { self.header.setNeedsDisplay(true) }; // header bg tracks the terminal color
+        unsafe { self.header.setNeedsDisplay(true) }; // header bg + title track the terminal color
         unsafe { self.placeholder.setNeedsDisplay(true) }; // empty-state colors track the theme too
         self.refresh_sidebar();
         self.save();
@@ -1585,14 +1717,6 @@ impl AppController {
         }
     }
 
-    /// Toggle whether the sidebar/header separator borders are drawn (Settings → Border).
-    pub fn set_show_border(&self, on: bool) {
-        settings::set_show_border(on);
-        self.refresh_sidebar();
-        unsafe { self.header.setNeedsDisplay(true) };
-        self.save();
-    }
-
     /// Set the global font size to an absolute value (used by the settings dialog).
     pub fn set_font_size(&self, size: f64) {
         settings::set(&settings::family(), size);
@@ -1697,6 +1821,48 @@ impl AppController {
         }
     }
 
+    /// Shell → Export Text: write the active session's whole buffer — scrollback and screen — to a
+    /// file the user picks.
+    ///
+    /// The panel is run modally, which pumps its own run loop: every PTY reader and both GCD timers
+    /// keep firing underneath it, so the text is taken *before* it opens rather than after. What is
+    /// saved is then what was on screen when the user asked, not whatever the shell printed while
+    /// they were picking a folder.
+    pub fn export_active_text(&self) {
+        let Some((text, name)) = ({
+            let m = self.model.borrow();
+            m.active
+                .and_then(|a| m.tabs.iter().find(|t| t.id == a))
+                .map(|t| (t.view.text(), config::sanitize_label(&t.display_title())))
+        }) else {
+            return;
+        };
+        let panel = unsafe { NSSavePanel::savePanel(self.mtm) };
+        unsafe {
+            let stem = if name.trim().is_empty() { "session".to_string() } else { name };
+            panel.setNameFieldStringValue(&NSString::from_str(&format!("{stem}.txt")));
+            if panel.runModal() != NSModalResponseOK {
+                return;
+            }
+        }
+        let Some(url) = (unsafe { panel.URL() }) else { return };
+        let Some(path) = (unsafe { url.path() }) else { return };
+        if let Err(e) = std::fs::write(path.to_string(), text) {
+            self.alert_export_failed(&e.to_string());
+        }
+    }
+
+    /// The export could not be written (a read-only volume, a full disk). Worth an alert rather than
+    /// a silent no-op: the user asked for a file and would otherwise go looking for one.
+    fn alert_export_failed(&self, why: &str) {
+        let alert = unsafe { NSAlert::new(self.mtm) };
+        unsafe {
+            alert.setMessageText(&NSString::from_str("Could not export the session"));
+            alert.setInformativeText(&NSString::from_str(why));
+            alert.runModal();
+        }
+    }
+
     /// Open the active tab's current directory in Finder.
     pub fn reveal_in_finder(&self) {
         if let Some(a) = self.model.borrow().active {
@@ -1721,11 +1887,31 @@ impl AppController {
     }
 
     /// Clear the screen (⌘K).
+    /// Type `cmd` into the active session and run it — what the toolbar's `claude` / `codex`
+    /// buttons do. Deliberately the same as typing it: the shell resolves the name on `$PATH`, and
+    /// if something is already running there the text lands in that program, exactly as it would
+    /// from the keyboard.
+    pub fn run_in_active(&self, cmd: &str) {
+        let m = self.model.borrow();
+        if let Some(a) = m.active {
+            if let Some(tab) = m.tabs.iter().find(|t| t.id == a) {
+                tab.view.send(format!("{cmd}\r").as_bytes());
+            }
+        }
+    }
+
+    /// Clear the active terminal — by asking the *shell* to, with a `^L`, not by blanking the grid.
+    ///
+    /// Wiping the grid directly (`\e[2J\e[H`, which is what this used to do) leaves the shell
+    /// believing its prompt is still on screen: the line is gone, the cursor is at the top, and
+    /// nothing comes back until the next Return. `^L` is what every terminal's clear is, and every
+    /// program knows it — the shell repaints its prompt at the top of the cleared screen, and a
+    /// full-screen application redraws itself instead, which is the right answer for both.
     pub fn clear_active(&self) {
         let m = self.model.borrow();
         if let Some(a) = m.active {
             if let Some(tab) = m.tabs.iter().find(|t| t.id == a) {
-                tab.view.clear();
+                tab.view.send(b"\x0c");
             }
         }
     }
@@ -1775,6 +1961,10 @@ impl AppController {
             .collect();
         drop(m);
         let (window_w, window_h) = self.window_size();
+        // Read at save time rather than tracked as the window moves: `windowDidMove:` fires per
+        // frame of a drag, and this rewrites the whole file. Every layout change saves, and so does
+        // quitting, which is what a restored position actually has to survive.
+        let origin = self.window.frame().origin;
         config::save(
             &config::Settings {
                 style: theme::name_of(self.style.get()),
@@ -1782,9 +1972,10 @@ impl AppController {
                 font_size: settings::size(),
                 sidebar_w: self.sidebar_w.get(),
                 sidebar_right: self.sidebar_right.get(),
-                show_border: settings::show_border(),
                 window_w,
                 window_h,
+                window_x: Some(origin.x),
+                window_y: Some(origin.y),
                 cursor_shape: settings::cursor_shape(),
                 cursor_blink: settings::cursor_blink(),
                 scrollback: settings::scrollback(),

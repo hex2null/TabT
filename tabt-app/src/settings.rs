@@ -149,14 +149,6 @@ thread_local! {
     static NEW_TAB_DIR: Cell<NewTabDir> = const { Cell::new(NewTabDir::Active) };
 }
 
-/// Whether the sidebar/header separator borders are drawn.
-pub fn show_border() -> bool {
-    SHOW_BORDER.with(|c| c.get())
-}
-pub fn set_show_border(v: bool) {
-    SHOW_BORDER.with(|c| c.set(v));
-}
-
 /// How the text cursor is drawn.
 pub fn cursor_shape() -> CursorShape {
     CURSOR_SHAPE.with(|c| c.get())

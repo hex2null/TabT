@@ -1719,6 +1719,34 @@ impl Grid {
     }
 
     /// For dumb rendering / tests: export as per-row text (with trailing whitespace stripped).
+    /// The whole buffer as text — the scrollback first, then the screen — one line per row, with
+    /// each line's trailing blanks removed and the blank rows below the last content dropped.
+    ///
+    /// Addressed through `buf_cell`, so it covers exactly what the user can scroll back to, and
+    /// exactly what a selection can reach. The alternate screen has no history, so there this is
+    /// just what is on screen — which is right: vim's buffer is vim's to save, not the terminal's.
+    pub fn buf_text(&self) -> String {
+        let mut lines: Vec<String> = (self.buf_top()..self.scrolled + self.rows)
+            .map(|row| {
+                (0..self.cols)
+                    .map(|col| self.buf_cell(col, row).ch)
+                    .filter(|&ch| ch != '\0') // drop wide-char trailer placeholders
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        // A screen is mostly empty below the prompt; exporting that as fifty blank lines is noise.
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let mut out = lines.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn to_lines(&self) -> Vec<String> {
         (0..self.rows)
             .map(|r| {
@@ -1767,6 +1795,19 @@ fn hex_digit(b: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn buf_text_exports_scrollback_then_screen_without_trailing_blanks() {
+        let mut g = Grid::new(10, 3);
+        g.set_history_max(100);
+        for line in ["one", "two", "three", "four", "five"] {
+            g.feed(line.as_bytes());
+            g.feed(b"\r\n");
+        }
+        // Five lines through a three-row screen: the first three scrolled into history, and the
+        // rows left blank under the cursor must not come out as empty lines.
+        assert_eq!(g.buf_text(), "one\ntwo\nthree\nfour\nfive\n");
+    }
+
     use super::*;
 
     #[test]

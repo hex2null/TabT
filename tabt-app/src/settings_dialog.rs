@@ -16,9 +16,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSPopUpButton,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSPopUpButton,
     NSScrollView, NSSegmentedControl,
-    NSSegmentStyle, NSStepper, NSTabView, NSTabViewItem, NSTabViewType, NSTextField, NSView,
+    NSSegmentStyle, NSSlider, NSTabView, NSTabViewItem, NSTabViewType, NSTextAlignment, NSTextField, NSView,
     NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
@@ -53,6 +53,12 @@ const LABEL_X: f64 = 26.0;
 const LABEL_W: f64 = 100.0;
 const CTRL_X: f64 = 134.0;
 const CTRL_W: f64 = 250.0;
+/// Width of the number shown beside a slider, at the right end of the control column.
+const VALUE_W: f64 = 26.0;
+/// Font-size range the slider covers. The same bounds the text field used to clamp to, so no
+/// existing configuration falls outside what the control can represent.
+const MIN_SIZE: f64 = 8.0;
+const MAX_SIZE: f64 = 40.0;
 
 /// A downward cursor over one pane's rows: `next()` yields the next row's baseline y. Panes are
 /// non-flipped (y grows upward), so it counts down from the top.
@@ -79,12 +85,11 @@ pub struct DialogIvars {
     tabs: RefCell<Option<Retained<NSTabView>>>,
     theme_grid: RefCell<Option<Retained<ThemeGrid>>>,
     fam_pop: RefCell<Option<Retained<NSPopUpButton>>>,
-    size_field: RefCell<Option<Retained<NSTextField>>>,
-    size_stepper: RefCell<Option<Retained<NSStepper>>>,
+    size_slider: RefCell<Option<Retained<NSSlider>>>,
+    size_value: RefCell<Option<Retained<NSTextField>>>,
     side_pop: RefCell<Option<Retained<NSPopUpButton>>>,
-    border_pop: RefCell<Option<Retained<NSPopUpButton>>>,
-    pad_field: RefCell<Option<Retained<NSTextField>>>,
-    pad_stepper: RefCell<Option<Retained<NSStepper>>>,
+    pad_slider: RefCell<Option<Retained<NSSlider>>>,
+    pad_value: RefCell<Option<Retained<NSTextField>>>,
     cursor_pop: RefCell<Option<Retained<NSPopUpButton>>>,
     scrollback_pop: RefCell<Option<Retained<NSPopUpButton>>>,
     scrollback_items: RefCell<Vec<usize>>, // the pop-up's values, in item order
@@ -130,6 +135,18 @@ declare_class!(
     unsafe impl SettingsDialog {
         /// The pane switcher. The tab view itself draws no tabs (see `show`), so this segmented
         /// control is the whole of the switching UI.
+        /// Esc closes the panel. Wired to a hidden button rather than to a responder method: this
+        /// is a plain window, so `cancelOperation:` only reaches whatever control has the keyboard
+        /// (a text field swallows it), and a key equivalent is the one route AppKit checks before
+        /// any of that. The close goes through `performClose:` so `windowWillClose:` still runs and
+        /// the shell field is still committed.
+        #[method(cancelPanel:)]
+        fn cancel_panel(&self, _sender: Option<&AnyObject>) {
+            if let Some(w) = self.ivars().window.borrow().as_ref() {
+                unsafe { w.performClose(None) };
+            }
+        }
+
         #[method(panePicked:)]
         fn pane_picked(&self, sender: &NSSegmentedControl) {
             let idx = unsafe { sender.selectedSegment() };
@@ -147,24 +164,16 @@ declare_class!(
         }
 
         // Stepper arrows: push the new value into the text field, then apply.
-        #[method(sizeStepped:)]
-        fn size_stepped(&self, sender: &NSStepper) {
-            let v = unsafe { sender.doubleValue() };
-            if let Some(f) = self.ivars().size_field.borrow().as_ref() {
-                unsafe { f.setStringValue(&NSString::from_str(&format!("{}", v as i64))) };
+        // Dragged the size slider. Continuous, so this fires per pixel of travel — but the value
+        // it carries is rounded to a whole point and applied only when that lands on a different
+        // one, because applying reflows every tab's grid and re-sends `TIOCSWINSZ`.
+        #[method(sizeChanged:)]
+        fn size_changed(&self, sender: &NSSlider) {
+            let v = unsafe { sender.doubleValue() }.round();
+            self.set_value_label(&self.ivars().size_value, v);
+            if v != settings::size() {
+                self.apply_size(v);
             }
-            self.apply_size(v);
-        }
-
-        // Text field edited (Enter): clamp, sync the stepper, then apply.
-        #[method(sizeEdited:)]
-        fn size_edited(&self, sender: &NSTextField) {
-            let v = unsafe { sender.doubleValue() }.clamp(8.0, 40.0);
-            unsafe { sender.setStringValue(&NSString::from_str(&format!("{}", v as i64))) };
-            if let Some(s) = self.ivars().size_stepper.borrow().as_ref() {
-                unsafe { s.setDoubleValue(v) };
-            }
-            self.apply_size(v);
         }
 
         #[method(sidebarChanged:)]
@@ -175,34 +184,16 @@ declare_class!(
             }
         }
 
-        #[method(borderChanged:)]
-        fn border_changed(&self, sender: &NSPopUpButton) {
-            let shown = unsafe { sender.indexOfSelectedItem() } == 1; // 0 = Hidden, 1 = Shown
-            if let Some(c) = self.controller() {
-                c.set_show_border(shown);
-            }
-        }
-
-        #[method(padStepped:)]
-        fn pad_stepped(&self, sender: &NSStepper) {
-            let v = unsafe { sender.doubleValue() };
-            if let Some(f) = self.ivars().pad_field.borrow().as_ref() {
-                unsafe { f.setStringValue(&NSString::from_str(&format!("{}", v as i64))) };
-            }
-            if let Some(c) = self.controller() {
-                c.set_padding(v);
-            }
-        }
-
-        #[method(padEdited:)]
-        fn pad_edited(&self, sender: &NSTextField) {
-            let v = unsafe { sender.doubleValue() }.clamp(0.0, settings::MAX_PAD);
-            unsafe { sender.setStringValue(&NSString::from_str(&format!("{}", v as i64))) };
-            if let Some(s) = self.ivars().pad_stepper.borrow().as_ref() {
-                unsafe { s.setDoubleValue(v) };
-            }
-            if let Some(c) = self.controller() {
-                c.set_padding(v);
+        // Same shape as the size slider: rounded, and applied only on a real step (padding feeds
+        // `dims()`, so every apply reflows the grid too).
+        #[method(padChanged:)]
+        fn pad_changed(&self, sender: &NSSlider) {
+            let v = unsafe { sender.doubleValue() }.round();
+            self.set_value_label(&self.ivars().pad_value, v);
+            if v != settings::pad() {
+                if let Some(c) = self.controller() {
+                    c.set_padding(v);
+                }
             }
         }
 
@@ -267,12 +258,11 @@ impl SettingsDialog {
             tabs: RefCell::new(None),
             theme_grid: RefCell::new(None),
             fam_pop: RefCell::new(None),
-            size_field: RefCell::new(None),
-            size_stepper: RefCell::new(None),
+            size_slider: RefCell::new(None),
+            size_value: RefCell::new(None),
             side_pop: RefCell::new(None),
-            border_pop: RefCell::new(None),
-            pad_field: RefCell::new(None),
-            pad_stepper: RefCell::new(None),
+            pad_slider: RefCell::new(None),
+            pad_value: RefCell::new(None),
             cursor_pop: RefCell::new(None),
             scrollback_pop: RefCell::new(None),
             scrollback_items: RefCell::new(Vec::new()),
@@ -339,6 +329,19 @@ impl SettingsDialog {
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
 
         let content = window.contentView().expect("content view");
+
+        // Esc → close. A zero-size button parked off the panel's own layout: it is never seen and
+        // never tabbed to, it exists only to carry the key equivalent.
+        let esc: Retained<NSButton> = unsafe {
+            msg_send_id![mtm.alloc::<NSButton>(), initWithFrame: NSRect::new(NSPoint::new(-100.0, -100.0), NSSize::new(1.0, 1.0))]
+        };
+        unsafe {
+            esc.setTitle(&NSString::from_str(""));
+            esc.setKeyEquivalent(&NSString::from_str("\u{1b}"));
+            let _: () = msg_send![&esc, setTarget: self];
+            esc.setAction(Some(sel!(cancelPanel:)));
+            content.addSubview(&esc);
+        }
 
         // ---- Panes: a borderless tab view driven by a segmented control ----
         // `NSNoTabsNoBorder` drops both the tab strip and the box AppKit draws around the content;
@@ -415,31 +418,24 @@ impl SettingsDialog {
         let fam_pop = self.make_popup(settings::FAMILIES.iter().copied(), y - 3.0, sel!(fontFamilyChanged:), mtm);
         unsafe { pane.addSubview(&fam_pop) };
 
-        // Font size: editable field + stepper.
+        // Font size: a slider over the range the app accepts, with the value beside it.
         let y = rows.next();
         add_label(&pane, "Size", y, mtm);
-        let (field, stepper) =
-            self.make_number_row(&pane, y, 8.0, 40.0, sel!(sizeEdited:), sel!(sizeStepped:), mtm);
-        *self.ivars().size_field.borrow_mut() = Some(field);
-        *self.ivars().size_stepper.borrow_mut() = Some(stepper);
+        let (slider, value) = self.make_slider_row(&pane, y, MIN_SIZE, MAX_SIZE, sel!(sizeChanged:), mtm);
+        *self.ivars().size_slider.borrow_mut() = Some(slider);
+        *self.ivars().size_value.borrow_mut() = Some(value);
 
         let y = rows.next();
         add_label(&pane, "Sidebar", y, mtm);
         let side_pop = self.make_popup(["Left", "Right"].into_iter(), y - 3.0, sel!(sidebarChanged:), mtm);
         unsafe { pane.addSubview(&side_pop) };
 
-        let y = rows.next();
-        add_label(&pane, "Border", y, mtm);
-        let border_pop = self.make_popup(["Hidden", "Shown"].into_iter(), y - 3.0, sel!(borderChanged:), mtm);
-        unsafe { pane.addSubview(&border_pop) };
-
         // Padding: the inset around the terminal text, in points.
         let y = rows.next();
         add_label(&pane, "Padding", y, mtm);
-        let (pad_field, pad_stepper) =
-            self.make_number_row(&pane, y, 0.0, settings::MAX_PAD, sel!(padEdited:), sel!(padStepped:), mtm);
-        *self.ivars().pad_field.borrow_mut() = Some(pad_field);
-        *self.ivars().pad_stepper.borrow_mut() = Some(pad_stepper);
+        let (pad_slider, pad_value) = self.make_slider_row(&pane, y, 0.0, settings::MAX_PAD, sel!(padChanged:), mtm);
+        *self.ivars().pad_slider.borrow_mut() = Some(pad_slider);
+        *self.ivars().pad_value.borrow_mut() = Some(pad_value);
 
         // Opacity: the background alpha, in whole percent.
         let y = rows.next();
@@ -453,7 +449,6 @@ impl SettingsDialog {
         // Remember the control references we need to re-seed later.
         *self.ivars().fam_pop.borrow_mut() = Some(fam_pop);
         *self.ivars().side_pop.borrow_mut() = Some(side_pop);
-        *self.ivars().border_pop.borrow_mut() = Some(border_pop);
         pane
     }
 
@@ -557,40 +552,47 @@ impl SettingsDialog {
     }
 
     /// An editable number field plus its stepper, both wired to this dialog, added to `pane`.
-    fn make_number_row(
+    /// A slider plus the number it is on: `[====|=======] 13`.
+    ///
+    /// The slider is continuous (the terminal follows the drag, which is the point of using one
+    /// here) and unsnapped: tick marks for a 30-step range draw as a comb under the control, so the
+    /// rounding lives in the action instead.
+    fn make_slider_row(
         &self,
         pane: &NSView,
         y: f64,
         min: f64,
         max: f64,
-        field_action: objc2::runtime::Sel,
-        stepper_action: objc2::runtime::Sel,
+        action: objc2::runtime::Sel,
         mtm: MainThreadMarker,
-    ) -> (Retained<NSTextField>, Retained<NSStepper>) {
-        let field: Retained<NSTextField> = unsafe {
-            msg_send_id![mtm.alloc::<NSTextField>(), initWithFrame: NSRect::new(
-                NSPoint::new(CTRL_X, y - 2.0), NSSize::new(52.0, 22.0))]
+    ) -> (Retained<NSSlider>, Retained<NSTextField>) {
+        let slider: Retained<NSSlider> = unsafe {
+            msg_send_id![mtm.alloc::<NSSlider>(), initWithFrame: NSRect::new(
+                NSPoint::new(CTRL_X, y - 2.0), NSSize::new(CTRL_W - VALUE_W - 8.0, 20.0))]
         };
-        let stepper: Retained<NSStepper> = unsafe {
-            msg_send_id![mtm.alloc::<NSStepper>(), initWithFrame: NSRect::new(
-                NSPoint::new(CTRL_X + 58.0, y - 3.0), NSSize::new(19.0, 25.0))]
-        };
+        let value = unsafe { NSTextField::labelWithString(&NSString::from_str(""), mtm) };
         unsafe {
-            field.setEditable(true);
-            field.setBezeled(true);
-            let _: () = msg_send![&field, setTarget: self];
-            field.setAction(Some(field_action));
-            stepper.setMinValue(min);
-            stepper.setMaxValue(max);
-            stepper.setIncrement(1.0);
-            stepper.setValueWraps(false);
-            let _: () = msg_send![&stepper, setTarget: self];
-            stepper.setAction(Some(stepper_action));
-            pane.addSubview(&field);
-            pane.addSubview(&stepper);
+            slider.setMinValue(min);
+            slider.setMaxValue(max);
+            slider.setContinuous(true);
+            let _: () = msg_send![&slider, setTarget: self];
+            slider.setAction(Some(action));
+            value.setFrame(NSRect::new(
+                NSPoint::new(CTRL_X + CTRL_W - VALUE_W, y - 1.0),
+                NSSize::new(VALUE_W, 18.0),
+            ));
+            value.setAlignment(NSTextAlignment::Right);
+            pane.addSubview(&slider);
+            pane.addSubview(&value);
         }
-        commit_on_end_editing(&field);
-        (field, stepper)
+        (slider, value)
+    }
+
+    /// Write a slider's current number into the label beside it.
+    fn set_value_label(&self, label: &RefCell<Option<Retained<NSTextField>>>, v: f64) {
+        if let Some(l) = label.borrow().as_ref() {
+            unsafe { l.setStringValue(&NSString::from_str(&format!("{}", v as i64))) };
+        }
     }
 
     /// Build a pop-up button filled with `titles`, wired to `action`, positioned at `y`.
@@ -614,27 +616,16 @@ impl SettingsDialog {
         pop
     }
 
-    /// Apply whatever is currently typed in the text fields, skipping values that already match —
-    /// the size and padding setters reflow every grid and re-send `TIOCSWINSZ`, which is not
-    /// something to do on every close for no change.
+    /// Apply whatever is currently typed in the text fields, skipping values that already match.
+    ///
+    /// Only the shell is left to commit: size and padding are sliders now, and a slider has no
+    /// uncommitted state — it applies as it moves.
     fn commit_fields(&self) {
         let store = self.ivars();
         let ctrl = match self.controller() {
             Some(c) => c,
             None => return,
         };
-        if let Some(f) = store.size_field.borrow().as_ref() {
-            let v = unsafe { f.doubleValue() }.clamp(8.0, 40.0);
-            if v != settings::size() {
-                ctrl.set_font_size(v);
-            }
-        }
-        if let Some(f) = store.pad_field.borrow().as_ref() {
-            let v = unsafe { f.doubleValue() }.clamp(0.0, settings::MAX_PAD);
-            if v != settings::pad() {
-                ctrl.set_padding(v);
-            }
-        }
         if let Some(f) = store.shell_field.borrow().as_ref() {
             let path = unsafe { f.stringValue() }.to_string();
             if path.trim() != settings::shell() {
@@ -660,25 +651,18 @@ impl SettingsDialog {
             }
         }
         let size = settings::size();
-        if let Some(f) = store.size_field.borrow().as_ref() {
-            unsafe { f.setStringValue(&NSString::from_str(&format!("{}", size as i64))) };
-        }
-        if let Some(s) = store.size_stepper.borrow().as_ref() {
+        if let Some(s) = store.size_slider.borrow().as_ref() {
             unsafe { s.setDoubleValue(size) };
         }
+        self.set_value_label(&store.size_value, size);
         if let Some(p) = store.side_pop.borrow().as_ref() {
             unsafe { p.selectItemAtIndex(if ctrl.sidebar_on_right() { 1 } else { 0 }) };
         }
-        if let Some(p) = store.border_pop.borrow().as_ref() {
-            unsafe { p.selectItemAtIndex(if settings::show_border() { 1 } else { 0 }) };
-        }
         let pad = settings::pad();
-        if let Some(f) = store.pad_field.borrow().as_ref() {
-            unsafe { f.setStringValue(&NSString::from_str(&format!("{}", pad as i64))) };
-        }
-        if let Some(s) = store.pad_stepper.borrow().as_ref() {
+        if let Some(s) = store.pad_slider.borrow().as_ref() {
             unsafe { s.setDoubleValue(pad) };
         }
+        self.set_value_label(&store.pad_value, pad);
         if let Some(p) = store.cursor_pop.borrow().as_ref() {
             unsafe { p.selectItemAtIndex(settings::cursor_shape().index() as isize) };
         }

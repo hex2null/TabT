@@ -70,9 +70,37 @@ declare_class!(
         fn toggle_sidebar(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.toggle_sidebar());
         }
+
+        // The toolbar's sidebar button (see `toolbar.rs`) targets this object. Its one action is
+        // always available — there is no state in which collapsing or expanding is meaningless —
+        // so validation is a plain yes rather than the default per-selector check.
+        #[method(validateToolbarItem:)]
+        fn validate_toolbar_item(&self, _item: Option<&AnyObject>) -> bool {
+            true
+        }
         #[method(renameSession:)]
         fn rename_session(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.rename_active_tab());
+        }
+        #[method(lastSession:)]
+        fn last_session(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.select_recent_tab());
+        }
+        #[method(goHome:)]
+        fn go_home(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("cd ~"));
+        }
+        #[method(runClaude:)]
+        fn run_claude(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("claude"));
+        }
+        #[method(runCodex:)]
+        fn run_codex(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("codex"));
+        }
+        #[method(exportText:)]
+        fn export_text(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.export_active_text());
         }
         #[method(revealInFinder:)]
         fn reveal_in_finder(&self, _s: Option<&AnyObject>) {
@@ -124,19 +152,19 @@ declare_class!(
         // As the window delegate: re-center the traffic lights after macOS relays them out on resize.
         #[method(windowDidResize:)]
         fn window_did_resize(&self, _n: Option<&AnyObject>) {
-            self.with(|c| c.reposition_traffic_lights());
+            self.with(|c| c.sync_top_strip());
         }
 
         // Cold start: the one-shot call in main runs before AppKit finalizes the button layout, which
         // then resets them. Re-apply once the window is shown/keyed so they land centered on first launch.
         #[method(windowDidBecomeKey:)]
         fn window_did_become_key(&self, _n: Option<&AnyObject>) {
-            self.with(|c| c.reposition_traffic_lights());
+            self.with(|c| c.sync_top_strip());
         }
 
         #[method(windowDidExpose:)]
         fn window_did_expose(&self, _n: Option<&AnyObject>) {
-            self.with(|c| c.reposition_traffic_lights());
+            self.with(|c| c.sync_top_strip());
         }
     }
 );
@@ -246,7 +274,11 @@ pub fn build_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarge
     shell.addItem(&NSMenuItem::separatorItem(mtm));
     add(mtm, &shell, "Rename Session", Some(sel!(renameSession:)), Some(target), "r", false);
     add(mtm, &shell, "Reveal in Finder", Some(sel!(revealInFinder:)), Some(target), "r", true);
+    // ⇧⌘S, the system's own "save a copy of this" shortcut.
+    add(mtm, &shell, "Export Text…", Some(sel!(exportText:)), Some(target), "s", true);
     shell.addItem(&NSMenuItem::separatorItem(mtm));
+    // ⌘~ (that is, ⇧⌘` — the same physical key): flip back to the session you came from.
+    add(mtm, &shell, "Last Session", Some(sel!(lastSession:)), Some(target), "`", true);
     add(mtm, &shell, "Close Tab", Some(sel!(closeTab:)), Some(target), "w", false);
 
     // ---- Edit (target=nil → first responder TermView) ----

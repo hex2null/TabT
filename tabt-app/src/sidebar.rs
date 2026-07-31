@@ -9,6 +9,7 @@
 //! the rest of the time focus stays on the terminal, and a click outside the box hands it straight back.
 
 use std::cell::{Cell, RefCell};
+use std::ffi::c_void;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
@@ -24,9 +25,8 @@ use crate::app::{AppController, SessionState, Snapshot, TabSnap};
 use crate::card::CARD_INSET;
 use crate::config;
 use crate::header::HEADER_H;
-use crate::settings;
 use crate::theme;
-use crate::view::{draw_symbol, draw_truncated, make_attrs, ns_color, rect, round_fill, round_stroke};
+use crate::view::{self, draw_symbol, draw_truncated, make_attrs, ns_color, rect, round_fill, round_stroke, TimerToken};
 
 /// Default sidebar width; `MIN_SIDEBAR_W`..`MAX_SIDEBAR_W` bound the divider drag. These mirror the
 /// system sidebar metrics a `NavigationSplitView` asks for (`columnWidth(min: 200, ideal: 240)`).
@@ -35,8 +35,17 @@ pub const MIN_SIDEBAR_W: f64 = 200.0;
 pub const MAX_SIDEBAR_W: f64 = 480.0;
 const ROW_H: f64 = 32.0; // session/settings row (per design spec)
 const SECTION_H: f64 = 24.0; // "Sessions" section label row above the ungrouped tabs
-const BTN_H: f64 = 26.0; // action button row (tighter top/bottom padding)
+const BTN_H: f64 = 28.0; // action button row — the search box's height, so the two chips at the
+                         // top of the card read as one size rather than nearly one
 const SEARCH_H: f64 = 28.0;
+/// Room reserved inside the search box's right edge for the "esc" hint, so a long query scrolls
+/// under its own clip rather than under the badge.
+const ESC_HINT_W: f64 = 24.0;
+/// How long the search box takes to unroll or fold away, in seconds. A shade quicker than the
+/// sidebar's own slide (`SIDEBAR_ANIM`): that one moves the whole panel, this one moves one row.
+const SEARCH_ANIM: f64 = 0.16;
+/// Animation tick. ~60 Hz, which is what a 160 ms motion needs to read as motion rather than steps.
+const ANIM_MS: u64 = 16;
 const PAD: f64 = 14.0; // content left inset
 /// Top strip of the card, holding the traffic lights and the collapse toggle. The card's top
 /// edge already sits CARD_INSET below the window's, so this is that much shorter than HEADER_H.
@@ -75,6 +84,12 @@ fn text_secondary() -> (f64, f64, f64) {
 fn text_placeholder() -> (f64, f64, f64) {
     let t = theme::current();
     theme::mix(t.fg, t.bg, 0.55)
+}
+/// The focus accent — the theme's, not the app's (see [`theme::Theme::accent`]). Used for the ring
+/// around a focused input and the selection behind its text, the two marks that say "this box has
+/// the keyboard".
+fn accent() -> (f64, f64, f64) {
+    theme::current().accent()
 }
 fn text_weakest() -> (f64, f64, f64) {
     let t = theme::current();
@@ -132,6 +147,7 @@ struct HoverKey {
 }
 
 /// A single laid-out row.
+#[derive(Clone)]
 struct Row {
     top: f64,
     h: f64,
@@ -171,6 +187,14 @@ pub struct SidebarIvars {
     // Search: query string + whether in search (focused) state.
     query: RefCell<String>,
     searching: Cell<bool>,
+    // How far the search box is unrolled, 0..1. Its own value rather than a function of
+    // `searching`, because the two disagree for exactly as long as the animation runs — which is
+    // the point: `searching` is where the box is going, this is where it is.
+    reveal: Cell<f64>,
+    // Runs only while `reveal` is still travelling toward `searching`, and cancels itself on
+    // arrival. The context it carries is this view as a raw pointer, so it must not outlive it —
+    // the sidebar lives as long as the app, and the timer is far shorter-lived than that.
+    anim: RefCell<Option<TimerToken>>,
     // Rename: object being edited (None = not editing) + edit buffer.
     editing: Cell<Option<Editing>>,
     edit_buf: RefCell<String>,
@@ -302,11 +326,14 @@ declare_class!(
             self.ivars().searching.get() || self.ivars().editing.get().is_some()
         }
 
-        // Click elsewhere (e.g. the terminal) → exit search, abandon rename.
+        // Click elsewhere (e.g. the terminal) → abandon a rename, but *keep* the search box.
+        //
+        // The box closes only when the user says so — Esc, ⌘F on an empty box, the magnifier — so a
+        // filtered list stays filtered while they work in the terminal. A rename is the opposite:
+        // it is a modal edit of one row, and leaving it half-typed on screen with the keyboard
+        // somewhere else would be a trap.
         #[method(resignFirstResponder)]
         fn resign_first_responder(&self) -> bool {
-            self.ivars().searching.set(false);
-            self.ivars().query.borrow_mut().clear();
             self.ivars().editing.set(None);
             self.ivars().edit_buf.borrow_mut().clear();
             self.reset_input();
@@ -417,6 +444,8 @@ impl SidebarView {
             tracking_added: Cell::new(false),
             query: RefCell::new(String::new()),
             searching: Cell::new(false),
+            reveal: Cell::new(0.0),
+            anim: RefCell::new(None),
             editing: Cell::new(None),
             edit_buf: RefCell::new(String::new()),
             caret: Cell::new(0),
@@ -487,9 +516,26 @@ impl SidebarView {
         HPAD + bw + ACTIONS_GAP / 2.0
     }
 
-    /// Top y of the group/tab list area (below the search box + the two buttons). Above this is the fixed area, which does not scroll.
-    fn list_top() -> f64 {
-        TOP_INSET + SEARCH_H + GAP + BTN_H + GAP
+    /// Top y of the group/tab list area (below the search box, when there is one, + the two
+    /// buttons). Above this is the fixed area, which does not scroll.
+    fn list_top(&self) -> f64 {
+        TOP_INSET + self.search_h() + BTN_H + GAP
+    }
+
+    /// What the search box currently costs the layout: nothing at rest, its full row plus the gap
+    /// once open, and everything in between while it animates. Every measurement that used to
+    /// assume a permanent row has to ask this instead — off by one row and the list draws into the
+    /// clip of the row above it.
+    fn search_h(&self) -> f64 {
+        (SEARCH_H + GAP) * self.reveal()
+    }
+
+    /// The unroll fraction, eased. Smoothstep rather than the raw linear ramp: the box and the
+    /// whole list below it move together, and a linear start/stop on that much travel reads as a
+    /// jerk at both ends.
+    fn reveal(&self) -> f64 {
+        let p = self.ivars().reveal.get().clamp(0.0, 1.0);
+        p * p * (3.0 - 2.0 * p)
     }
 
     /// Whether a session matches the search query: by name, or by the directory it is in.
@@ -506,13 +552,21 @@ impl SidebarView {
 
     /// Build all rows. `scroll` only affects groups/tabs (the list area); search/buttons stay fixed.
     /// A list row's `top` is returned directly as a screen coordinate (scroll already subtracted), so hit testing and dragging need no further conversion.
-    fn build_rows(snap: &Snapshot, query: &str, scroll: f64) -> Vec<Row> {
+    fn build_rows(&self, snap: &Snapshot, query: &str, scroll: f64) -> Vec<Row> {
         let q = query.to_lowercase();
         let mut rows = Vec::new();
         let mut y = TOP_INSET;
-        // Search box (label holds the current query; drawn specially in render).
-        rows.push(Row { top: y, h: SEARCH_H, indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
-        y += SEARCH_H + GAP;
+        // Search box (label holds the current query; drawn specially in render). Only while the
+        // search is on — or on its way in or out: at rest the sessions start right under the top
+        // strip, and the box is reached through the strip's magnifier or ⌘F.
+        //
+        // Its `h` is the *visible* height, which is what the drawing clips to and what hit testing
+        // uses, so a click during the animation lands on whatever is actually under the pointer.
+        let slot = self.search_h();
+        if slot > 0.0 {
+            rows.push(Row { top: y, h: SEARCH_H * self.reveal(), indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
+            y += slot;
+        }
 
         // Side-by-side "Terminal" and "Group" buttons, occupying one row.
         rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
@@ -586,8 +640,8 @@ impl SidebarView {
     }
 
     /// Merged rows of the top list + bottom style area (used for drawing and hit testing).
-    fn all_rows(snap: &Snapshot, height: f64, query: &str, scroll: f64) -> Vec<Row> {
-        let mut rows = Self::build_rows(snap, query, scroll);
+    fn all_rows(&self, snap: &Snapshot, height: f64, query: &str, scroll: f64) -> Vec<Row> {
+        let mut rows = self.build_rows(snap, query, scroll);
         rows.extend(Self::footer_rows(snap, height));
         rows
     }
@@ -599,18 +653,18 @@ impl SidebarView {
 
     /// Maximum scroll amount when list content exceeds the visible height (0 if content is short).
     fn max_scroll(&self, snap: &Snapshot, query: &str, height: f64) -> f64 {
-        let rows = Self::build_rows(snap, query, 0.0);
-        Self::max_scroll_of(&rows, height)
+        let rows = self.build_rows(snap, query, 0.0);
+        self.max_scroll_of(&rows, height)
     }
 
     /// Same computation as `max_scroll`, but from an already-built (unscrolled) row list —
     /// lets `render()` measure and position rows from a single `build_rows` call instead of two.
-    fn max_scroll_of(rows: &[Row], height: f64) -> f64 {
+    fn max_scroll_of(&self, rows: &[Row], height: f64) -> f64 {
         let content_bottom = rows
             .iter()
             .filter(|r| matches!(r.kind, Press::Group(_) | Press::Tab(..)))
             .map(|r| r.top + r.h)
-            .fold(Self::list_top(), f64::max);
+            .fold(self.list_top(), f64::max);
         let footer_top = height - Self::footer_height();
         (content_bottom - footer_top).max(0.0)
     }
@@ -622,17 +676,16 @@ impl SidebarView {
         };
         let snap = ctrl.snapshot();
         let query = self.ivars().query.borrow().clone();
-        let searching = self.ivars().searching.get();
         let editing = self.ivars().editing.get();
         let (w, h) = (self.bounds().size.width, self.bounds().size.height);
         let footer_top = h - Self::footer_height();
-        let list_top = Self::list_top();
+        let list_top = self.list_top();
 
         // Build the scrollable rows once (unscrolled), derive max_scroll from that same build,
         // then shift positions for the actual scroll offset — avoids cloning every tab/group
         // title a second time via a second build_rows call.
-        let mut rows = Self::build_rows(&snap, &query, 0.0);
-        let max_scroll = Self::max_scroll_of(&rows, h);
+        let mut rows = self.build_rows(&snap, &query, 0.0);
+        let max_scroll = self.max_scroll_of(&rows, h);
         let scroll = self.scroll().clamp(0.0, max_scroll);
         self.ivars().scroll.set(scroll);
         if scroll > 0.0 {
@@ -645,14 +698,8 @@ impl SidebarView {
         rows.extend(Self::footer_rows(&snap, h));
 
         // No background fill: this view is mounted inside the card (see `card.rs`), whose layer
-        // paints the fill, border and shadow. The only separator left is the one above the settings
-        // row — the card's own rounded edge replaces the line that marked the seam.
-        if settings::show_border() {
-            unsafe {
-                ns_color(theme::current().sidebar_border()).set();
-                NSRectFill(rect(0.0, footer_top - 1.0, w, 1.0));
-            }
-        }
+        // paints the fill, border and shadow — and no separator above the settings row either, the
+        // card's own rounded edge having replaced the line that used to mark that seam.
 
         // Hover hit (don't show hover highlight while dragging, to avoid overlapping the drop line).
         let hovering = self.ivars().hovering.get() && !self.ivars().dragging.get();
@@ -662,7 +709,7 @@ impl SidebarView {
         // The fixed area (search box + two buttons + bottom style row) doesn't scroll; draw directly.
         for row in &rows {
             if !matches!(row.kind, Press::Group(_) | Press::Tab(..) | Press::TabsLabel) {
-                self.draw_row(row, w, &query, searching, editing, hovered(row));
+                self.draw_row(row, w, &query, editing, hovered(row));
             }
         }
 
@@ -675,13 +722,28 @@ impl SidebarView {
         unsafe { NSRectClip(list_rect) };
         for row in &rows {
             if matches!(row.kind, Press::Group(_) | Press::Tab(..) | Press::TabsLabel) {
-                self.draw_row(row, w, &query, searching, editing, hovered(row));
+                self.draw_row(row, w, &query, editing, hovered(row));
             }
         }
-        // Drag drop line (theme-aligned; clipped within the list area, so it won't spill into the fixed area).
+        // Drop feedback, clipped within the list area so it won't spill into the fixed one. Two
+        // shapes, and only ever one of them: a *container* highlight when the drop would put the
+        // tab inside a collapsed group, and otherwise the insertion line between two rows. They
+        // answer different questions — "into what" versus "between which two" — and a collapsed
+        // group has no visible gap for a line to mean anything in.
         if self.ivars().dragging.get() {
-            if let Some(y) = self.drop_indicator_y(&snap) {
-                round_fill(rect(8.0, y - 1.5, w - 16.0, 3.0), 1.5, &overlay(0.7));
+            if let Some(top) = self.drop_into_group(&snap) {
+                // Fill only, no outline: the row is already bounded by the rows above and below it,
+                // so a ring around it just draws a second edge inside those — and the sidebar's
+                // other "this row is the one" marks (selection, hover) are all plain washes too.
+                let a = accent();
+                round_fill(rect(HPAD, top + 1.0, w - 2.0 * HPAD, ROW_H - 2.0), 7.0, &rgba(a.0, a.1, a.2, 0.22));
+            } else if let Some(y) = self.drop_indicator_y(&snap) {
+                // A 2pt bar, the weight the system's own drop indicators use: any heavier and it
+                // stops reading as a line and starts reading as a row of its own. Snapped to whole
+                // points, since the y it is given is a row top minus the scroll offset and a
+                // trackpad leaves that fractional — off the grid, a bar this thin antialiases
+                // across three device pixels and looks both thicker and blurrier than it is.
+                round_fill(rect(8.0, y.round() - 1.0, w - 16.0, 2.0), 1.0, &overlay(0.7));
             }
         }
         if let Some(c) = &ctx {
@@ -699,9 +761,9 @@ impl SidebarView {
     }
 
     /// Draw a single row (search box / rename box / button / group / tab / style row).
-    fn draw_row(&self, row: &Row, w: f64, query: &str, searching: bool, editing: Option<Editing>, hovered: bool) {
+    fn draw_row(&self, row: &Row, w: f64, query: &str, editing: Option<Editing>, hovered: bool) {
         if let Press::Search = row.kind {
-            self.draw_search(row, w, query, searching);
+            self.draw_search(row, w, query);
             return;
         }
         // Tab/group being renamed: draw the in-place edit box instead of the normal title.
@@ -906,7 +968,7 @@ impl SidebarView {
     /// Excludes the dragged tab itself during computation, to support reordering within the same region.
     fn tab_drop_target(&self, snap: &Snapshot, dragged: u64) -> Option<(Option<usize>, Option<u64>)> {
         let query = self.ivars().query.borrow().clone();
-        let rows = Self::build_rows(snap, &query, self.scroll());
+        let rows = self.build_rows(snap, &query, self.scroll());
         let y = self.ivars().cur_y.get();
         // The region of the row that's hit is the target region.
         let mut region = None;
@@ -942,11 +1004,36 @@ impl SidebarView {
         Some((region, before))
     }
 
+    /// The row top of the collapsed group the drag is currently over, if dropping there would put
+    /// the tab *into* that group rather than between two rows.
+    ///
+    /// Only for a tab drag, and only with the search box empty: a query lists a collapsed group's
+    /// matches underneath it regardless of its state, so there the rows are on screen and the
+    /// insertion line is the honest answer again.
+    ///
+    /// The drop itself needed no change — a group row has always resolved to that group's region,
+    /// and with none of its tabs on screen the insertion lands at the end of it. What was missing
+    /// was saying so: the line drew under the group title, which reads as "after this group".
+    fn drop_into_group(&self, snap: &Snapshot) -> Option<f64> {
+        if !matches!(self.ivars().press.get(), Press::Tab(..)) {
+            return None;
+        }
+        let query = self.ivars().query.borrow().clone();
+        if !query.is_empty() {
+            return None;
+        }
+        let y = self.ivars().cur_y.get();
+        self.build_rows(snap, &query, self.scroll())
+            .into_iter()
+            .find(|r| matches!(r.kind, Press::Group(_)) && r.collapsed && y >= r.top && y < r.top + r.h)
+            .map(|r| r.top)
+    }
+
     /// The y (insertion position) the drag placeholder line should snap to; None means don't draw it.
     /// Kept consistent with `on_up`'s drop decision, so the preview line faithfully reflects the final drop position.
     fn drop_indicator_y(&self, snap: &Snapshot) -> Option<f64> {
         let query = self.ivars().query.borrow().clone();
-        let rows = Self::build_rows(snap, &query, self.scroll());
+        let rows = self.build_rows(snap, &query, self.scroll());
         let list_bottom = rows.last().map(|r| r.top + r.h).unwrap_or(0.0);
         let y = self.ivars().cur_y.get();
         match self.ivars().press.get() {
@@ -1014,9 +1101,9 @@ impl SidebarView {
     /// Hit test: which row the y within the view hits (list rows are only valid within the visible area, to avoid mis-hits on scrolled-out rows).
     fn row_at(&self, snap: &Snapshot, y: f64, h: f64, query: &str) -> Press {
         let footer_top = h - Self::footer_height();
-        for row in &Self::all_rows(snap, h, query, self.scroll()) {
+        for row in &self.all_rows(snap, h, query, self.scroll()) {
             let list_row = matches!(row.kind, Press::Group(_) | Press::Tab(..) | Press::TabsLabel);
-            if list_row && (y < Self::list_top() || y >= footer_top) {
+            if list_row && (y < self.list_top() || y >= footer_top) {
                 continue;
             }
             if y >= row.top && y < row.top + row.h {
@@ -1108,11 +1195,11 @@ impl SidebarView {
             }
         }
         let snap = ctrl.snapshot();
-        let rows = Self::build_rows(&snap, &query, 0.0);
+        let rows = self.build_rows(&snap, &query, 0.0);
         // None = filtered out by the search query.
         let top = rows.iter().find(|r| matches!(r.kind, Press::Tab(id, _) if id == active))?.top;
         let h = self.bounds().size.height;
-        let (list_top, footer_top) = (Self::list_top(), h - Self::footer_height());
+        let (list_top, footer_top) = (self.list_top(), h - Self::footer_height());
         let mut s = self.scroll();
         if top - s < list_top {
             s = top - list_top;
@@ -1120,7 +1207,7 @@ impl SidebarView {
         if top - s + ROW_H > footer_top {
             s = top + ROW_H - footer_top;
         }
-        let s = s.clamp(0.0, Self::max_scroll_of(&rows, h));
+        let s = s.clamp(0.0, self.max_scroll_of(&rows, h));
         self.ivars().scroll.set(s);
         unsafe {
             self.setNeedsDisplay(true);
@@ -1167,9 +1254,10 @@ impl SidebarView {
                 return;
             }
             self.cancel_rename();
-        } else if self.ivars().searching.get() && press != Press::Search {
-            self.exit_search();
         }
+        // A press elsewhere used to close the search box; it no longer does. The box is dismissed
+        // only by Esc, by ⌘F on an empty one, or by the magnifier — clicking a session while a
+        // filter is up is *using* the filter, not leaving it.
         // Dual-button row: by x, land on "Terminal" (left) or "Group" (right).
         if press == Press::Actions {
             press = if x < Self::actions_split_x(w) { Press::NewTab } else { Press::NewGroup };
@@ -1231,7 +1319,7 @@ impl SidebarView {
                 Press::Group(gi) => {
                     // The new insertion index is how many group vertical midpoints the drop position crossed.
                     let snap = ctrl.snapshot();
-                    let rows = Self::build_rows(&snap, "", self.scroll());
+                    let rows = self.build_rows(&snap, "", self.scroll());
                     let heads: Vec<f64> = rows
                         .iter()
                         .filter_map(|r| match r.kind {
@@ -1255,16 +1343,9 @@ impl SidebarView {
         } else {
             match press {
                 Press::Search => self.enter_search(),
-                Press::NewTab => {
-                    self.exit_search();
-                    ctrl.add_tab_default();
-                }
-                Press::NewGroup => {
-                    self.exit_search();
-                    ctrl.add_group_default();
-                }
+                Press::NewTab => ctrl.add_tab_default(),
+                Press::NewGroup => ctrl.add_group_default(),
                 Press::Tab(id, _) => {
-                    self.exit_search();
                     // Double-click → rename in place; single click → select, or deselect when it is
                     // already the active tab (the terminal area falls back to the placeholder).
                     if unsafe { event.clickCount() } >= 2 {
@@ -1303,15 +1384,41 @@ impl SidebarView {
         unsafe { self.setNeedsDisplay(true) };
     }
 
-    /// Draw the top search box: chip fill + magnifier + placeholder/query + ⌘F badge on the right; when focused, stroke it and draw the cursor.
-    fn draw_search(&self, row: &Row, w: f64, query: &str, searching: bool) {
+    /// Draw the search box: chip fill + magnifier + placeholder/query + focus ring and caret.
+    ///
+    /// Always the focused state — the row it draws only exists while the search has the keyboard
+    /// (see `build_rows`), so there is no resting appearance left to draw and no ⌘F badge to
+    /// advertise the shortcut with. That hint moved to the strip magnifier's tooltip.
+    fn draw_search(&self, row: &Row, w: f64, query: &str) {
+        // The box is always drawn at its full size and clipped to however much of it is unrolled —
+        // it opens like a drawer rather than squashing, which would put the text through a 28-to-0
+        // vertical scale on the way past.
+        let outer = unsafe { NSGraphicsContext::currentContext() };
+        if let Some(c) = &outer {
+            unsafe { c.saveGraphicsState() };
+        }
+        unsafe { NSRectClip(rect(0.0, row.top, w, row.h)) };
+        let row = &Row { h: SEARCH_H, ..row.clone() };
         let box_rect = rect(HPAD, row.top, w - 2.0 * HPAD, row.h);
         round_fill(box_rect, 7.0, &overlay(CHIP_BG));
-        // No resting outline — the chip fill is what marks the field, same as the action buttons
-        // below it. The accent stroke stays, because focus needs a mark of its own: the caret alone
-        // is easy to miss on an empty box.
-        if searching {
-            round_stroke(box_rect, 7.0, 1.0, &rgba(ACCENT_ICON.0, ACCENT_ICON.1, ACCENT_ICON.2, 0.7));
+        // The accent ring is what marks the focus: the caret alone is easy to miss on an empty box,
+        // and the chip fill is the same one the action buttons below carry.
+        //
+        // Stroked half a point *inside* the box, because a stroke is centered on its path: on the
+        // box's own rect its outer half falls outside, which the reveal clip above then cuts off —
+        // the ring loses its top and bottom edges and keeps only the sides.
+        //
+        // Only while the box actually holds the keyboard: it now stays open after losing focus, and
+        // a ring on a box that keystrokes no longer reach would be pointing at the wrong place.
+        let focused = self.has_keyboard();
+        if focused {
+            let a = accent();
+            round_stroke(
+                rect(box_rect.origin.x + 0.5, box_rect.origin.y + 0.5, box_rect.size.width - 1.0, box_rect.size.height - 1.0),
+                6.5,
+                1.0,
+                &rgba(a.0, a.1, a.2, 0.7),
+            );
         }
         // Magnifier SF icon on the left.
         draw_symbol("magnifyingglass", rect(HPAD + 9.0, row.top + (row.h - 13.0) / 2.0, 13.0, 13.0), text_placeholder());
@@ -1323,23 +1430,22 @@ impl SidebarView {
         };
         let attrs = make_attrs(&self.ivars().font, Some(&ns_color(color)));
         let ns = NSString::from_str(&text);
-        // Scroll + clip so a long query never spills past the box (matches the rename box).
-        let right_pad = 9.0;
+        // Scroll + clip so a long query never spills past the box (matches the rename box) — and
+        // stops short of the Esc hint, which sits inside the box's right edge.
+        let right_pad = 9.0 + ESC_HINT_W;
         let avail = (w - HPAD - right_pad - text_x).max(0.0);
         let caret_w = self.caret_width(query);
-        let offset = if searching { (caret_w - avail).max(0.0) } else { 0.0 };
+        let offset = (caret_w - avail).max(0.0);
         let clip = rect(text_x, row.top, avail + right_pad, row.h);
         let ctx = unsafe { NSGraphicsContext::currentContext() };
         if let Some(c) = &ctx {
             unsafe { c.saveGraphicsState() };
         }
         unsafe { NSRectClip(clip) };
-        if searching {
-            self.draw_selection(query, text_x, offset, row.top + 4.0, row.h - 9.0);
-        }
+        self.draw_selection(query, text_x, offset, row.top + 4.0, row.h - 9.0);
         unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(text_x - offset, row.top + (row.h - 16.0) / 2.0), Some(&attrs)) };
-        // Cursor: when focused, sits at the caret position within the query (hugs the left for an empty query).
-        if searching {
+        // Cursor: at the caret position within the query (hugs the left for an empty query).
+        if focused {
             unsafe {
                 ns_color(text_primary()).set();
                 NSRectFill(rect(text_x + caret_w - offset + 1.0, row.top + 4.0, 1.0, row.h - 9.0));
@@ -1348,10 +1454,14 @@ impl SidebarView {
         if let Some(c) = &ctx {
             unsafe { c.restoreGraphicsState() };
         }
-
-        // ⌘F badge on the right (shown when not focused).
-        if !searching {
-            self.draw_badge("⌘F", w - HPAD - 8.0, row.top + row.h / 2.0);
+        // "esc" at the right, the way the box used to advertise ⌘F. Only while the box holds the
+        // keyboard, because that is the only time Esc reaches it — otherwise the key belongs to the
+        // terminal and the hint would be advertising someone else's shortcut.
+        if focused {
+            self.draw_badge("esc", w - HPAD - 9.0, row.top + row.h / 2.0);
+        }
+        if let Some(c) = &outer {
+            unsafe { c.restoreGraphicsState() };
         }
     }
 
@@ -1360,7 +1470,8 @@ impl SidebarView {
         let box_rect = rect(HPAD, row.top + 1.0, w - 2.0 * HPAD, row.h - 2.0);
         let text = self.ivars().edit_buf.borrow().clone();
         round_fill(box_rect, 7.0, &overlay(0.08));
-        round_stroke(box_rect, 7.0, 1.0, &rgba(ACCENT_ICON.0, ACCENT_ICON.1, ACCENT_ICON.2, 0.7));
+        let a = accent();
+        round_stroke(box_rect, 7.0, 1.0, &rgba(a.0, a.1, a.2, 0.7));
         let text_x = HPAD + 9.0;
         let right_pad = 9.0;
         let avail = (w - HPAD - right_pad - text_x).max(0.0); // visible text width inside the box
@@ -1413,8 +1524,9 @@ impl SidebarView {
         };
         let xa = text_x + self.text_width(text, a) - offset + 1.0;
         let xb = text_x + self.text_width(text, b) - offset + 1.0;
+        let a = accent();
         unsafe {
-            rgba(ACCENT_ICON.0, ACCENT_ICON.1, ACCENT_ICON.2, 0.30).set();
+            rgba(a.0, a.1, a.2, 0.30).set();
             NSRectFill(rect(xa, top, xb - xa, h));
         }
     }
@@ -1518,14 +1630,41 @@ impl SidebarView {
         img
     }
 
-    fn enter_search(&self) {
-        // Clicking the box again while it is already focused must not reset the caret and undo history.
-        if self.ivars().searching.get() {
-            return;
+    /// Flip the search state and start the box moving toward it. Every path that opens or closes
+    /// the search goes through here, so none of them can leave `reveal` stranded.
+    fn set_searching(&self, on: bool) {
+        self.ivars().searching.set(on);
+        if self.ivars().anim.borrow().is_some() {
+            return; // already travelling; the tick reads the target each time, so it just turns around
         }
-        self.ivars().searching.set(true);
-        self.ivars().caret.set(self.ivars().query.borrow().chars().count());
-        self.reset_input();
+        let ctx = self as *const Self as *mut c_void;
+        let token = view::attach_timer(ANIM_MS, ctx, search_anim_tick);
+        *self.ivars().anim.borrow_mut() = Some(token);
+    }
+
+    /// Advance `reveal` one tick toward `searching`, and stop the timer on arrival.
+    fn step_search_anim(&self) {
+        let target = if self.ivars().searching.get() { 1.0 } else { 0.0 };
+        let step = ANIM_MS as f64 / 1000.0 / SEARCH_ANIM;
+        let cur = self.ivars().reveal.get();
+        let next = if target > cur { (cur + step).min(1.0) } else { (cur - step).max(0.0) };
+        self.ivars().reveal.set(next);
+        unsafe { self.setNeedsDisplay(true) };
+        if next == target {
+            if let Some(t) = self.ivars().anim.borrow_mut().take() {
+                view::cancel_timer(&t);
+            }
+        }
+    }
+
+    fn enter_search(&self) {
+        // Opening an already-open box must not reset its caret and undo history — but it must still
+        // take the keyboard back, because the box now stays on screen after losing it.
+        if !self.ivars().searching.get() {
+            self.set_searching(true);
+            self.ivars().caret.set(self.ivars().query.borrow().chars().count());
+            self.reset_input();
+        }
         if let Some(ctrl) = self.controller() {
             ctrl.focus_sidebar();
         }
@@ -1533,12 +1672,20 @@ impl SidebarView {
 
     /// Enter search state and redraw (⌘F triggered from the menu).
     pub fn begin_search(&self) {
-        self.enter_search();
+        // ⌘F on a box that is already open and still empty closes it again: the same key that
+        // opened it, and with nothing typed there is nothing to lose by doing so. With a query in
+        // it the box stays — that text is the user's work, and ⌘F is not where they would expect
+        // to throw it away (Esc is).
+        if self.ivars().searching.get() && self.ivars().query.borrow().is_empty() {
+            self.exit_search();
+        } else {
+            self.enter_search();
+        }
         unsafe { self.setNeedsDisplay(true) };
     }
 
     fn exit_search(&self) {
-        self.ivars().searching.set(false);
+        self.set_searching(false);
         self.ivars().query.borrow_mut().clear();
         self.reset_input();
         if let Some(ctrl) = self.controller() {
@@ -1783,6 +1930,15 @@ impl SidebarView {
         self.splice(buf, a, b, &text, EditKind::Insert);
     }
 
+    /// Whether this view currently holds the window's keyboard focus. The search box stays on
+    /// screen after losing it, so "the search is on" and "the search has the keyboard" are two
+    /// different questions now, and the focus marks answer this one.
+    fn has_keyboard(&self) -> bool {
+        let Some(window) = self.window() else { return false };
+        let Some(fr) = (unsafe { window.firstResponder() }) else { return false };
+        std::ptr::eq(&*fr as *const _ as *const u8, self as *const Self as *const u8)
+    }
+
     /// Reset the shared input state (selection + undo history) when a box takes or loses focus.
     fn reset_input(&self) {
         self.ivars().sel.set(None);
@@ -1798,12 +1954,14 @@ impl SidebarView {
         };
         let snap = ctrl.snapshot();
         let query = self.ivars().query.borrow().clone();
-        let first = Self::build_rows(&snap, &query, self.scroll()).into_iter().find_map(|r| match r.kind {
+        let first = self.build_rows(&snap, &query, self.scroll()).into_iter().find_map(|r| match r.kind {
             Press::Tab(id, _) => Some(id),
             _ => None,
         });
         if let Some(id) = first {
-            self.exit_search();
+            // The box stays: Return picks a session out of the filter, it does not leave it. Focus
+            // follows the selection to the terminal, so the box is left showing its query without
+            // the focus ring — see `has_keyboard`.
             ctrl.select(id);
         }
     }
@@ -1818,7 +1976,7 @@ impl SidebarView {
             Editing::Tab(id) => ctrl.tab_title(id),
             Editing::Group(gi) => ctrl.group_name(gi),
         };
-        self.ivars().searching.set(false);
+        self.set_searching(false);
         self.ivars().query.borrow_mut().clear();
         self.ivars().editing.set(Some(what));
         self.ivars().caret.set(init.chars().count()); // caret at end of the initial name
@@ -1848,7 +2006,12 @@ impl SidebarView {
         if self.ivars().editing.get().is_some() {
             self.cancel_rename();
         } else if self.ivars().searching.get() {
-            self.exit_search();
+            // The search box survives a collapse — it closes only when the user closes it — but the
+            // keyboard must not go with it: a card parked off the window edge holding first
+            // responder would swallow everything typed at the terminal.
+            if let Some(ctrl) = self.controller() {
+                ctrl.focus_terminal();
+            }
             unsafe { self.setNeedsDisplay(true) };
         }
     }
@@ -1899,5 +2062,10 @@ fn rgba(r: f64, g: f64, b: f64, a: f64) -> Retained<NSColor> {
     unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, a) }
 }
 
-// ---- Accent color: amber #f0b15a, used only for the search/rename focus rings ----
-const ACCENT_ICON: (f64, f64, f64) = (240.0 / 255.0, 177.0 / 255.0, 90.0 / 255.0);
+/// GCD trampoline for the search box's unroll (see `SidebarView::set_searching`). The context is
+/// the view; the timer that carries it is cancelled from `step_search_anim` the moment the box
+/// arrives, so it cannot outlive one animation.
+extern "C" fn search_anim_tick(ctx: *mut c_void) {
+    let view = unsafe { &*(ctx as *const SidebarView) };
+    view.step_search_anim();
+}

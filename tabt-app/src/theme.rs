@@ -99,18 +99,35 @@ impl Theme {
         (target / contrast).min(0.20)
     }
 
-    /// Subtle separator/border line color derived from the theme (background nudged toward the
-    /// foreground), so borders read correctly on dark and light themes alike.
-    pub fn border(&self) -> Rgb {
-        mix(self.bg, self.fg, 0.10)
+    /// The accent the sidebar's focused inputs draw in — the ring around the search and rename
+    /// boxes, and the selection behind their text.
+    ///
+    /// Taken from the theme's own bright blue (palette 12): every scheme defines one, and it is the
+    /// same family the theme picker's miniature already uses for a path, so a focused box reads as
+    /// belonging to the scheme rather than to the app. It was a fixed amber until it had to live on
+    /// half a dozen light themes and a green phosphor.
+    ///
+    /// Lifted toward the foreground when it does not separate from the card it is drawn on: this is
+    /// a hairline ring, and a blue that sits at the card's own luminance — xterm's `#0000ee` on a
+    /// near-black panel, which is what the base palette gives a theme that sets no colors of its
+    /// own — disappears into it. A monochrome phosphor theme ignores SGR entirely and its palette
+    /// means nothing, so there the phosphor itself is the accent.
+    pub fn accent(&self) -> Rgb {
+        if self.mono {
+            return self.fg;
+        }
+        let (r, g, b) = self.palette[12];
+        let c = (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
+        const MIN: f64 = 0.18; // luminance separation the ring needs from the card to be seen
+        let d = (luminance(c) - luminance(self.card_bg())).abs();
+        if d >= MIN {
+            return c;
+        }
+        // At no separation at all this lands on the foreground, which the card is guaranteed to
+        // show — the theme's body text is drawn on it.
+        mix(c, self.fg, ((MIN - d) / MIN).clamp(0.0, 1.0))
     }
 
-    /// Separator drawn on the sidebar panel. The panel carries [`Theme::card_bg`] and its content is
-    /// quieter than the terminal's, so the shared [`Theme::border`] sinks into it — this is one step
-    /// stronger, enough for the edge to read as a rim.
-    pub fn sidebar_border(&self) -> Rgb {
-        mix(self.bg, self.fg, 0.20)
-    }
 }
 
 /// Linear blend a→b by t (0 = a, 1 = b). The single RGB-mixing helper used across the app.

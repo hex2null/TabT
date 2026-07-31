@@ -665,6 +665,20 @@ impl TermView {
         self.ivars().grid.borrow().title().to_string()
     }
 
+    /// Send bytes to the shell as if they had been typed. Used for the clear button, whose whole
+    /// point is that the *shell* does the clearing.
+    pub fn send(&self, bytes: &[u8]) {
+        let fd = self.ivars().master_fd.get();
+        if fd >= 0 {
+            unsafe { write_all(fd, bytes) };
+        }
+    }
+
+    /// Everything this session has produced — scrollback and screen — as text (Shell → Export Text).
+    pub fn text(&self) -> String {
+        self.ivars().grid.borrow().buf_text()
+    }
+
     /// Fire `meta_fn` if the grid's title or cwd differs from what was last reported. Compares
     /// borrowed strings, so a read that changed neither — the overwhelming majority — allocates
     /// nothing.

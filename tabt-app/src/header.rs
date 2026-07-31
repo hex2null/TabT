@@ -1,10 +1,15 @@
-//! Terminal-pane header bar (full-height layout).
+//! The band under the toolbar, across the top of the terminal pane.
 //!
-//! A thin bar across the top of the terminal host showing the active session name +
-//! a `~ · zsh`-style meta string on the left, and a green "running" indicator on the
-//! right. It also provides a clean, draggable top strip for the right pane now that the
-//! window title bar is transparent/full-size. The controller pushes the title via
-//! [`HeaderView::set_title`].
+//! The window's title bar is transparent and full-size, so this view is what gives the top strip
+//! the terminal's own background instead of the system's, and it draws the active session name and
+//! its `~ · zsh` meta string on top of that. The sidebar toggle beside them is not drawn here: it
+//! is a real `NSToolbar` item (see `toolbar.rs`), and the toolbar's band is laid over this one.
+//!
+//! The title is drawn here rather than made a toolbar item of its own because it has to start at
+//! the *terminal's* left edge, which moves with the sidebar. A toolbar spans the window, and AppKit
+//! measures a custom item view once, when the item is inserted — a title item could be placed but
+//! never re-placed, so it would part company with the terminal the first time the sidebar moved.
+//! This view already spans exactly the host, so the same alignment costs nothing.
 
 use std::cell::{Cell, RefCell};
 
@@ -14,11 +19,11 @@ use objc2_app_kit::{NSEvent, NSFont, NSRectFill, NSStringDrawing, NSView};
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSString};
 
 use crate::theme;
-use crate::view::{make_attrs, ns_color, ns_color_bg, rect};
+use crate::view::{make_attrs, ns_color, ns_color_bg};
 
-pub const HEADER_H: f64 = 44.0; // toolbar band height; the top strip (traffic lights, collapse
-                                // toggle, title) is centered in the part of it the card covers,
-                                // i.e. on (CARD_INSET + HEADER_H) / 2
+pub const HEADER_H: f64 = 44.0; // fallback band height, used until the window can report the real
+                                // one — with a toolbar attached that height is the system's, see
+                                // `AppController::band_h`
 
 pub struct HeaderIvars {
     title: RefCell<String>,
@@ -61,9 +66,9 @@ declare_class!(
             self.render();
         }
 
-        // Title-bar behavior: double-click zooms (maximize/restore) the window like the
-        // native title bar; a single click/drag moves the window (the header covers the
-        // title-bar strip, so AppKit's own handling never sees these clicks).
+        // Title-bar behavior for whatever part of the band the toolbar does not cover: double-click
+        // zooms (maximize/restore) the window like the native title bar; a single click/drag moves
+        // it. Clicks that land on the toolbar are AppKit's, and it does the same two things.
         #[method(mouseDown:)]
         fn mouse_down(&self, event: &NSEvent) {
             let window = match self.window() {
@@ -111,8 +116,8 @@ impl HeaderView {
         unsafe { self.setNeedsDisplay(true) };
     }
 
-    /// Set the title's left inset (larger when the sidebar is collapsed, to clear the
-    /// traffic lights + toggle that now overlay this pane).
+    /// Set the title's left inset (larger when the sidebar is collapsed, to clear the traffic
+    /// lights and the toolbar's toggle, which then overlay this pane).
     pub fn set_left_inset(&self, x: f64) {
         if self.ivars().left_inset.get() != x {
             self.ivars().left_inset.set(x);
@@ -121,7 +126,7 @@ impl HeaderView {
     }
 
     /// Put the title on `y` (measured down from this view's top) — the centerline shared with the
-    /// traffic lights and the collapse toggle.
+    /// traffic lights and the toolbar's own items.
     pub fn set_center_y(&self, y: f64) {
         if self.ivars().center_y.get() != y {
             self.ivars().center_y.set(y);
@@ -131,16 +136,13 @@ impl HeaderView {
 
     fn render(&self) {
         let b = self.bounds();
-        let (w, h) = (b.size.width, b.size.height);
         let t = theme::current();
         unsafe {
-            // Background matches the terminal exactly (theme bg); an optional 1px bottom border (Settings → Border).
+            // Background matches the terminal exactly (theme bg), and nothing else: the band and the
+            // terminal under it are one surface, so a rule between them would only draw a line
+            // across the middle of it.
             ns_color_bg(t.bg).set();
             NSRectFill(b);
-            if crate::settings::show_border() {
-                ns_color(t.border()).set();
-                NSRectFill(rect(0.0, h - 1.0, w, 1.0));
-            }
         }
 
         // Colors derive from the theme so the title stays legible on light and dark themes.

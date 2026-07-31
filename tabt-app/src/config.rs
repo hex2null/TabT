@@ -98,9 +98,14 @@ pub struct Settings {
     pub font_size: f64,
     pub sidebar_w: f64,
     pub sidebar_right: bool, // true = sidebar on the right
-    pub show_border: bool,   // whether to draw the sidebar/header separator lines
     pub window_w: f64,       // saved window content width (0 = use the built-in default)
     pub window_h: f64,       // saved window content height (0 = use the built-in default)
+    // Saved window position (AppKit screen coordinates, bottom-left origin). `None` — the key being
+    // absent — means "no saved position, center it", which is what every config written before this
+    // existed says. It cannot be a sentinel number the way the size is: 0 is a real coordinate, and
+    // so is a negative one, on a display sitting above or left of the main one.
+    pub window_x: Option<f64>,
+    pub window_y: Option<f64>,
     pub cursor_shape: CursorShape,
     pub cursor_blink: bool,
     pub scrollback: usize,   // lines of history per terminal
@@ -124,9 +129,10 @@ impl Default for Settings {
             font_size: crate::settings::DEFAULT_SIZE,
             sidebar_w: crate::sidebar::SIDEBAR_W,
             sidebar_right: false,
-            show_border: false,
             window_w: 0.0,
             window_h: 0.0,
+            window_x: None,
+            window_y: None,
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
             scrollback: tabt_core::DEFAULT_HISTORY_MAX,
@@ -257,12 +263,13 @@ pub fn parse(text: &str) -> Layout {
                     }
                 }
                 "sidebar_right" => s.sidebar_right = truthy(value),
-                "show_border" => s.show_border = truthy(value),
                 "window_width" => {
                     if let Ok(n) = value.parse::<f64>() {
                         s.window_w = n;
                     }
                 }
+                "window_x" => s.window_x = value.parse::<f64>().ok(),
+                "window_y" => s.window_y = value.parse::<f64>().ok(),
                 "window_height" => {
                     if let Ok(n) = value.parse::<f64>() {
                         s.window_h = n;
@@ -417,10 +424,13 @@ fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String
     out.push_str(&format!("font_size = {}\n", s.font_size));
     out.push_str(&format!("sidebar_width = {}\n", s.sidebar_w));
     out.push_str(&format!("sidebar_right = {}\n", s.sidebar_right));
-    out.push_str(&format!("show_border = {}\n", s.show_border));
     if s.window_w > 0.0 && s.window_h > 0.0 {
         out.push_str(&format!("window_width = {}\n", s.window_w));
         out.push_str(&format!("window_height = {}\n", s.window_h));
+    }
+    if let (Some(x), Some(y)) = (s.window_x, s.window_y) {
+        out.push_str(&format!("window_x = {}\n", x));
+        out.push_str(&format!("window_y = {}\n", y));
     }
     out.push_str(&format!("cursor_shape = {}\n", s.cursor_shape.name()));
     out.push_str(&format!("cursor_blink = {}\n", s.cursor_blink));
@@ -536,9 +546,10 @@ mod tests {
             font_size: 15.0,
             sidebar_w: 240.0,
             sidebar_right: true,
-            show_border: true,
             window_w: 1200.0,
             window_h: 800.0,
+            window_x: Some(-40.0),
+            window_y: Some(-120.5),
             cursor_shape: CursorShape::Underline,
             cursor_blink: true,
             scrollback: 12_000,
@@ -558,8 +569,10 @@ mod tests {
         assert_eq!(g.font_size, 15.0);
         assert_eq!(g.sidebar_w, 240.0);
         assert!(g.sidebar_right);
-        assert!(g.show_border);
         assert_eq!((g.window_w, g.window_h), (1200.0, 800.0));
+        // Negative and fractional on purpose: a display above or left of the main one gives both,
+        // and the size fields' "0 means unset" trick would swallow the first of them.
+        assert_eq!((g.window_x, g.window_y), (Some(-40.0), Some(-120.5)));
         assert!(g.cursor_shape == CursorShape::Underline);
         assert!(g.cursor_blink);
         assert_eq!(g.scrollback, 12_000);
