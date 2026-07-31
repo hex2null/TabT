@@ -1056,7 +1056,12 @@ impl AppController {
             return;
         }
         if closed_active {
-            if let Some(a) = self.model.borrow().tabs.first().map(|t| t.id) {
+            // Bound to a local first: a temporary `Ref` in an `if let` scrutinee lives until the
+            // end of the whole `if let`, body included, so borrowing inline here would still hold
+            // the model when `select` takes it mutably — a BorrowMutError, and under
+            // `panic = "abort"` that is the whole app going down.
+            let next = self.model.borrow().tabs.first().map(|t| t.id);
+            if let Some(a) = next {
                 self.select(a);
             }
         }
