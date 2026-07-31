@@ -74,6 +74,13 @@ const SHARE_ID: &str = "dev.local.tabt.toolbar.share";
 const HOME_ID: &str = "dev.local.tabt.toolbar.home";
 const CLAUDE_ID: &str = "dev.local.tabt.toolbar.claude";
 const CODEX_ID: &str = "dev.local.tabt.toolbar.codex";
+const GEMINI_ID: &str = "dev.local.tabt.toolbar.gemini";
+const AIDER_ID: &str = "dev.local.tabt.toolbar.aider";
+const CURSOR_ID: &str = "dev.local.tabt.toolbar.cursor";
+const INTERRUPT_ID: &str = "dev.local.tabt.toolbar.interrupt";
+const RESTART_ID: &str = "dev.local.tabt.toolbar.restart";
+const FONT_UP_ID: &str = "dev.local.tabt.toolbar.fontup";
+const FONT_DOWN_ID: &str = "dev.local.tabt.toolbar.fontdown";
 /// AppKit's own item, which eats whatever width is left — it is what pins the session actions to
 /// the trailing end while the leading pair stays by the traffic lights.
 const FLEX_ID: &str = "NSToolbarFlexibleSpaceItem";
@@ -85,14 +92,49 @@ const SPACE_ID: &str = "NSToolbarSpaceItem";
 /// The space's key in the stored layout — the one entry in [`CUSTOMIZABLE`] with no item of its own.
 pub const SPACE_KEY: &str = "space";
 
+/// Which half of the toolbar an entry belongs to: the AI launchers, or the actions that operate on
+/// the session already in front of you.
+///
+/// The split is **soft**. It sets the order the table hands out by default and the headings the
+/// customizer groups its palette under, and that is all: nothing in [`ToolbarDelegate::identifiers`]
+/// reads it, so where the capsules actually fall stays the placed space's job and a drag can put any
+/// button anywhere. Hard zones would take back the one thing the customizer is for.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Group {
+    Ai,
+    Common,
+}
+
+impl Group {
+    /// The heading the customizer's palette shows over this group's tiles.
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::Ai => "AI",
+            Group::Common => "Common",
+        }
+    }
+
+    /// The groups, in the order the palette lists them.
+    pub const ALL: [Group; 2] = [Group::Ai, Group::Common];
+}
+
 /// One entry the customizer can place: the short key `layout.conf` stores, the toolbar identifier,
-/// the label the customizer shows under it, the symbol it draws, and its tooltip.
+/// the label the customizer shows under it, the symbol it draws, its tooltip, and which half of the
+/// bar it belongs to.
 pub struct Entry {
     pub key: &'static str,
     id: &'static str,
     pub label: &'static str,
     pub symbol: &'static str,
     tip: &'static str,
+    pub group: Group,
+    /// Whether a config that has never mentioned this key gets the button.
+    ///
+    /// The **one deliberate exception** to the rule `toolbar_hidden` exists for — that a button a
+    /// later version adds shows up rather than staying invisible. A version that adds seven at once
+    /// would otherwise rearrange a bar the user had arranged by hand, so the newer ones start in the
+    /// customizer's palette instead, one drag from the toolbar and impossible to miss there.
+    default_on: bool,
 }
 
 /// Everything the trailing group can hold, in the order it holds it out of the box — which is also
@@ -101,17 +143,26 @@ pub struct Entry {
 /// One table, so the customizer's tile and the toolbar's item cannot describe the same button
 /// differently; the action is the one thing that cannot live in a `const` and is looked up by key
 /// in [`action_for`].
-pub const CUSTOMIZABLE: [Entry; 10] = [
-    Entry { key: "claude", id: CLAUDE_ID, label: "Claude", symbol: "claude", tip: "Run claude in this session" },
-    Entry { key: "codex", id: CODEX_ID, label: "Codex", symbol: "openai", tip: "Run codex in this session" },
-    Entry { key: SPACE_KEY, id: SPACE_ID, label: "Space", symbol: "", tip: "" },
-    Entry { key: "home", id: HOME_ID, label: "Home", symbol: "house", tip: "cd ~" },
-    Entry { key: "copy", id: COPY_ID, label: "Copy", symbol: "doc.on.doc", tip: "Copy (⌘C)" },
-    Entry { key: "paste", id: PASTE_ID, label: "Paste", symbol: "doc.on.clipboard", tip: "Paste (⌘V)" },
-    Entry { key: "clearline", id: CLEAR_LINE_ID, label: "Clear Line", symbol: "delete.left", tip: "Clear Line (⌃U)" },
-    Entry { key: "clear", id: CLEAR_ID, label: "Clear", symbol: "eraser", tip: "Clear Screen (⌃L)" },
-    Entry { key: "screenshot", id: SHOT_ID, label: "Screenshot", symbol: "camera.viewfinder", tip: "Screenshot (⇧⌘5)" },
-    Entry { key: "share", id: SHARE_ID, label: "Share", symbol: SHARE_SYMBOL, tip: "Export or reveal this session" },
+pub const CUSTOMIZABLE: [Entry; 17] = [
+    // ---- AI: each types its command into the session and presses Return ----
+    Entry { key: "claude", id: CLAUDE_ID, label: "Claude", symbol: "claude", tip: "Run claude in this session", group: Group::Ai, default_on: true },
+    Entry { key: "codex", id: CODEX_ID, label: "Codex", symbol: "openai", tip: "Run codex in this session", group: Group::Ai, default_on: true },
+    Entry { key: "gemini", id: GEMINI_ID, label: "Gemini", symbol: "sparkles", tip: "Run gemini in this session", group: Group::Ai, default_on: false },
+    Entry { key: "aider", id: AIDER_ID, label: "Aider", symbol: "wand.and.stars", tip: "Run aider in this session", group: Group::Ai, default_on: false },
+    Entry { key: "cursor", id: CURSOR_ID, label: "Cursor", symbol: "cursorarrow.rays", tip: "Run cursor-agent in this session", group: Group::Ai, default_on: false },
+    // ---- Common: the session in front of you ----
+    Entry { key: SPACE_KEY, id: SPACE_ID, label: "Space", symbol: "", tip: "", group: Group::Common, default_on: true },
+    Entry { key: "home", id: HOME_ID, label: "Home", symbol: "house", tip: "cd ~", group: Group::Common, default_on: true },
+    Entry { key: "copy", id: COPY_ID, label: "Copy", symbol: "doc.on.doc", tip: "Copy (⌘C)", group: Group::Common, default_on: true },
+    Entry { key: "paste", id: PASTE_ID, label: "Paste", symbol: "doc.on.clipboard", tip: "Paste (⌘V)", group: Group::Common, default_on: true },
+    Entry { key: "clearline", id: CLEAR_LINE_ID, label: "Clear Line", symbol: "delete.left", tip: "Clear Line (⌃U)", group: Group::Common, default_on: true },
+    Entry { key: "clear", id: CLEAR_ID, label: "Clear", symbol: "eraser", tip: "Clear Screen (⌃L)", group: Group::Common, default_on: true },
+    Entry { key: "screenshot", id: SHOT_ID, label: "Screenshot", symbol: "camera.viewfinder", tip: "Screenshot (⇧⌘5)", group: Group::Common, default_on: true },
+    Entry { key: "share", id: SHARE_ID, label: "Share", symbol: SHARE_SYMBOL, tip: "Export or reveal this session", group: Group::Common, default_on: true },
+    Entry { key: "interrupt", id: INTERRUPT_ID, label: "Interrupt", symbol: "stop.circle", tip: "Interrupt (⌃C)", group: Group::Common, default_on: false },
+    Entry { key: "restart", id: RESTART_ID, label: "Restart", symbol: "arrow.clockwise", tip: "Restart this session", group: Group::Common, default_on: false },
+    Entry { key: "fontup", id: FONT_UP_ID, label: "Bigger", symbol: "plus.magnifyingglass", tip: "Increase Font Size (⌘=)", group: Group::Common, default_on: false },
+    Entry { key: "fontdown", id: FONT_DOWN_ID, label: "Smaller", symbol: "minus.magnifyingglass", tip: "Decrease Font Size (⌘−)", group: Group::Common, default_on: false },
 ];
 
 /// The entry with that key, if this build has one — a stored layout may name a button an older or
@@ -127,6 +178,11 @@ pub fn entry(key: &str) -> Option<&'static Entry> {
 /// is the *hidden* set so a button a later version adds appears rather than staying invisible;
 /// `toolbar_order` is the arrangement, and a shown button it does not mention — exactly that newly
 /// added one — is appended in this table's own order rather than dropped.
+///
+/// Appending is where `default_on` applies, and only there: an entry the config has never heard of
+/// joins the bar only if the table says it should, while one the user dragged in is honoured from
+/// the stored order regardless. So the newer buttons wait in the customizer's palette, and moving
+/// one into the bar is permanent the moment it lands.
 pub fn layout() -> Vec<&'static str> {
     let shows = |k: &str| settings::toolbar_shows(k);
     let stored = settings::toolbar_order();
@@ -140,11 +196,18 @@ pub fn layout() -> Vec<&'static str> {
         }
     }
     for e in CUSTOMIZABLE.iter() {
-        if shows(e.key) && !keys.contains(&e.key) && !stored.iter().any(|k| k == e.key) {
+        if e.default_on && shows(e.key) && !keys.contains(&e.key) && !stored.iter().any(|k| k == e.key) {
             keys.push(e.key);
         }
     }
     keys
+}
+
+/// The bar a config that says nothing gets: the `default_on` keys, in the table's order. Also what
+/// the customizer's Restore Defaults goes back to — "every entry" would drag in the buttons the
+/// table deliberately keeps in the palette.
+pub fn defaults() -> Vec<&'static str> {
+    CUSTOMIZABLE.iter().filter(|e| e.default_on).map(|e| e.key).collect()
 }
 
 /// The keys not in [`layout`] — what the customizer offers to drag back in.
@@ -245,18 +308,26 @@ impl ToolbarDelegate {
 ///
 /// `copy:`/`paste:` are the terminal's own, so they travel the responder chain to whichever
 /// `TermView` has the keyboard exactly as the Edit menu's items do (see [`Toolbar::set_target`]).
-/// The two launchers type their command into the session and press Return, which is all "run claude
-/// here" means — the shell resolves it on $PATH exactly as the user would.
+/// The launchers type their command into the session and press Return, which is all "run claude
+/// here" means — the shell resolves it on $PATH exactly as the user would. The font pair sends the
+/// selectors the ⌘=/⌘− menu items already send, so the button and the shortcut stay one code path.
 fn action_for(key: &str) -> Option<Sel> {
     Some(match key {
         "claude" => sel!(runClaude:),
         "codex" => sel!(runCodex:),
+        "gemini" => sel!(runGemini:),
+        "aider" => sel!(runAider:),
+        "cursor" => sel!(runCursor:),
         "home" => sel!(goHome:),
         "copy" => sel!(copy:),
         "paste" => sel!(paste:),
         "clearline" => sel!(clearLine:),
         "clear" => sel!(clearScreen:),
         "screenshot" => sel!(takeScreenshot:),
+        "interrupt" => sel!(interruptSession:),
+        "restart" => sel!(restartSession:),
+        "fontup" => sel!(increaseFontSize:),
+        "fontdown" => sel!(decreaseFontSize:),
         // A table row added without a case here gets no action rather than a wrong one: the item
         // then validates as disabled, which is visible, where a plausible-looking default would
         // quietly fire the neighbouring button's selector.

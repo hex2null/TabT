@@ -106,6 +106,26 @@ declare_class!(
         fn run_codex(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.run_in_active("codex"));
         }
+        #[method(runGemini:)]
+        fn run_gemini(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("gemini"));
+        }
+        #[method(runAider:)]
+        fn run_aider(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("aider"));
+        }
+        #[method(runCursor:)]
+        fn run_cursor(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("cursor-agent"));
+        }
+        #[method(interruptSession:)]
+        fn interrupt_session(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.interrupt_active());
+        }
+        #[method(restartSession:)]
+        fn restart_session(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.restart_active_tab());
+        }
         #[method(exportText:)]
         fn export_text(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.export_active_text());
@@ -281,6 +301,9 @@ pub fn build_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarge
     add(mtm, &shell, "New Group", Some(sel!(newGroup:)), Some(target), "n", true);
     shell.addItem(&NSMenuItem::separatorItem(mtm));
     add(mtm, &shell, "Rename Session", Some(sel!(renameSession:)), Some(target), "r", false);
+    // A fresh shell in the same tab and the same directory. Reachable from the keyboard as Enter on
+    // an *ended* session, but not otherwise, so the toolbar's button needs a menu item beside it.
+    add(mtm, &shell, "Restart Session", Some(sel!(restartSession:)), Some(target), "", false);
     add(mtm, &shell, "Reveal in Finder", Some(sel!(revealInFinder:)), Some(target), "r", true);
     // ⇧⌘S, the system's own "save a copy of this" shortcut.
     add(mtm, &shell, "Export Text…", Some(sel!(exportText:)), Some(target), "s", true);

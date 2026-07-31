@@ -7,10 +7,15 @@
 //! icons at [`toolbar::ICON_PT`] in the tone [`toolbar::icon_tone`] gives them — so what the pane
 //! shows and what the window shows are the same row of buttons, not an illustration of it.
 //!
-//! Below it are the buttons currently *out* of the toolbar. Dragging moves one either way: into the
-//! band to add or reorder it, out of the band to remove it. The **Space** is one more draggable
-//! entry rather than a fixed rule, which is what makes the two capsules the user's: recent macOS
-//! draws a run of adjacent items as one capsule, so where the space lands is where the row splits.
+//! Below it are the buttons currently *out* of the toolbar, under one heading per
+//! [`toolbar::Group`] — AI and Common. Those groups are the table's, and they are soft: they order
+//! the palette and nothing else, so a drag can still put any button anywhere in the band. A group
+//! with nothing left in it takes its heading with it.
+//!
+//! Dragging moves a button either way: into the band to add or reorder it, out of the band to
+//! remove it. The **Space** is one more draggable entry rather than a fixed rule, which is what
+//! makes the capsules the user's: recent macOS draws a run of adjacent items as one capsule, so
+//! where the space lands is where the row splits.
 //!
 //! Two things about the drag are deliberate:
 //!
@@ -28,7 +33,10 @@ use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
-use objc2_app_kit::{NSColor, NSEvent, NSFont, NSFontWeightMedium, NSFontWeightRegular, NSStringDrawing, NSView};
+use objc2_app_kit::{
+    NSBezierPath, NSColor, NSEvent, NSFont, NSFontWeightMedium, NSFontWeightRegular, NSGraphicsContext,
+    NSStringDrawing, NSView,
+};
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSString};
 
 use crate::app::AppController;
@@ -67,6 +75,12 @@ const PLATE_H: f64 = 36.0;
 /// what keeps the two sets of icons the same size where they share a row.
 const ICON_BOX: f64 = 17.0;
 
+/// Room the lights and the session title keep for themselves at the band's leading edge — where
+/// the button run is clipped (see [`ToolbarEditor::run_zone`]). Measured from the lights' own
+/// geometry plus enough for a short title, not from the title's actual width, which changes with
+/// the session and would move the clip under the user.
+const TITLE_ZONE_W: f64 = LIGHT_X + 3.0 * (LIGHT_D + LIGHT_GAP) + 14.0 + 62.0;
+
 /// The traffic lights: diameter, spacing, and where the first one's left edge sits.
 const LIGHT_D: f64 = 12.0;
 const LIGHT_GAP: f64 = 8.0;
@@ -80,9 +94,11 @@ const LIGHTS: [(f64, f64, f64); 3] =
 const TILE_W: f64 = 76.0;
 const TILE_H: f64 = 52.0;
 const TILE_GAP: f64 = 10.0;
-/// Gap between the band and the palette's heading, and between the heading and the first tile row.
+/// Gap between the band and the palette's first heading, and the height a heading occupies.
 const PALETTE_TOP: f64 = 22.0;
 const HEADING_H: f64 = 22.0;
+/// Extra room between one group's last tile row and the next group's heading.
+const SECTION_GAP: f64 = 8.0;
 
 /// How far the pointer must travel before a press becomes a drag. Below this the gesture is a
 /// click, and a click here does nothing at all (see the module docs).
@@ -100,6 +116,17 @@ enum Press {
 
 /// No drop position — the pointer is outside the band, which for a band item means "remove".
 const NO_DROP: isize = -1;
+/// A [`Slot`] that is a heading rather than a tile.
+const NO_INDEX: usize = usize::MAX;
+
+/// One placed thing in the palette: a group's heading, or one button's tile. Headings carry the
+/// group they name; tiles carry their position in the flat palette list, which is what a press on
+/// one reports (`Press::Palette`).
+struct Slot {
+    index: usize,
+    group: Option<toolbar::Group>,
+    rect: NSRect,
+}
 
 pub struct EditorIvars {
     controller: Cell<*const AppController>,
@@ -218,21 +245,29 @@ impl ToolbarEditor {
         unsafe { self.setNeedsDisplay(true) };
     }
 
-    /// Put every button back, in the table's own order — the layout a fresh config produces.
+    /// Back to the bar a fresh config produces — [`toolbar::defaults`], not every entry: the table
+    /// deliberately keeps the newer buttons in the palette, and "restore" must not drag them in.
     pub fn restore_defaults(&self) {
         if let Some(c) = self.controller() {
-            c.set_toolbar_layout(
-                toolbar::CUSTOMIZABLE.iter().map(|e| e.key.to_string()).collect(),
-                Vec::new(),
-            );
+            let order: Vec<String> = toolbar::defaults().iter().map(|k| k.to_string()).collect();
+            let hidden: Vec<String> = toolbar::CUSTOMIZABLE
+                .iter()
+                .filter(|e| !order.iter().any(|k| k == e.key))
+                .map(|e| e.key.to_string())
+                .collect();
+            c.set_toolbar_layout(order, hidden);
         }
         self.reload();
     }
 
-    /// How tall the pane's content is, so the dialog can place what goes under it.
+    /// How tall the pane's content is, so the dialog can place what goes under it. Measured against
+    /// the *worst* case — every button removed — because the pane is a fixed size and a palette
+    /// taller than its frame is clipped, not scrolled.
     pub fn height(&self, width: f64) -> f64 {
-        let rows = toolbar::CUSTOMIZABLE.len().div_ceil(self.cols(width).max(1));
-        BAND_Y + self.band_h() + PALETTE_TOP + HEADING_H + rows as f64 * (TILE_H + TILE_GAP)
+        let all: Vec<&'static str> = toolbar::CUSTOMIZABLE.iter().map(|e| e.key).collect();
+        let slots = self.palette_slots(&all, width);
+        let bottom = slots.iter().map(|s| s.rect.origin.y + s.rect.size.height).fold(0.0, f64::max);
+        bottom.max(self.palette_top()) + TILE_GAP
     }
 
     // ---- geometry ----
@@ -248,24 +283,70 @@ impl ToolbarEditor {
         rect(PAD_X, BAND_Y, (w - 2.0 * PAD_X).max(1.0), self.band_h())
     }
 
+    /// The part of the band the button run may occupy: everything right of the traffic lights and
+    /// the session title. The run is drawn and hit-tested against this, so a run too long for the
+    /// preview's narrower window is cut at the title rather than drawn over it.
+    fn run_zone(&self, band: NSRect) -> NSRect {
+        let left = band.origin.x + TITLE_ZONE_W;
+        rect(left, band.origin.y, (band.origin.x + band.size.width - left).max(0.0), band.size.height)
+    }
+
     /// How many palette tiles fit on a row.
     fn cols(&self, width: f64) -> usize {
         (((width - 2.0 * PAD_X + TILE_GAP) / (TILE_W + TILE_GAP)).floor() as usize).max(1)
     }
 
+    /// Where the palette's first heading sits.
     fn palette_top(&self) -> f64 {
-        BAND_Y + self.band_h() + PALETTE_TOP + HEADING_H
+        BAND_Y + self.band_h() + PALETTE_TOP
     }
 
-    fn tile_rect(&self, i: usize) -> NSRect {
-        let cols = self.cols(self.frame().size.width);
-        let (col, row) = (i % cols, i / cols);
-        rect(
-            PAD_X + col as f64 * (TILE_W + TILE_GAP),
-            self.palette_top() + row as f64 * (TILE_H + TILE_GAP),
-            TILE_W,
-            TILE_H,
-        )
+    /// Lay the palette out: one heading per group that has tiles, then that group's tiles in rows.
+    ///
+    /// The single source of the palette's geometry — `render`, `hit` and `height` all read this, so
+    /// a section break cannot land in one of them and not the others. `index` is the position in the
+    /// flat palette list, which is what `Press::Palette` carries.
+    fn palette_slots(&self, palette: &[&'static str], width: f64) -> Vec<Slot> {
+        let cols = self.cols(width);
+        let mut slots = Vec::new();
+        let mut y = self.palette_top();
+        for g in toolbar::Group::ALL {
+            let of_group: Vec<usize> = palette
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| toolbar::entry(k).map(|e| e.group) == Some(g))
+                .map(|(i, _)| i)
+                .collect();
+            // A group with nothing left in it takes its heading with it, exactly as an empty run
+            // takes its space in the band.
+            if of_group.is_empty() {
+                continue;
+            }
+            slots.push(Slot { index: NO_INDEX, group: Some(g), rect: rect(PAD_X, y, width, HEADING_H) });
+            y += HEADING_H;
+            let rows = of_group.len().div_ceil(cols);
+            for (n, index) in of_group.into_iter().enumerate() {
+                let (col, row) = (n % cols, n / cols);
+                slots.push(Slot {
+                    index,
+                    group: None,
+                    rect: rect(
+                        PAD_X + col as f64 * (TILE_W + TILE_GAP),
+                        y + row as f64 * (TILE_H + TILE_GAP),
+                        TILE_W,
+                        TILE_H,
+                    ),
+                });
+            }
+            y += rows as f64 * (TILE_H + TILE_GAP) + SECTION_GAP;
+        }
+        slots
+    }
+
+    /// The palette laid out for what is actually in it right now.
+    fn slots_now(&self) -> Vec<Slot> {
+        let palette = self.ivars().palette.borrow().clone();
+        self.palette_slots(&palette, self.frame().size.width)
     }
 
     /// Where each of `keys` sits inside the band: one right-aligned run, exactly as the flexible
@@ -299,6 +380,11 @@ impl ToolbarEditor {
     fn hit(&self, p: NSPoint) -> Press {
         let band = self.band_rect();
         if contains(band, p) {
+            // Only the run's own zone: an item clipped away behind the title is not on screen, and
+            // a press there would grab something the user cannot see.
+            if !contains(self.run_zone(band), p) {
+                return Press::None;
+            }
             let keys = self.ivars().band.borrow().clone();
             for (i, (k, r)) in keys.iter().zip(self.item_rects(&keys, band)).enumerate() {
                 // The space is 8pt wide for real, which is a picture worth keeping and a target
@@ -310,9 +396,9 @@ impl ToolbarEditor {
             }
             return Press::None;
         }
-        for i in 0..self.ivars().palette.borrow().len() {
-            if contains(self.tile_rect(i), p) {
-                return Press::Palette(i);
+        for s in self.slots_now() {
+            if s.index != NO_INDEX && contains(s.rect, p) {
+                return Press::Palette(s.index);
             }
         }
         Press::None
@@ -322,6 +408,10 @@ impl ToolbarEditor {
     /// the pointer is not over the band.
     fn drop_index(&self, p: NSPoint) -> isize {
         let band = self.band_rect();
+        // The whole band, deliberately — not the run's clipped zone. A release over the title or
+        // the traffic lights is still a release *inside the toolbar*, and the count below already
+        // yields 0 there, which is "move it to the front". Narrowing this to the zone would make a
+        // drop the user can see land inside the bar mean "remove".
         if !contains(band, p) {
             return NO_DROP;
         }
@@ -436,9 +526,18 @@ impl ToolbarEditor {
         // ---- The buttons, right-aligned as the flexible space leaves them ----
         let keys = self.preview_keys();
         let rects = self.item_rects(&keys, band);
-        // The capsule recent macOS draws behind each run of adjacent items — which is what a space
-        // in the middle of the run is *for*, and so the one thing the preview cannot leave out.
+        // Clipped to the room left of the title, because the preview band is a *narrower* window
+        // than the real one: at 1:1 a long enough run outgrows it and would otherwise paint over
+        // the title and the traffic lights, which reads as a bug rather than as "your window is
+        // wider than this". The real toolbar has the whole window and only overflows into AppKit's
+        // own overflow menu. Everything is still laid out at full size — only the pixels are cut.
+        let zone = self.run_zone(band);
+        save_state();
+        clip(zone);
         for (from, to) in runs(&keys) {
+            // The capsule recent macOS draws behind each run of adjacent items — which is what a
+            // space in the middle of the run is *for*, and so the one thing the preview cannot
+            // leave out.
             let (a, b) = (rects[from], rects[to]);
             let plate = rect(
                 a.origin.x,
@@ -451,6 +550,23 @@ impl ToolbarEditor {
         }
         for (k, r) in keys.iter().zip(rects.iter()) {
             self.draw_entry(k, *r, tone);
+        }
+        restore_state();
+        // …and say so at the cut, rather than leaving a run that looks arbitrarily sliced. In the
+        // band's own dimmed tone, not a system label color: it sits inside the preview.
+        if rects.first().map(|r| r.origin.x < zone.origin.x).unwrap_or(false) {
+            let attrs = make_attrs(&caption, Some(&ns_color(theme::mix(t.fg, t.bg, 0.55))));
+            let s = NSString::from_str("…");
+            let sz = unsafe { s.sizeWithAttributes(Some(&attrs)) };
+            unsafe {
+                s.drawAtPoint_withAttributes(
+                    NSPoint::new(
+                        zone.origin.x - sz.width - 4.0,
+                        band.origin.y + (band.size.height - sz.height) / 2.0,
+                    ),
+                    Some(&attrs),
+                )
+            };
         }
 
         // The insertion caret, in the system accent color — the one mark here that must read the
@@ -467,6 +583,9 @@ impl ToolbarEditor {
                     let r = rects[i - 1];
                     r.origin.x + r.size.width
                 };
+                // Clamped into the run's zone: the caret is drawn after the clip is released, so
+                // an overflowing run would otherwise put it over the traffic lights.
+                let x = x.max(zone.origin.x);
                 let caret = rect(
                     x.round() - 1.0,
                     band.origin.y + PLATTER_INSET - 2.0,
@@ -477,20 +596,23 @@ impl ToolbarEditor {
             }
         }
 
-        // ---- The palette ----
-        let head_y = BAND_Y + self.band_h() + PALETTE_TOP;
-        draw_text("Not in the toolbar", NSPoint::new(PAD_X, head_y), &heading, &secondary);
+        // ---- The palette: what is out of the toolbar, under one heading per group ----
         let palette = self.ivars().palette.borrow().clone();
         let skip = match (dragging, self.ivars().press.get()) {
             // The tile being dragged is under the pointer instead of in its slot.
             (true, Press::Palette(i)) => Some(i),
             _ => None,
         };
-        for (i, k) in palette.iter().enumerate() {
-            if Some(i) == skip {
+        for s in self.slots_now() {
+            if let Some(g) = s.group {
+                draw_text(g.label(), NSPoint::new(s.rect.origin.x, s.rect.origin.y), &heading, &secondary);
                 continue;
             }
-            let r = self.tile_rect(i);
+            if Some(s.index) == skip {
+                continue;
+            }
+            let Some(k) = palette.get(s.index) else { continue };
+            let r = s.rect;
             let icon = rect(
                 r.origin.x + (TILE_W - ICON_BOX) / 2.0,
                 r.origin.y + 8.0,
@@ -499,8 +621,7 @@ impl ToolbarEditor {
             );
             self.draw_entry(k, icon, tone);
             if let Some(e) = toolbar::entry(k) {
-                let label = unsafe { NSFont::systemFontOfSize_weight(10.0, NSFontWeightRegular) };
-                draw_centered(e.label, rect(r.origin.x, r.origin.y + 30.0, TILE_W, 14.0), &label, &secondary);
+                draw_centered(e.label, rect(r.origin.x, r.origin.y + 30.0, TILE_W, 14.0), &tile_font, &secondary);
             }
         }
         if palette.is_empty() {
@@ -537,7 +658,16 @@ impl ToolbarEditor {
     fn draw_entry(&self, key: &str, r: NSRect, tone: theme::Rgb) {
         if key == toolbar::SPACE_KEY {
             let faint = theme::mix(tone, theme::current().bg, 0.5);
-            let bar = rect(r.origin.x + r.size.width / 2.0 - 1.0, r.origin.y + 20.0, 2.0, r.size.height - 40.0);
+            // Proportional, because this is drawn into two very different boxes: the band's 52pt
+            // item and the palette's 17pt icon square. A fixed inset that suits the first leaves
+            // nothing at all of the second.
+            let h = (r.size.height * 0.35).max(8.0);
+            let bar = rect(
+                (r.origin.x + r.size.width / 2.0 - 1.0).round(),
+                (r.origin.y + (r.size.height - h) / 2.0).round(),
+                2.0,
+                h,
+            );
             round_fill(bar, 1.0, &ns_color(faint));
             return;
         }
@@ -583,6 +713,26 @@ fn runs(keys: &[&'static str]) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// Push/pop the drawing state around a clip, on the context `drawRect:` is running in — there is no
+/// `NSView` API for a scoped clip, and the state has to be restored or the clip leaks into whatever
+/// AppKit draws next in the same pass.
+fn save_state() {
+    if let Some(ctx) = unsafe { NSGraphicsContext::currentContext() } {
+        unsafe { ctx.saveGraphicsState() };
+    }
+}
+
+fn restore_state() {
+    if let Some(ctx) = unsafe { NSGraphicsContext::currentContext() } {
+        unsafe { ctx.restoreGraphicsState() };
+    }
+}
+
+/// Clip everything drawn after this (until [`restore_state`]) to `r`.
+fn clip(r: NSRect) {
+    unsafe { NSBezierPath::bezierPathWithRect(r).addClip() };
 }
 
 fn contains(r: NSRect, p: NSPoint) -> bool {

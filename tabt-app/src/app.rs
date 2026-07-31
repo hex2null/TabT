@@ -1962,6 +1962,50 @@ impl AppController {
         self.send_active(b"\x15");
     }
 
+    /// Interrupt whatever is running, as `⌃C` does. Written to the shell rather than signalled from
+    /// here for the same reason the two erasers are: the terminal driver turns that byte into
+    /// SIGINT for the *foreground* process group, which is the one the user means and the one this
+    /// side cannot name — a `kill` from here would have to guess at it.
+    pub fn interrupt_active(&self) {
+        self.send_active(b"\x03");
+    }
+
+    /// Restart the active session: a fresh shell in the same tab, in the same directory.
+    ///
+    /// [`Self::restart_tab`] alone is only correct for a session that has **already ended** — it
+    /// overwrites `master_fd` and the reader token without closing either, so on a live tab it would
+    /// leak the pty and orphan the shell. So a live one is taken down first, exactly as
+    /// `end_tab_session` takes down a shell that exited on its own, after hanging up its process
+    /// group. A foreground job is confirmed first, on the same terms closing the tab would be: the
+    /// hangup kills it either way, and this is the user's last chance to say no.
+    pub fn restart_active_tab(&self) {
+        let Some(id) = self.model.borrow().active else { return };
+        let live = {
+            let m = self.model.borrow();
+            m.tabs.iter().find(|t| t.id == id).map(|t| t.state != SessionState::Ended).unwrap_or(false)
+        };
+        if live {
+            if self.tab_has_foreground_job(id)
+                && !confirm(self.mtm, "Restart this session?", RUNNING_JOB_WARNING, "Restart")
+            {
+                return;
+            }
+            // The shell is its own session leader (`setsid` in `pty::spawn`), so the negated pid
+            // names its whole process group — the job it is running goes with it. Read before the
+            // teardown, which sets the pid to -1.
+            let pid = self.model.borrow().tabs.iter().find(|t| t.id == id).map(|t| t.shell_pid);
+            if let Some(pid) = pid.filter(|p| *p > 0) {
+                unsafe { libc::kill(-pid, libc::SIGHUP) };
+            }
+            // Then exactly what a shell exiting on its own does — including the sidebar and header
+            // refreshes it owes for setting the state directly. Hand-rolling the teardown here
+            // would skip those, and `restart_tab` can still fail (no fds, no process table), which
+            // would leave the tab ended behind a stale dot and a stale meta line.
+            self.end_tab_session(id);
+        }
+        self.restart_tab(id);
+    }
+
     /// Write bytes to the active session's shell as if typed.
     fn send_active(&self, bytes: &[u8]) {
         let m = self.model.borrow();
