@@ -77,24 +77,81 @@ const CODEX_ID: &str = "dev.local.tabt.toolbar.codex";
 /// AppKit's own item, which eats whatever width is left — it is what pins the session actions to
 /// the trailing end while the leading pair stays by the traffic lights.
 const FLEX_ID: &str = "NSToolbarFlexibleSpaceItem";
-/// The buttons Settings → Toolbar can turn off, in the order they appear. The short key is what
-/// `layout.conf` stores; the label is what the checkbox says.
-pub const CUSTOMIZABLE: [(&str, &str, &str); 9] = [
-    ("claude", CLAUDE_ID, "Claude"),
-    ("codex", CODEX_ID, "Codex"),
-    ("home", HOME_ID, "Home (cd ~)"),
-    ("copy", COPY_ID, "Copy"),
-    ("paste", PASTE_ID, "Paste"),
-    ("clearline", CLEAR_LINE_ID, "Clear Line"),
-    ("clear", CLEAR_ID, "Clear Screen"),
-    ("screenshot", SHOT_ID, "Screenshot"),
-    ("share", SHARE_ID, "Share"),
+/// AppKit's fixed-width space. Recent macOS draws a run of adjacent items in one capsule, so this
+/// is what splits that run: by default the two launchers get a capsule of their own, apart from the
+/// actions that operate on the session already in front of you. It is one draggable entry in the
+/// customizer like any other button, so where that split falls is the user's.
+const SPACE_ID: &str = "NSToolbarSpaceItem";
+/// The space's key in the stored layout — the one entry in [`CUSTOMIZABLE`] with no item of its own.
+pub const SPACE_KEY: &str = "space";
+
+/// One entry the customizer can place: the short key `layout.conf` stores, the toolbar identifier,
+/// the label the customizer shows under it, the symbol it draws, and its tooltip.
+pub struct Entry {
+    pub key: &'static str,
+    id: &'static str,
+    pub label: &'static str,
+    pub symbol: &'static str,
+    tip: &'static str,
+}
+
+/// Everything the trailing group can hold, in the order it holds it out of the box — which is also
+/// the order a button added by a later version is appended in (see [`layout`]).
+///
+/// One table, so the customizer's tile and the toolbar's item cannot describe the same button
+/// differently; the action is the one thing that cannot live in a `const` and is looked up by key
+/// in [`action_for`].
+pub const CUSTOMIZABLE: [Entry; 10] = [
+    Entry { key: "claude", id: CLAUDE_ID, label: "Claude", symbol: "claude", tip: "Run claude in this session" },
+    Entry { key: "codex", id: CODEX_ID, label: "Codex", symbol: "openai", tip: "Run codex in this session" },
+    Entry { key: SPACE_KEY, id: SPACE_ID, label: "Space", symbol: "", tip: "" },
+    Entry { key: "home", id: HOME_ID, label: "Home", symbol: "house", tip: "cd ~" },
+    Entry { key: "copy", id: COPY_ID, label: "Copy", symbol: "doc.on.doc", tip: "Copy (⌘C)" },
+    Entry { key: "paste", id: PASTE_ID, label: "Paste", symbol: "doc.on.clipboard", tip: "Paste (⌘V)" },
+    Entry { key: "clearline", id: CLEAR_LINE_ID, label: "Clear Line", symbol: "delete.left", tip: "Clear Line (⌃U)" },
+    Entry { key: "clear", id: CLEAR_ID, label: "Clear", symbol: "eraser", tip: "Clear Screen (⌃L)" },
+    Entry { key: "screenshot", id: SHOT_ID, label: "Screenshot", symbol: "camera.viewfinder", tip: "Screenshot (⇧⌘5)" },
+    Entry { key: "share", id: SHARE_ID, label: "Share", symbol: SHARE_SYMBOL, tip: "Export or reveal this session" },
 ];
 
-/// AppKit's fixed-width space. Recent macOS draws a run of adjacent items in one capsule, so this
-/// is what splits that run: the two launchers get a capsule of their own, apart from the actions
-/// that operate on the session already in front of you.
-const SPACE_ID: &str = "NSToolbarSpaceItem";
+/// The entry with that key, if this build has one — a stored layout may name a button an older or
+/// newer version had.
+pub fn entry(key: &str) -> Option<&'static Entry> {
+    CUSTOMIZABLE.iter().find(|e| e.key == key)
+}
+
+/// What the trailing group actually holds, in order: the user's arrangement, resolved against what
+/// this build knows and what they have switched off.
+///
+/// Two stored keys feed this and neither is redundant. `toolbar_hidden` is the visibility, and it
+/// is the *hidden* set so a button a later version adds appears rather than staying invisible;
+/// `toolbar_order` is the arrangement, and a shown button it does not mention — exactly that newly
+/// added one — is appended in this table's own order rather than dropped.
+pub fn layout() -> Vec<&'static str> {
+    let shows = |k: &str| settings::toolbar_shows(k);
+    let stored = settings::toolbar_order();
+    let mut keys: Vec<&'static str> = Vec::new();
+    for e in stored.iter().filter_map(|k| entry(k)).filter(|e| shows(e.key)) {
+        // Deduplicated here rather than trusted: `layout.conf` is hand-editable, and a repeated
+        // key would insert the *same* `NSToolbarItem` at two indices, which AppKit does not
+        // support. It is also what keeps the space a single movable entry.
+        if !keys.contains(&e.key) {
+            keys.push(e.key);
+        }
+    }
+    for e in CUSTOMIZABLE.iter() {
+        if shows(e.key) && !keys.contains(&e.key) && !stored.iter().any(|k| k == e.key) {
+            keys.push(e.key);
+        }
+    }
+    keys
+}
+
+/// The keys not in [`layout`] — what the customizer offers to drag back in.
+pub fn removed() -> Vec<&'static str> {
+    let shown = layout();
+    CUSTOMIZABLE.iter().map(|e| e.key).filter(|k| !shown.contains(k)).collect()
+}
 
 pub struct DelegateIvars {
     items: Vec<(String, Retained<NSToolbarItem>)>,
@@ -164,18 +221,17 @@ impl ToolbarDelegate {
             ids.extend_from_slice(&[SEARCH_ID, TOGGLE_ID]);
         }
         ids.push(FLEX_ID);
-        // Two capsules: the launchers, then the actions on the session already in front of you.
-        // Whatever the user has switched off in Settings → Toolbar drops out here, and a group that
-        // ends up empty takes its separator with it — a lone space would leave a gap with nothing
-        // on one side of it.
-        let on = |k: &str| settings::toolbar_shows(k);
-        let launchers: Vec<&'static str> = CUSTOMIZABLE[0..2].iter().filter(|(k, ..)| on(k)).map(|(_, id, _)| *id).collect();
-        let actions: Vec<&'static str> = CUSTOMIZABLE[2..].iter().filter(|(k, ..)| on(k)).map(|(_, id, _)| *id).collect();
-        ids.extend_from_slice(&launchers);
-        if !launchers.is_empty() && !actions.is_empty() {
-            ids.push(SPACE_ID);
+        // The user's arrangement (Settings → Toolbar), with the space they placed splitting the run
+        // into capsules. A space at either end is dropped: leading, it is a gap against the
+        // flexible space that eats the row anyway; trailing, a gap with nothing on one side of it.
+        let mut keys = layout();
+        while keys.first() == Some(&SPACE_KEY) {
+            keys.remove(0);
         }
-        ids.extend_from_slice(&actions);
+        while keys.last() == Some(&SPACE_KEY) {
+            keys.pop();
+        }
+        ids.extend(keys.iter().filter_map(|k| entry(k)).map(|e| e.id));
         ids
     }
 
@@ -184,13 +240,37 @@ impl ToolbarDelegate {
     }
 }
 
+/// What each customizable button sends. The one part of [`CUSTOMIZABLE`] that cannot live in the
+/// table itself, since a `Sel` is not a `const`.
+///
+/// `copy:`/`paste:` are the terminal's own, so they travel the responder chain to whichever
+/// `TermView` has the keyboard exactly as the Edit menu's items do (see [`Toolbar::set_target`]).
+/// The two launchers type their command into the session and press Return, which is all "run claude
+/// here" means — the shell resolves it on $PATH exactly as the user would.
+fn action_for(key: &str) -> Option<Sel> {
+    Some(match key {
+        "claude" => sel!(runClaude:),
+        "codex" => sel!(runCodex:),
+        "home" => sel!(goHome:),
+        "copy" => sel!(copy:),
+        "paste" => sel!(paste:),
+        "clearline" => sel!(clearLine:),
+        "clear" => sel!(clearScreen:),
+        "screenshot" => sel!(takeScreenshot:),
+        // A table row added without a case here gets no action rather than a wrong one: the item
+        // then validates as disabled, which is visible, where a plausible-looking default would
+        // quietly fire the neighbouring button's selector.
+        _ => return None,
+    })
+}
+
 /// One of the two buttons: a system symbol in a bordered toolbar item, which is what gives it the
 /// standard size, hover highlight and pressed state.
 ///
 /// The action is the selector the matching View-menu item already sends, so the menu and the button
 /// cannot drift. The target is set once the menu target exists (see [`Toolbar::set_target`]); until
 /// then the item validates against the responder chain and simply stays disabled.
-fn item(mtm: MainThreadMarker, id: &str, symbol: &str, label: &str, tip: &str, action: Sel) -> Retained<NSToolbarItem> {
+fn item(mtm: MainThreadMarker, id: &str, symbol: &str, label: &str, tip: &str, action: Option<Sel>) -> Retained<NSToolbarItem> {
     unsafe {
         let item = NSToolbarItem::initWithItemIdentifier(mtm.alloc(), &NSString::from_str(id));
         let label = NSString::from_str(label);
@@ -199,7 +279,7 @@ fn item(mtm: MainThreadMarker, id: &str, symbol: &str, label: &str, tip: &str, a
         item.setPaletteLabel(&label);
         item.setToolTip(Some(&NSString::from_str(tip)));
         item.setBordered(true);
-        item.setAction(Some(action));
+        item.setAction(action);
         item
     }
 }
@@ -211,32 +291,65 @@ fn item(mtm: MainThreadMarker, id: &str, symbol: &str, label: &str, tip: &str, a
 /// mechanism `view::draw_symbol` uses for the self-drawn icons, so the toolbar and the card's own
 /// strip end up the same tone. It has to be re-applied on every theme change ([`Toolbar::apply_theme`]).
 fn set_symbol(item: &NSToolbarItem, symbol: &str, label: &NSString) {
-    let tone = { let t = theme::current(); theme::mix(t.fg, t.bg, ICON_DIM) };
+    let tone = icon_tone();
+    let Some(colored) = icon_image(symbol, tone, Some(label)) else { return };
     unsafe {
-        // A bundled artwork of that name wins — that is how `claude` and `openai` get their own
-        // marks — and everything else is a system symbol. Both end up tinted to the same tone at
-        // the same size, so a brand glyph sits in the row as one more icon rather than as a logo.
-        let colored = match bundled_image(symbol) {
-            Some(img) => tinted(&img, tone),
-            None => {
-                let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                    &NSString::from_str(symbol),
-                    Some(label),
-                ) else {
-                    return;
-                };
-                let color_cfg = NSImageSymbolConfiguration::configurationWithHierarchicalColor(&ns_color(tone));
-                let size_cfg = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
-                    ICON_PT,
-                    NSFontWeightRegular,
-                    NSImageSymbolScale::Medium,
-                );
-                let cfg = size_cfg.configurationByApplyingConfiguration(&color_cfg);
-                img.imageWithSymbolConfiguration(&cfg).unwrap_or(img)
-            }
-        };
         colored.setTemplate(false);
         item.setImage(Some(&colored));
+    }
+}
+
+/// The tone every one of these icons is drawn in: the theme's foreground, dimmed toward its
+/// background. Shared with the customizer's preview, which has to land on the same gray.
+pub fn icon_tone() -> theme::Rgb {
+    let t = theme::current();
+    theme::mix(t.fg, t.bg, ICON_DIM)
+}
+
+/// One toolbar icon at [`ICON_PT`], tinted to `tone`.
+///
+/// A bundled artwork of that name wins — that is how `claude` and `openai` get their own marks —
+/// and everything else is a system symbol. Both end up tinted to the same tone at the same size, so
+/// a brand glyph sits in the row as one more icon rather than as a logo. The customizer draws its
+/// preview through this too: `view::draw_symbol` knows only the system's symbols, and would render
+/// the two brand marks as nothing at all.
+pub fn icon_image(symbol: &str, tone: theme::Rgb, label: Option<&NSString>) -> Option<Retained<NSImage>> {
+    unsafe {
+        if let Some(img) = bundled_image(symbol) {
+            return Some(tinted(&img, tone));
+        }
+        let img = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str(symbol),
+            label,
+        )?;
+        let color_cfg = NSImageSymbolConfiguration::configurationWithHierarchicalColor(&ns_color(tone));
+        let size_cfg = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
+            ICON_PT,
+            NSFontWeightRegular,
+            NSImageSymbolScale::Medium,
+        );
+        let cfg = size_cfg.configurationByApplyingConfiguration(&color_cfg);
+        Some(img.imageWithSymbolConfiguration(&cfg).unwrap_or(img))
+    }
+}
+
+/// Draw one toolbar icon centered in `r` — the customizer's preview, at the size and tone the real
+/// band uses.
+///
+/// Centered at the image's own size and snapped to whole points, for the reason
+/// `view::draw_symbol` documents: these are hairline glyphs, and an origin off the pixel grid
+/// renders them as a soft smudge.
+pub fn draw_icon(symbol: &str, r: NSRect, tone: theme::Rgb) {
+    let Some(img) = icon_image(symbol, tone, None) else { return };
+    unsafe {
+        let sz = img.size();
+        img.drawInRect(NSRect::new(
+            NSPoint::new(
+                (r.origin.x + (r.size.width - sz.width) / 2.0).round(),
+                (r.origin.y + (r.size.height - sz.height) / 2.0).round(),
+            ),
+            NSSize::new(sz.width.round(), sz.height.round()),
+        ));
     }
 }
 
@@ -328,33 +441,33 @@ impl Toolbar {
         // session actions are the terminal's own, so their actions travel the responder chain to
         // the mounted `TermView` exactly as the Edit menu's items do — `copy:`/`paste:` are its
         // methods, and clear/reveal are the controller's, reached through the same menu target.
-        let spec: [(&'static str, &'static str, &str, &str, Sel); 10] = [
+        // The sidebar pair, which the customizer does not touch — they are the collapsed state's
+        // stand-ins for the card's own strip, not session actions.
+        let pair: [(&'static str, &'static str, &str, &str, Sel); 2] = [
             (TOGGLE_ID, "sidebar.left", "Sidebar", "Show Sidebar (⌘B)", sel!(toggleSidebar:)),
             (SEARCH_ID, "magnifyingglass", "Search", "Search Sessions (⌘F)", sel!(findSession:)),
-            (HOME_ID, "house", "Home", "cd ~", sel!(goHome:)),
-            (COPY_ID, "doc.on.doc", "Copy", "Copy (⌘C)", sel!(copy:)),
-            (PASTE_ID, "doc.on.clipboard", "Paste", "Paste (⌘V)", sel!(paste:)),
-            (CLEAR_LINE_ID, "delete.left", "Clear Line", "Clear Line (⌃U)", sel!(clearLine:)),
-            (CLEAR_ID, "eraser", "Clear", "Clear Screen (⌃L)", sel!(clearScreen:)),
-            (SHOT_ID, "camera.viewfinder", "Screenshot", "Screenshot (⇧⌘5)", sel!(takeScreenshot:)),
-            // The two launchers type their command into the session and press Return, which is all
-            // "run claude here" means — the shell resolves it on $PATH exactly as the user would.
-            (CLAUDE_ID, "claude", "Claude", "Run claude in this session", sel!(runClaude:)),
-            (CODEX_ID, "openai", "Codex", "Run codex in this session", sel!(runCodex:)),
         ];
-        let mut built: Vec<(&str, Retained<NSToolbarItem>)> = spec
+        let mut built: Vec<(&str, &'static str, Retained<NSToolbarItem>)> = pair
             .iter()
-            .map(|(id, sym, label, tip, action)| (*id, item(mtm, id, sym, label, tip, *action)))
+            .map(|(id, sym, label, tip, action)| (*id, *sym, item(mtm, id, sym, label, tip, Some(*action))))
             .collect();
+        // …then everything the trailing group can hold, from the one table that describes it. The
+        // space is AppKit's own item and the share button carries a menu rather than an action, so
+        // both are built elsewhere; every other entry is a plain bordered image item.
+        for e in CUSTOMIZABLE.iter() {
+            if e.key == SPACE_KEY || e.id == SHARE_ID {
+                continue;
+            }
+            built.push((e.id, e.symbol, item(mtm, e.id, e.symbol, e.label, e.tip, action_for(e.key))));
+        }
         let (share, share_menu) = share_item(mtm);
-        built.push((SHARE_ID, share));
-        let symbols = spec.iter().map(|(_, sym, ..)| *sym).chain(std::iter::once(SHARE_SYMBOL));
+        built.push((SHARE_ID, SHARE_SYMBOL, share));
         let items: Vec<(Retained<NSToolbarItem>, &'static str)> =
-            built.iter().zip(symbols).map(|((_, it), sym)| (it.clone(), sym)).collect();
+            built.iter().map(|(_, sym, it)| (it.clone(), *sym)).collect();
         let delegate: Retained<ToolbarDelegate> = {
             let this = mtm.alloc();
             let this = this.set_ivars(DelegateIvars {
-                items: built.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+                items: built.iter().map(|(k, _, v)| (k.to_string(), v.clone())).collect(),
             });
             unsafe { msg_send_id![super(this), init] }
         };

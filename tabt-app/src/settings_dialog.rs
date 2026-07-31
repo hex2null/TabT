@@ -1,5 +1,5 @@
 //! Settings dialog: a small native panel with standard AppKit controls, split into tabs
-//! (Theme / Appearance / Terminal / Shell).
+//! (Theme / Appearance / Toolbar / Terminal / Shell).
 //!
 //! It replaces the old bottom-of-sidebar pop-up menu. The controls read/write through the
 //! [`AppController`], so every change applies live and is persisted immediately. The panel
@@ -9,6 +9,11 @@
 //! Rows are laid out by [`Rows`], a cursor that walks down a pane one `ROW_H` at a time: adding a
 //! setting is one `rows.next()`, not a re-tune of a column of hand-computed constants. The panes
 //! are sized to the tallest one (`MAX_ROWS`), so switching tabs never resizes the window.
+//!
+//! Two panes are not control rows at all but self-drawn views, for the same reason: a name in a
+//! pop-up says nothing about a color scheme, and a checkbox says nothing about where a button sits.
+//! Theme is `theme_grid.rs`, Toolbar is `toolbar_editor.rs` — and the second is what sets [`W`],
+//! since it draws the window's own title bar at 1:1.
 
 use std::cell::{Cell, RefCell};
 
@@ -28,10 +33,13 @@ use objc2_foundation::{
 use crate::app::AppController;
 use crate::settings;
 use crate::theme_grid::ThemeGrid;
+use crate::toolbar_editor::ToolbarEditor;
 
-/// Window content width. The panes are the same, less `MARGIN` on each side. Sized for the theme
-/// grid — two preview cards wide — rather than for the control rows, which need far less.
-const W: f64 = 524.0;
+/// Window content width. The panes are the same, less `MARGIN` on each side. Sized for the Toolbar
+/// pane, which draws the window's own title bar at 1:1 and therefore needs room for the whole run
+/// of buttons *plus* the traffic lights and the title beside them; the theme grid (two preview
+/// cards) and the control rows both want less and simply spread out.
+const W: f64 = 640.0;
 /// Gap between the window edge and the tab view.
 const MARGIN: f64 = 12.0;
 /// Vertical distance between two rows.
@@ -42,6 +50,8 @@ const ROW_H: f64 = 38.0;
 const PANE_H: f64 = 384.0;
 /// Gap between the top of a pane and its first row.
 const PANE_TOP: f64 = 20.0;
+/// Room the Toolbar pane leaves at its bottom for the Restore Defaults button.
+const RESET_H: f64 = 40.0;
 
 /// The panes, in order — the segmented switcher's labels and the tab view's items.
 const PANES: [&str; 5] = ["Theme", "Appearance", "Toolbar", "Terminal", "Shell"];
@@ -51,10 +61,20 @@ const SWITCHER_H: f64 = 34.0;
 /// "Appearance" into an ellipsis.
 const SWITCHER_W: f64 = 425.0;
 
-const LABEL_X: f64 = 26.0;
+/// A labelled row is a fixed block — label column, gap, control — and the block is *centered* in
+/// the pane rather than pinned to a left margin. The panel's width is set by the Toolbar pane's 1:1
+/// title bar, which is far wider than any control row needs; left-pinned rows in a pane that wide
+/// leave a field of empty space on one side only, under a switcher that is itself centered.
 const LABEL_W: f64 = 100.0;
-const CTRL_X: f64 = 134.0;
 const CTRL_W: f64 = 250.0;
+/// Label-to-control gap, and the whole block's width.
+const LABEL_GAP: f64 = 8.0;
+const ROW_W: f64 = LABEL_W + LABEL_GAP + CTRL_W;
+/// Where that block starts. Measured against the pane, which is the window less its margins and the
+/// few points of chrome the tab view keeps for itself — close enough to centered that a point of
+/// slop does not show, and it costs no plumbing through every row builder.
+const LABEL_X: f64 = (W - 2.0 * MARGIN - ROW_W) / 2.0;
+const CTRL_X: f64 = LABEL_X + LABEL_W + LABEL_GAP;
 /// Width of the number shown beside a slider, at the right end of the control column.
 const VALUE_W: f64 = 26.0;
 /// Font-size range the slider covers. The same bounds the text field used to clamp to, so no
@@ -90,7 +110,7 @@ pub struct DialogIvars {
     size_slider: RefCell<Option<Retained<NSSlider>>>,
     size_value: RefCell<Option<Retained<NSTextField>>>,
     side_pop: RefCell<Option<Retained<NSPopUpButton>>>,
-    toolbar_boxes: RefCell<Vec<Retained<NSButton>>>,
+    toolbar_editor: RefCell<Option<Retained<ToolbarEditor>>>,
     pad_slider: RefCell<Option<Retained<NSSlider>>>,
     pad_value: RefCell<Option<Retained<NSTextField>>>,
     cursor_pop: RefCell<Option<Retained<NSPopUpButton>>>,
@@ -150,15 +170,11 @@ declare_class!(
             }
         }
 
-        /// One of the Toolbar pane's checkboxes. The tag is the row's index into
-        /// `toolbar::CUSTOMIZABLE`, so nothing here has to know the button list twice.
-        #[method(toolbarItemToggled:)]
-        fn toolbar_item_toggled(&self, sender: &NSButton) {
-            let idx = unsafe { sender.tag() } as usize;
-            let Some((key, ..)) = crate::toolbar::CUSTOMIZABLE.get(idx) else { return };
-            let on = unsafe { sender.state() } != 0;
-            if let Some(c) = self.controller() {
-                c.set_toolbar_shows(key, on);
+        /// Toolbar → Restore Defaults: every button back, in the built-in order.
+        #[method(restoreToolbar:)]
+        fn restore_toolbar(&self, _sender: &NSButton) {
+            if let Some(e) = self.ivars().toolbar_editor.borrow().as_ref() {
+                e.restore_defaults();
             }
         }
 
@@ -276,7 +292,7 @@ impl SettingsDialog {
             size_slider: RefCell::new(None),
             size_value: RefCell::new(None),
             side_pop: RefCell::new(None),
-            toolbar_boxes: RefCell::new(Vec::new()),
+            toolbar_editor: RefCell::new(None),
             pad_slider: RefCell::new(None),
             pad_value: RefCell::new(None),
             cursor_pop: RefCell::new(None),
@@ -533,29 +549,42 @@ impl SettingsDialog {
     }
 
     /// Shell: which shell to run, and where a new tab starts.
-    /// Toolbar: one checkbox per button in the trailing group, in the order they appear there.
+    /// Toolbar: the customizer — a full-size picture of the band with the buttons in it, and the
+    /// ones that are out below (`toolbar_editor.rs`).
     ///
-    /// Laid out on a tighter step than `Rows` — a checkbox is a line of text, not a labelled
-    /// control, and nine of them on the 38pt row pitch would not fit the pane the theme grid sizes.
+    /// The editor is self-drawn and top-down, so it is mounted flush with the top of the pane and
+    /// sized by its own `height()`; the only standard control here is the Restore Defaults button
+    /// under it, on the pane's own bottom edge.
     fn build_toolbar(&self, pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
         let pane = new_pane(pane_w, mtm);
-        let mut y = PANE_H - PANE_TOP - 4.0;
-        for (key, _, label) in crate::toolbar::CUSTOMIZABLE {
-            let cb = unsafe {
-                NSButton::checkboxWithTitle_target_action(&NSString::from_str(label), Some(self), Some(sel!(toolbarItemToggled:)), mtm)
-            };
-            unsafe {
-                cb.setFrame(NSRect::new(NSPoint::new(LABEL_X, y), NSSize::new(pane_w - 2.0 * LABEL_X, 20.0)));
-                // The tag carries the row's index into `CUSTOMIZABLE`, so the action needs nothing
-                // but the sender to know which button it is.
-                let idx = crate::toolbar::CUSTOMIZABLE.iter().position(|(k, ..)| *k == key).unwrap_or(0);
-                cb.setTag(idx as isize);
-                cb.setState(if settings::toolbar_shows(key) { 1 } else { 0 });
-                pane.addSubview(&cb);
-            }
-            self.ivars().toolbar_boxes.borrow_mut().push(cb);
-            y -= 26.0;
+        let editor = ToolbarEditor::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(pane_w, PANE_H)));
+        if let Some(c) = self.controller() {
+            editor.set_controller(c as *const AppController);
         }
+        // The controller answers the band's height, so the editor can only size itself once it has
+        // one — and a non-flipped pane places a subview by its bottom edge, so the frame is set
+        // from the measured height rather than left at the pane's.
+        let h = editor.height(pane_w).min(PANE_H - RESET_H);
+        unsafe {
+            editor.setFrame(NSRect::new(NSPoint::new(0.0, PANE_H - h), NSSize::new(pane_w, h)));
+            pane.addSubview(&editor);
+        }
+
+        let reset = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("Restore Defaults"),
+                Some(self),
+                Some(sel!(restoreToolbar:)),
+                mtm,
+            )
+        };
+        unsafe {
+            // Aligned with the editor's own left margin, not with the control rows: this pane has
+            // none, and the button belongs under the band's leading edge.
+            reset.setFrame(NSRect::new(NSPoint::new(crate::toolbar_editor::PAD_X - 6.0, 8.0), NSSize::new(150.0, 24.0)));
+            pane.addSubview(&reset);
+        }
+        *self.ivars().toolbar_editor.borrow_mut() = Some(editor);
         pane
     }
 
@@ -677,6 +706,15 @@ impl SettingsDialog {
         }
     }
 
+    /// The theme changed under an open panel. Only the Toolbar pane's band preview cares: it is
+    /// painted in the theme's colors, and unlike the terminal's own views nothing invalidates it
+    /// when the theme moves.
+    pub fn theme_changed(&self) {
+        if let Some(e) = self.ivars().toolbar_editor.borrow().as_ref() {
+            unsafe { e.setNeedsDisplay(true) };
+        }
+    }
+
     /// Re-read the current settings into the controls.
     fn seed_values(&self) {
         let ctrl = match self.controller() {
@@ -701,11 +739,8 @@ impl SettingsDialog {
         if let Some(p) = store.side_pop.borrow().as_ref() {
             unsafe { p.selectItemAtIndex(if ctrl.sidebar_on_right() { 1 } else { 0 }) };
         }
-        for cb in store.toolbar_boxes.borrow().iter() {
-            let idx = unsafe { cb.tag() } as usize;
-            if let Some((key, ..)) = crate::toolbar::CUSTOMIZABLE.get(idx) {
-                unsafe { cb.setState(if settings::toolbar_shows(key) { 1 } else { 0 }) };
-            }
+        if let Some(e) = store.toolbar_editor.borrow().as_ref() {
+            e.reload();
         }
         let pad = settings::pad();
         if let Some(s) = store.pad_slider.borrow().as_ref() {

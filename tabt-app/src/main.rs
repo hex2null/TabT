@@ -25,6 +25,7 @@ mod theme;
 mod theme_grid;
 mod toggle;
 mod toolbar;
+mod toolbar_editor;
 mod view;
 
 use objc2::msg_send;

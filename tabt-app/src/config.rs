@@ -107,6 +107,10 @@ pub struct Settings {
     // Toolbar buttons switched off in Settings → Toolbar, by their short keys. Stored as the
     // hidden set so a button a later version adds shows up rather than staying hidden.
     pub toolbar_hidden: Vec<String>,
+    // The order the customizer's drag left them in, by the same keys. Empty = the built-in order;
+    // a key this build does not know is dropped, and a shown key the list does not mention is
+    // appended (see `toolbar::layout`).
+    pub toolbar_order: Vec<String>,
     pub window_x: Option<f64>,
     pub window_y: Option<f64>,
     pub cursor_shape: CursorShape,
@@ -135,6 +139,7 @@ impl Default for Settings {
             window_w: 0.0,
             window_h: 0.0,
             toolbar_hidden: Vec::new(),
+            toolbar_order: Vec::new(),
             window_x: None,
             window_y: None,
             cursor_shape: CursorShape::Block,
@@ -274,6 +279,10 @@ pub fn parse(text: &str) -> Layout {
                 }
                 "toolbar_hidden" => {
                     s.toolbar_hidden =
+                        value.split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_string).collect()
+                }
+                "toolbar_order" => {
+                    s.toolbar_order =
                         value.split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_string).collect()
                 }
                 "window_x" => s.window_x = value.parse::<f64>().ok(),
@@ -439,6 +448,9 @@ fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String
     if !s.toolbar_hidden.is_empty() {
         out.push_str(&format!("toolbar_hidden = {}\n", s.toolbar_hidden.join(",")));
     }
+    if !s.toolbar_order.is_empty() {
+        out.push_str(&format!("toolbar_order = {}\n", s.toolbar_order.join(",")));
+    }
     if let (Some(x), Some(y)) = (s.window_x, s.window_y) {
         out.push_str(&format!("window_x = {}\n", x));
         out.push_str(&format!("window_y = {}\n", y));
@@ -560,6 +572,7 @@ mod tests {
             window_w: 1200.0,
             window_h: 800.0,
             toolbar_hidden: vec!["copy".to_string(), "share".to_string()],
+            toolbar_order: vec!["clear".to_string(), "space".to_string(), "claude".to_string()],
             window_x: Some(-40.0),
             window_y: Some(-120.5),
             cursor_shape: CursorShape::Underline,
@@ -586,6 +599,7 @@ mod tests {
         // and the size fields' "0 means unset" trick would swallow the first of them.
         assert_eq!((g.window_x, g.window_y), (Some(-40.0), Some(-120.5)));
         assert_eq!(g.toolbar_hidden, vec!["copy".to_string(), "share".to_string()]);
+        assert_eq!(g.toolbar_order, vec!["clear".to_string(), "space".to_string(), "claude".to_string()]);
         assert!(g.cursor_shape == CursorShape::Underline);
         assert!(g.cursor_blink);
         assert_eq!(g.scrollback, 12_000);

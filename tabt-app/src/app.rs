@@ -496,6 +496,11 @@ impl AppController {
         // `drawRect:`.
         card::apply_theme(&self.card);
         self.toolbar.apply_theme();
+        // The settings panel may be open on the Toolbar pane, whose band preview is painted in the
+        // theme's colors — it is a `drawRect:` view, but nothing else invalidates it from here.
+        if let Some(d) = self.settings_dialog.borrow().as_ref() {
+            d.theme_changed();
+        }
     }
 
     /// Set `view`'s frame — animated while a sidebar collapse/expand is in flight, instant
@@ -672,7 +677,7 @@ impl AppController {
     /// `contentLayoutRect` is the content view minus that band. It falls back to [`HEADER_H`] while
     /// the window has no content view yet, and is clamped because a full-screen window reports no
     /// band at all — the terminal would then run under the notch/menu bar on the way in.
-    fn band_h(&self) -> f64 {
+    pub fn band_h(&self) -> f64 {
         let Some(cv) = self.window.contentView() else { return HEADER_H };
         let band = cv.bounds().size.height - unsafe { self.window.contentLayoutRect() }.size.height;
         if band.is_finite() && (8.0..=200.0).contains(&band) {
@@ -750,6 +755,7 @@ impl AppController {
         settings::set_pad(cfg.padding);
         settings::set_opacity(cfg.opacity);
         settings::set_toolbar_hidden(cfg.toolbar_hidden.clone());
+        settings::set_toolbar_order(cfg.toolbar_order.clone());
         self.toolbar.rebuild();
         self.sync_blink_timer();
         // Restore the saved window size (clamped to a sane range) before laying out / spawning
@@ -1878,13 +1884,13 @@ impl AppController {
         }
     }
 
-    /// Settings → Toolbar: switch one of the toolbar's buttons on or off.
-    pub fn set_toolbar_shows(&self, key: &str, shown: bool) {
-        let mut hidden = settings::toolbar_hidden();
-        hidden.retain(|k| k != key);
-        if !shown {
-            hidden.push(key.to_string());
-        }
+    /// Settings → Toolbar: the arrangement the customizer's drag left behind.
+    ///
+    /// Both halves travel together and are the customizer's whole state: `order` is what the
+    /// trailing group holds, in order, and `hidden` is what it does not — see `toolbar::layout` for
+    /// why the second is stored as the removed set rather than derived from the first.
+    pub fn set_toolbar_layout(&self, order: Vec<String>, hidden: Vec<String>) {
+        settings::set_toolbar_order(order);
         settings::set_toolbar_hidden(hidden);
         self.toolbar.rebuild();
         self.save();
@@ -2034,6 +2040,7 @@ impl AppController {
                 padding: settings::pad(),
                 opacity: settings::opacity(),
                 toolbar_hidden: settings::toolbar_hidden(),
+                toolbar_order: settings::toolbar_order(),
             },
             &ungrouped,
             &groups,
