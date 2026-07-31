@@ -630,15 +630,6 @@ impl TermView {
         self.ivars().sel_head.set(None);
     }
 
-    /// Clear screen (⌘K): directly feed ED(2) + cursor home to the Grid.
-    pub fn clear(&self) {
-        let mut grid = self.ivars().grid.borrow_mut();
-        grid.feed(b"\x1b[2J\x1b[H");
-        grid.scroll_to_bottom(); // a cleared screen has nothing to read back to
-        drop(grid);
-        unsafe { self.setNeedsDisplay(true) };
-    }
-
     /// Bind the owning tab id, end/restart callbacks, the ⌘B collapse callback and the title/cwd
     /// change callback (called by AppController after creation).
     pub fn attach(&self, ctx: *const c_void, tab_id: u64, end: EndFn, restart: RestartFn, toggle: CmdFn, meta: MetaFn) {

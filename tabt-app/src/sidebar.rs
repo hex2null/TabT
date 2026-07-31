@@ -839,11 +839,13 @@ impl SidebarView {
             round_fill(inset, 7.0, &overlay(ROW_HOVER));
         }
         Self::draw_status_dot(row);
-        // Small terminal icon + session name.
-        // A session that printed something you have not seen is brightened to the primary color —
-        // the same weight a selected row gets. Deliberately not a third dot form: the dot already
-        // carries running/idle/ended, and a fourth variant there would be unreadable at 6pt.
-        let fg = if row.selected || row.activity { text_primary() } else { text_secondary() };
+        // Small terminal icon + session name. The tier depends on selection and nothing else: a
+        // row's brightness is a fact about the list, not about the session, and having unseen
+        // output raise it left every row that had printed anything sitting at full weight until it
+        // was visited — the contrast that says "this is the one you are in" gone until then. The
+        // unseen mark is a dot on the right instead (below), which says the same thing without
+        // touching the text.
+        let fg = if row.selected { text_primary() } else { text_secondary() };
         draw_symbol("terminal", rect(row.indent + 12.0, vmid(12.0), 14.0, 12.0), fg);
         // Name truncates with an ellipsis; leaves room for the right-side meta / "⋯".
         let name_x = row.indent + 30.0;
@@ -855,6 +857,10 @@ impl SidebarView {
             draw_symbol("ellipsis", rect(w - 28.0, vmid(11.0), 16.0, 11.0), text_placeholder());
         } else if row.bell {
             draw_symbol("bell.fill", rect(w - 26.0, vmid(12.0), 12.0, 12.0), fg);
+        } else if row.activity {
+            // Unseen output: the unread dot every mail client has, and gone the moment the tab is
+            // selected. Below the bell, which is an event rather than a standing fact.
+            round_fill(rect(w - 23.0, vmid(6.0), 6.0, 6.0), 3.0, &ns_color(text_placeholder()));
         } else if row.locked {
             draw_symbol("lock.fill", rect(w - 26.0, vmid(12.0), 11.0, 12.0), text_placeholder());
         } else if row.selected {
@@ -1935,7 +1941,7 @@ impl SidebarView {
     /// different questions now, and the focus marks answer this one.
     fn has_keyboard(&self) -> bool {
         let Some(window) = self.window() else { return false };
-        let Some(fr) = (unsafe { window.firstResponder() }) else { return false };
+        let Some(fr) = window.firstResponder() else { return false };
         std::ptr::eq(&*fr as *const _ as *const u8, self as *const Self as *const u8)
     }
 

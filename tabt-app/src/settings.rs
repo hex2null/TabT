@@ -147,6 +147,22 @@ thread_local! {
     // Inheriting the active tab's directory is what the app did before the setting existed, so it
     // stays the default: an upgrade must not change where ⌘T lands.
     static NEW_TAB_DIR: Cell<NewTabDir> = const { Cell::new(NewTabDir::Active) };
+    // Toolbar buttons the user has switched off (see `toolbar_shows`).
+    static TOOLBAR_HIDDEN: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whether a toolbar button is shown. Stored as the *hidden* set, so a button added by a later
+/// version appears by default rather than staying invisible on an older config.
+pub fn toolbar_shows(key: &str) -> bool {
+    TOOLBAR_HIDDEN.with(|h| !h.borrow().iter().any(|k| k == key))
+}
+
+pub fn toolbar_hidden() -> Vec<String> {
+    TOOLBAR_HIDDEN.with(|h| h.borrow().clone())
+}
+
+pub fn set_toolbar_hidden(v: Vec<String>) {
+    TOOLBAR_HIDDEN.with(|h| *h.borrow_mut() = v);
 }
 
 /// How the text cursor is drawn.

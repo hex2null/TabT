@@ -44,10 +44,12 @@ const PANE_H: f64 = 384.0;
 const PANE_TOP: f64 = 20.0;
 
 /// The panes, in order — the segmented switcher's labels and the tab view's items.
-const PANES: [&str; 4] = ["Theme", "Appearance", "Terminal", "Shell"];
+const PANES: [&str; 5] = ["Theme", "Appearance", "Toolbar", "Terminal", "Shell"];
 /// The switcher's own strip above the panes.
 const SWITCHER_H: f64 = 34.0;
-const SWITCHER_W: f64 = 340.0;
+/// Sized for the widest label at the segment count — five panes at 340 squeezed
+/// "Appearance" into an ellipsis.
+const SWITCHER_W: f64 = 425.0;
 
 const LABEL_X: f64 = 26.0;
 const LABEL_W: f64 = 100.0;
@@ -88,6 +90,7 @@ pub struct DialogIvars {
     size_slider: RefCell<Option<Retained<NSSlider>>>,
     size_value: RefCell<Option<Retained<NSTextField>>>,
     side_pop: RefCell<Option<Retained<NSPopUpButton>>>,
+    toolbar_boxes: RefCell<Vec<Retained<NSButton>>>,
     pad_slider: RefCell<Option<Retained<NSSlider>>>,
     pad_value: RefCell<Option<Retained<NSTextField>>>,
     cursor_pop: RefCell<Option<Retained<NSPopUpButton>>>,
@@ -144,6 +147,18 @@ declare_class!(
         fn cancel_panel(&self, _sender: Option<&AnyObject>) {
             if let Some(w) = self.ivars().window.borrow().as_ref() {
                 unsafe { w.performClose(None) };
+            }
+        }
+
+        /// One of the Toolbar pane's checkboxes. The tag is the row's index into
+        /// `toolbar::CUSTOMIZABLE`, so nothing here has to know the button list twice.
+        #[method(toolbarItemToggled:)]
+        fn toolbar_item_toggled(&self, sender: &NSButton) {
+            let idx = unsafe { sender.tag() } as usize;
+            let Some((key, ..)) = crate::toolbar::CUSTOMIZABLE.get(idx) else { return };
+            let on = unsafe { sender.state() } != 0;
+            if let Some(c) = self.controller() {
+                c.set_toolbar_shows(key, on);
             }
         }
 
@@ -261,6 +276,7 @@ impl SettingsDialog {
             size_slider: RefCell::new(None),
             size_value: RefCell::new(None),
             side_pop: RefCell::new(None),
+            toolbar_boxes: RefCell::new(Vec::new()),
             pad_slider: RefCell::new(None),
             pad_value: RefCell::new(None),
             cursor_pop: RefCell::new(None),
@@ -367,8 +383,9 @@ impl SettingsDialog {
         unsafe {
             add_pane(&tabs, PANES[0], self.build_theme(pane_w, mtm), mtm);
             add_pane(&tabs, PANES[1], self.build_appearance(pane_w, mtm), mtm);
-            add_pane(&tabs, PANES[2], self.build_terminal(pane_w, mtm), mtm);
-            add_pane(&tabs, PANES[3], self.build_shell(pane_w, mtm), mtm);
+            add_pane(&tabs, PANES[2], self.build_toolbar(pane_w, mtm), mtm);
+            add_pane(&tabs, PANES[3], self.build_terminal(pane_w, mtm), mtm);
+            add_pane(&tabs, PANES[4], self.build_shell(pane_w, mtm), mtm);
             content.addSubview(&tabs);
         }
 
@@ -516,6 +533,32 @@ impl SettingsDialog {
     }
 
     /// Shell: which shell to run, and where a new tab starts.
+    /// Toolbar: one checkbox per button in the trailing group, in the order they appear there.
+    ///
+    /// Laid out on a tighter step than `Rows` — a checkbox is a line of text, not a labelled
+    /// control, and nine of them on the 38pt row pitch would not fit the pane the theme grid sizes.
+    fn build_toolbar(&self, pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
+        let pane = new_pane(pane_w, mtm);
+        let mut y = PANE_H - PANE_TOP - 4.0;
+        for (key, _, label) in crate::toolbar::CUSTOMIZABLE {
+            let cb = unsafe {
+                NSButton::checkboxWithTitle_target_action(&NSString::from_str(label), Some(self), Some(sel!(toolbarItemToggled:)), mtm)
+            };
+            unsafe {
+                cb.setFrame(NSRect::new(NSPoint::new(LABEL_X, y), NSSize::new(pane_w - 2.0 * LABEL_X, 20.0)));
+                // The tag carries the row's index into `CUSTOMIZABLE`, so the action needs nothing
+                // but the sender to know which button it is.
+                let idx = crate::toolbar::CUSTOMIZABLE.iter().position(|(k, ..)| *k == key).unwrap_or(0);
+                cb.setTag(idx as isize);
+                cb.setState(if settings::toolbar_shows(key) { 1 } else { 0 });
+                pane.addSubview(&cb);
+            }
+            self.ivars().toolbar_boxes.borrow_mut().push(cb);
+            y -= 26.0;
+        }
+        pane
+    }
+
     fn build_shell(&self, pane_w: f64, mtm: MainThreadMarker) -> Retained<NSView> {
         let pane = new_pane(pane_w, mtm);
         let mut rows = Rows::new();
@@ -657,6 +700,12 @@ impl SettingsDialog {
         self.set_value_label(&store.size_value, size);
         if let Some(p) = store.side_pop.borrow().as_ref() {
             unsafe { p.selectItemAtIndex(if ctrl.sidebar_on_right() { 1 } else { 0 }) };
+        }
+        for cb in store.toolbar_boxes.borrow().iter() {
+            let idx = unsafe { cb.tag() } as usize;
+            if let Some((key, ..)) = crate::toolbar::CUSTOMIZABLE.get(idx) {
+                unsafe { cb.setState(if settings::toolbar_shows(key) { 1 } else { 0 }) };
+            }
         }
         let pad = settings::pad();
         if let Some(s) = store.pad_slider.borrow().as_ref() {

@@ -86,6 +86,14 @@ declare_class!(
         fn last_session(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.select_recent_tab());
         }
+        #[method(takeScreenshot:)]
+        fn take_screenshot(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.open_screenshot_ui());
+        }
+        #[method(clearLine:)]
+        fn clear_line(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.clear_line_active());
+        }
         #[method(goHome:)]
         fn go_home(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.run_in_active("cd ~"));

@@ -49,6 +49,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSArray, NSObjectProtocol, NSString};
 
+use crate::settings;
 use crate::theme;
 use crate::view::ns_color;
 
@@ -65,7 +66,9 @@ const TOGGLE_ID: &str = "dev.local.tabt.toolbar.toggle";
 const SEARCH_ID: &str = "dev.local.tabt.toolbar.search";
 const COPY_ID: &str = "dev.local.tabt.toolbar.copy";
 const PASTE_ID: &str = "dev.local.tabt.toolbar.paste";
+const CLEAR_LINE_ID: &str = "dev.local.tabt.toolbar.clearline";
 const CLEAR_ID: &str = "dev.local.tabt.toolbar.clear";
+const SHOT_ID: &str = "dev.local.tabt.toolbar.screenshot";
 const SHARE_ID: &str = "dev.local.tabt.toolbar.share";
 const HOME_ID: &str = "dev.local.tabt.toolbar.home";
 const CLAUDE_ID: &str = "dev.local.tabt.toolbar.claude";
@@ -73,6 +76,20 @@ const CODEX_ID: &str = "dev.local.tabt.toolbar.codex";
 /// AppKit's own item, which eats whatever width is left — it is what pins the session actions to
 /// the trailing end while the leading pair stays by the traffic lights.
 const FLEX_ID: &str = "NSToolbarFlexibleSpaceItem";
+/// The buttons Settings → Toolbar can turn off, in the order they appear. The short key is what
+/// `layout.conf` stores; the label is what the checkbox says.
+pub const CUSTOMIZABLE: [(&str, &str, &str); 9] = [
+    ("claude", CLAUDE_ID, "Claude"),
+    ("codex", CODEX_ID, "Codex"),
+    ("home", HOME_ID, "Home (cd ~)"),
+    ("copy", COPY_ID, "Copy"),
+    ("paste", PASTE_ID, "Paste"),
+    ("clearline", CLEAR_LINE_ID, "Clear Line"),
+    ("clear", CLEAR_ID, "Clear Screen"),
+    ("screenshot", SHOT_ID, "Screenshot"),
+    ("share", SHARE_ID, "Share"),
+];
+
 /// AppKit's fixed-width space. Recent macOS draws a run of adjacent items in one capsule, so this
 /// is what splits that run: the two launchers get a capsule of their own, apart from the actions
 /// that operate on the session already in front of you.
@@ -145,7 +162,19 @@ impl ToolbarDelegate {
         if with_sidebar_pair {
             ids.extend_from_slice(&[SEARCH_ID, TOGGLE_ID]);
         }
-        ids.extend_from_slice(&[FLEX_ID, CLAUDE_ID, CODEX_ID, SPACE_ID, HOME_ID, COPY_ID, PASTE_ID, CLEAR_ID, SHARE_ID]);
+        ids.push(FLEX_ID);
+        // Two capsules: the launchers, then the actions on the session already in front of you.
+        // Whatever the user has switched off in Settings → Toolbar drops out here, and a group that
+        // ends up empty takes its separator with it — a lone space would leave a gap with nothing
+        // on one side of it.
+        let on = |k: &str| settings::toolbar_shows(k);
+        let launchers: Vec<&'static str> = CUSTOMIZABLE[0..2].iter().filter(|(k, ..)| on(k)).map(|(_, id, _)| *id).collect();
+        let actions: Vec<&'static str> = CUSTOMIZABLE[2..].iter().filter(|(k, ..)| on(k)).map(|(_, id, _)| *id).collect();
+        ids.extend_from_slice(&launchers);
+        if !launchers.is_empty() && !actions.is_empty() {
+            ids.push(SPACE_ID);
+        }
+        ids.extend_from_slice(&actions);
         ids
     }
 
@@ -263,13 +292,15 @@ impl Toolbar {
         // session actions are the terminal's own, so their actions travel the responder chain to
         // the mounted `TermView` exactly as the Edit menu's items do — `copy:`/`paste:` are its
         // methods, and clear/reveal are the controller's, reached through the same menu target.
-        let spec: [(&'static str, &'static str, &str, &str, Sel); 8] = [
+        let spec: [(&'static str, &'static str, &str, &str, Sel); 10] = [
             (TOGGLE_ID, "sidebar.left", "Sidebar", "Show Sidebar (⌘B)", sel!(toggleSidebar:)),
             (SEARCH_ID, "magnifyingglass", "Search", "Search Sessions (⌘F)", sel!(findSession:)),
             (HOME_ID, "house", "Home", "cd ~", sel!(goHome:)),
             (COPY_ID, "doc.on.doc", "Copy", "Copy (⌘C)", sel!(copy:)),
             (PASTE_ID, "doc.on.clipboard", "Paste", "Paste (⌘V)", sel!(paste:)),
+            (CLEAR_LINE_ID, "delete.left", "Clear Line", "Clear Line (⌃U)", sel!(clearLine:)),
             (CLEAR_ID, "eraser", "Clear", "Clear Screen (⌃L)", sel!(clearScreen:)),
+            (SHOT_ID, "camera.viewfinder", "Screenshot", "Screenshot (⇧⌘5)", sel!(takeScreenshot:)),
             // The two launchers type their command into the session and press Return, which is all
             // "run claude here" means — the shell resolves it on $PATH exactly as the user would.
             (CLAUDE_ID, "sparkles", "Claude", "Run claude in this session", sel!(runClaude:)),
@@ -328,11 +359,18 @@ impl Toolbar {
             return;
         }
         self.shown.set(shown);
+        self.rebuild();
+    }
+
+    /// Re-lay the toolbar from the current state and settings. Removing and re-inserting is the
+    /// whole mechanism: `NSToolbarItem` has no setter for `isVisible`, and this runs once per
+    /// collapse or settings change, not per frame.
+    pub fn rebuild(&self) {
         unsafe {
             while self.toolbar.items().count() > 0 {
                 self.toolbar.removeItemAtIndex(0);
             }
-            for (i, id) in ToolbarDelegate::identifiers(shown).into_iter().enumerate() {
+            for (i, id) in ToolbarDelegate::identifiers(self.shown.get()).into_iter().enumerate() {
                 self.toolbar.insertItemWithItemIdentifier_atIndex(&NSString::from_str(id), i as isize);
             }
         }

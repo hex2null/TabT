@@ -104,6 +104,9 @@ pub struct Settings {
     // absent — means "no saved position, center it", which is what every config written before this
     // existed says. It cannot be a sentinel number the way the size is: 0 is a real coordinate, and
     // so is a negative one, on a display sitting above or left of the main one.
+    // Toolbar buttons switched off in Settings → Toolbar, by their short keys. Stored as the
+    // hidden set so a button a later version adds shows up rather than staying hidden.
+    pub toolbar_hidden: Vec<String>,
     pub window_x: Option<f64>,
     pub window_y: Option<f64>,
     pub cursor_shape: CursorShape,
@@ -131,6 +134,7 @@ impl Default for Settings {
             sidebar_right: false,
             window_w: 0.0,
             window_h: 0.0,
+            toolbar_hidden: Vec::new(),
             window_x: None,
             window_y: None,
             cursor_shape: CursorShape::Block,
@@ -267,6 +271,10 @@ pub fn parse(text: &str) -> Layout {
                     if let Ok(n) = value.parse::<f64>() {
                         s.window_w = n;
                     }
+                }
+                "toolbar_hidden" => {
+                    s.toolbar_hidden =
+                        value.split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_string).collect()
                 }
                 "window_x" => s.window_x = value.parse::<f64>().ok(),
                 "window_y" => s.window_y = value.parse::<f64>().ok(),
@@ -428,6 +436,9 @@ fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String
         out.push_str(&format!("window_width = {}\n", s.window_w));
         out.push_str(&format!("window_height = {}\n", s.window_h));
     }
+    if !s.toolbar_hidden.is_empty() {
+        out.push_str(&format!("toolbar_hidden = {}\n", s.toolbar_hidden.join(",")));
+    }
     if let (Some(x), Some(y)) = (s.window_x, s.window_y) {
         out.push_str(&format!("window_x = {}\n", x));
         out.push_str(&format!("window_y = {}\n", y));
@@ -548,6 +559,7 @@ mod tests {
             sidebar_right: true,
             window_w: 1200.0,
             window_h: 800.0,
+            toolbar_hidden: vec!["copy".to_string(), "share".to_string()],
             window_x: Some(-40.0),
             window_y: Some(-120.5),
             cursor_shape: CursorShape::Underline,
@@ -573,6 +585,7 @@ mod tests {
         // Negative and fractional on purpose: a display above or left of the main one gives both,
         // and the size fields' "0 means unset" trick would swallow the first of them.
         assert_eq!((g.window_x, g.window_y), (Some(-40.0), Some(-120.5)));
+        assert_eq!(g.toolbar_hidden, vec!["copy".to_string(), "share".to_string()]);
         assert!(g.cursor_shape == CursorShape::Underline);
         assert!(g.cursor_blink);
         assert_eq!(g.scrollback, 12_000);

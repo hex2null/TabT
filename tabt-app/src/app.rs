@@ -98,6 +98,9 @@ struct Tab {
     /// `TermView::output_seq` as of the last sample, to spot new output without the PTY path
     /// having to notify anyone.
     last_seq: u64,
+    // Whether `last_seq` has been compared against a real reading yet. See `sample_states`: the
+    // first one is a baseline, not a change.
+    primed: bool,
     /// The shell this session is actually running. Per tab, not read from Settings: changing the
     /// setting deliberately leaves running shells alone, so the global value names what the *next*
     /// tab will run and would misreport this one.
@@ -746,6 +749,8 @@ impl AppController {
         settings::set_new_tab_dir(cfg.new_tab_dir);
         settings::set_pad(cfg.padding);
         settings::set_opacity(cfg.opacity);
+        settings::set_toolbar_hidden(cfg.toolbar_hidden.clone());
+        self.toolbar.rebuild();
         self.sync_blink_timer();
         // Restore the saved window size (clamped to a sane range) before laying out / spawning
         // tabs. The upper bound guards against a corrupted config producing an unusable
@@ -851,6 +856,7 @@ impl AppController {
             activity: false,
             bell: false,
             last_seq: 0,
+            primed: false,
             shell,
             // Record where the shell actually starts, not what was requested: `pty::spawn` falls
             // back to HOME on an empty cwd, and leaving that blank here would leave a fresh tab
@@ -882,6 +888,7 @@ impl AppController {
                 t.activity = false;
                 t.bell = false;
                 t.last_seq = t.view.output_seq();
+                t.primed = true; // selecting is a reading too, so the sampler must not re-baseline
             }
             // A collapsed group hides its tabs, so the tab just made active would have no row in
             // the sidebar and keystrokes would go to a terminal nothing marks as selected. The rule
@@ -1596,7 +1603,15 @@ impl AppController {
                 // marking the tab in front of you would be noise, and `select` clears them anyway.
                 let seq = t.view.output_seq();
                 let background = active != Some(t.id);
-                if seq != t.last_seq {
+                // A session's own start-up counts for nothing: at spawn `last_seq` is 0 and the
+                // shell has not printed its prompt yet, so the first sample after a restore would
+                // otherwise mark every tab in the layout as having unseen output — the whole
+                // sidebar, on every launch, until each one had been clicked. The first observation
+                // only establishes the baseline.
+                if !t.primed {
+                    t.primed = true;
+                    t.last_seq = seq;
+                } else if seq != t.last_seq {
                     t.last_seq = seq;
                     if background && !t.activity {
                         t.activity = true;
@@ -1863,6 +1878,29 @@ impl AppController {
         }
     }
 
+    /// Settings → Toolbar: switch one of the toolbar's buttons on or off.
+    pub fn set_toolbar_shows(&self, key: &str, shown: bool) {
+        let mut hidden = settings::toolbar_hidden();
+        hidden.retain(|k| k != key);
+        if !shown {
+            hidden.push(key.to_string());
+        }
+        settings::set_toolbar_hidden(hidden);
+        self.toolbar.rebuild();
+        self.save();
+    }
+
+    /// Bring up the system's screenshot palette — the one ⇧⌘5 shows.
+    ///
+    /// Opens Screenshot.app rather than synthesizing the keystroke: a synthetic ⇧⌘5 needs
+    /// Accessibility permission this app has no other reason to ask for, and would be swallowed
+    /// outright if the user has rebound the shortcut. Launching the app is what the shortcut does.
+    pub fn open_screenshot_ui(&self) {
+        let _ = std::process::Command::new("open")
+            .args(["-b", "com.apple.screenshot.launcher"])
+            .spawn();
+    }
+
     /// Open the active tab's current directory in Finder.
     pub fn reveal_in_finder(&self) {
         if let Some(a) = self.model.borrow().active {
@@ -1908,10 +1946,22 @@ impl AppController {
     /// program knows it — the shell repaints its prompt at the top of the cleared screen, and a
     /// full-screen application redraws itself instead, which is the right answer for both.
     pub fn clear_active(&self) {
+        self.send_active(b"\x0c");
+    }
+
+    /// Discard whatever is typed at the prompt, as `⌃U` does — the toolbar's other eraser. Sent to
+    /// the shell for the same reason `⌃L` is: the line belongs to the line editor, not to the grid,
+    /// and blanking those cells would leave the shell still holding the text.
+    pub fn clear_line_active(&self) {
+        self.send_active(b"\x15");
+    }
+
+    /// Write bytes to the active session's shell as if typed.
+    fn send_active(&self, bytes: &[u8]) {
         let m = self.model.borrow();
         if let Some(a) = m.active {
             if let Some(tab) = m.tabs.iter().find(|t| t.id == a) {
-                tab.view.send(b"\x0c");
+                tab.view.send(bytes);
             }
         }
     }
@@ -1983,6 +2033,7 @@ impl AppController {
                 new_tab_dir: settings::new_tab_dir(),
                 padding: settings::pad(),
                 opacity: settings::opacity(),
+                toolbar_hidden: settings::toolbar_hidden(),
             },
             &ungrouped,
             &groups,
