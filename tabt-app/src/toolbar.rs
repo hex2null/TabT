@@ -43,11 +43,12 @@ use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
 use objc2::runtime::Sel;
 use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSFontWeightRegular, NSImage, NSImageSymbolConfiguration, NSImageSymbolScale, NSMenu,
-    NSMenuItem, NSMenuToolbarItem, NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode,
-    NSToolbarItem, NSToolbarItemIdentifier, NSWindow, NSWindowToolbarStyle,
+    NSCompositingOperation, NSFontWeightRegular, NSImage, NSImageSymbolConfiguration,
+    NSImageSymbolScale, NSMenu, NSMenuItem, NSMenuToolbarItem, NSRectFillUsingOperation, NSToolbar,
+    NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSToolbarItemIdentifier, NSWindow,
+    NSWindowToolbarStyle,
 };
-use objc2_foundation::{MainThreadMarker, NSArray, NSObjectProtocol, NSString};
+use objc2_foundation::{MainThreadMarker, NSArray, NSBundle, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 use crate::settings;
 use crate::theme;
@@ -210,25 +211,60 @@ fn item(mtm: MainThreadMarker, id: &str, symbol: &str, label: &str, tip: &str, a
 /// mechanism `view::draw_symbol` uses for the self-drawn icons, so the toolbar and the card's own
 /// strip end up the same tone. It has to be re-applied on every theme change ([`Toolbar::apply_theme`]).
 fn set_symbol(item: &NSToolbarItem, symbol: &str, label: &NSString) {
-    let t = theme::current();
+    let tone = { let t = theme::current(); theme::mix(t.fg, t.bg, ICON_DIM) };
     unsafe {
-        let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(symbol),
-            Some(label),
-        ) else {
-            return;
+        // A bundled artwork of that name wins — that is how `claude` and `openai` get their own
+        // marks — and everything else is a system symbol. Both end up tinted to the same tone at
+        // the same size, so a brand glyph sits in the row as one more icon rather than as a logo.
+        let colored = match bundled_image(symbol) {
+            Some(img) => tinted(&img, tone),
+            None => {
+                let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str(symbol),
+                    Some(label),
+                ) else {
+                    return;
+                };
+                let color_cfg = NSImageSymbolConfiguration::configurationWithHierarchicalColor(&ns_color(tone));
+                let size_cfg = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
+                    ICON_PT,
+                    NSFontWeightRegular,
+                    NSImageSymbolScale::Medium,
+                );
+                let cfg = size_cfg.configurationByApplyingConfiguration(&color_cfg);
+                img.imageWithSymbolConfiguration(&cfg).unwrap_or(img)
+            }
         };
-        let color_cfg = NSImageSymbolConfiguration::configurationWithHierarchicalColor(&ns_color(theme::mix(t.fg, t.bg, ICON_DIM)));
-        let size_cfg = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
-            ICON_PT,
-            NSFontWeightRegular,
-            NSImageSymbolScale::Medium,
-        );
-        let cfg = size_cfg.configurationByApplyingConfiguration(&color_cfg);
-        let colored = img.imageWithSymbolConfiguration(&cfg).unwrap_or(img);
         colored.setTemplate(false);
         item.setImage(Some(&colored));
     }
+}
+
+/// A PNG shipped in `Contents/Resources`, or None — an unbundled `cargo build` has no resources at
+/// all, and the caller falls back to a system symbol there (see `set_symbol`).
+unsafe fn bundled_image(name: &str) -> Option<Retained<NSImage>> {
+    let path = NSBundle::mainBundle()
+        .pathForResource_ofType(Some(&NSString::from_str(name)), Some(&NSString::from_str("png")))?;
+    NSImage::initWithContentsOfFile(NSImage::alloc(), &path)
+}
+
+/// Redraw `img` in one flat color at the icon size, keeping its alpha.
+///
+/// The artwork is a black glyph on transparency, so this is the same result the symbols get from a
+/// hierarchical color configuration: `sourceAtop` paints the color over everything the glyph
+/// covers and leaves the transparent parts alone. Marking it a template instead would hand the
+/// tinting to AppKit, which would use its own control color rather than the theme's.
+#[allow(deprecated)] // lockFocus/unlockFocus: a 16pt icon rebuilt on a theme change, not per frame
+unsafe fn tinted(img: &NSImage, tone: (f64, f64, f64)) -> Retained<NSImage> {
+    let size = NSSize::new(ICON_PT, ICON_PT);
+    let out = NSImage::initWithSize(NSImage::alloc(), size);
+    let r = NSRect::new(NSPoint::new(0.0, 0.0), size);
+    out.lockFocus();
+    img.drawInRect_fromRect_operation_fraction(r, NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)), NSCompositingOperation::SourceOver, 1.0);
+    ns_color(tone).set();
+    NSRectFillUsingOperation(r, NSCompositingOperation::SourceAtop);
+    out.unlockFocus();
+    out
 }
 
 /// Symbol for the share item, kept out of `spec` because that table is keyed by action and this
@@ -303,8 +339,8 @@ impl Toolbar {
             (SHOT_ID, "camera.viewfinder", "Screenshot", "Screenshot (⇧⌘5)", sel!(takeScreenshot:)),
             // The two launchers type their command into the session and press Return, which is all
             // "run claude here" means — the shell resolves it on $PATH exactly as the user would.
-            (CLAUDE_ID, "sparkles", "Claude", "Run claude in this session", sel!(runClaude:)),
-            (CODEX_ID, "chevron.left.forwardslash.chevron.right", "Codex", "Run codex in this session", sel!(runCodex:)),
+            (CLAUDE_ID, "claude", "Claude", "Run claude in this session", sel!(runClaude:)),
+            (CODEX_ID, "openai", "Codex", "Run codex in this session", sel!(runCodex:)),
         ];
         let mut built: Vec<(&str, Retained<NSToolbarItem>)> = spec
             .iter()

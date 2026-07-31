@@ -57,6 +57,9 @@ bundle: build
 	# Credits shown by the standard About panel (the app menu's "About"); carries the repository
 	# link. Same rule as above: it has to land before codesign.
 	cp bundle/Credits.rtf "$(BUNDLE)/Resources/"
+	# Artwork for the toolbar's claude/codex buttons (toolbar::bundled_image). Same rule again:
+	# a resource added after codesign invalidates the signature.
+	cp bundle/claude.png bundle/openai.png "$(BUNDLE)/Resources/"
 	@if security find-certificate -c "$(CERT_NAME)" >/dev/null 2>&1; then \
 		codesign --force --sign "$(CERT_NAME)" "$(APP)"; \
 	else \
