@@ -45,11 +45,12 @@ const MARGIN: f64 = 12.0;
 /// Vertical distance between two rows.
 const ROW_H: f64 = 38.0;
 /// Height of every pane's content area — one size for all of them, so switching tabs never
-/// resizes the window. Set by the Toolbar pane's worst case — every button dragged out, so the
-/// palette carries all of them under both headings — since that pane is drawn into a fixed frame
-/// and a palette taller than it is clipped rather than scrolled. The theme grid scrolls and the
-/// control panes hold less, so both simply use what they need of it.
-const PANE_H: f64 = 408.0;
+/// resizes the window. Set by the Toolbar pane's worst case: its two rows, plus a palette holding
+/// every button (all of them dragged out), plus the Restore Defaults row. That pane is drawn into a
+/// fixed frame and a palette taller than it is clipped rather than scrolled, so the size has to be
+/// the worst case and not the usual one. The theme grid scrolls and the control panes hold less, so
+/// both simply use what they need of it.
+const PANE_H: f64 = 456.0;
 /// Gap between the top of a pane and its first row.
 const PANE_TOP: f64 = 20.0;
 /// Room the Toolbar pane leaves at its bottom for the Restore Defaults button.

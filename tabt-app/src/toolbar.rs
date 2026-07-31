@@ -85,20 +85,25 @@ const FONT_DOWN_ID: &str = "dev.local.tabt.toolbar.fontdown";
 /// the trailing end while the leading pair stays by the traffic lights.
 const FLEX_ID: &str = "NSToolbarFlexibleSpaceItem";
 /// AppKit's fixed-width space. Recent macOS draws a run of adjacent items in one capsule, so this
-/// is what splits that run: by default the two launchers get a capsule of their own, apart from the
-/// actions that operate on the session already in front of you. It is one draggable entry in the
-/// customizer like any other button, so where that split falls is the user's.
+/// is what splits that run into the two capsules: the AI launchers, then the actions that operate on
+/// the session already in front of you.
 const SPACE_ID: &str = "NSToolbarSpaceItem";
-/// The space's key in the stored layout — the one entry in [`CUSTOMIZABLE`] with no item of its own.
+/// How the stored order writes that split: everything before this token is the AI row, everything
+/// after it the Common row (see [`rows`]).
+///
+/// A token in the list rather than an entry with a tile of its own, because the customizer draws the
+/// two groups as **two rows** and the break between them is the row break — there is nothing left for
+/// a draggable "Space" button to mean. Configs written when it *was* one read back unchanged, which
+/// is the whole reason the divider kept this key.
 pub const SPACE_KEY: &str = "space";
 
-/// Which half of the toolbar an entry belongs to: the AI launchers, or the actions that operate on
-/// the session already in front of you.
+/// Which half of the toolbar a button sits in: the AI launchers, or the actions that operate on the
+/// session already in front of you. One capsule each, in this order.
 ///
-/// The split is **soft**. It sets the order the table hands out by default and the headings the
-/// customizer groups its palette under, and that is all: nothing in [`ToolbarDelegate::identifiers`]
-/// reads it, so where the capsules actually fall stays the placed space's job and a drag can put any
-/// button anywhere. Hard zones would take back the one thing the customizer is for.
+/// A button's group is **the row the user put it in**, not a fixed property of the button: the
+/// customizer draws one editable row per group and dragging across the gap moves a button between
+/// them. [`Entry::group`] is only where a button starts — the row it joins the first time it is
+/// placed, and the row an older config's arrangement is read back into when it recorded no divider.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Group {
     Ai,
@@ -106,7 +111,7 @@ pub enum Group {
 }
 
 impl Group {
-    /// The heading the customizer's palette shows over this group's tiles.
+    /// The heading the customizer shows over this group's row.
     pub fn label(self) -> &'static str {
         match self {
             Group::Ai => "AI",
@@ -114,7 +119,7 @@ impl Group {
         }
     }
 
-    /// The groups, in the order the palette lists them.
+    /// The groups, in the order the toolbar holds them.
     pub const ALL: [Group; 2] = [Group::Ai, Group::Common];
 }
 
@@ -127,6 +132,8 @@ pub struct Entry {
     pub label: &'static str,
     pub symbol: &'static str,
     tip: &'static str,
+    /// Where the button starts: the row it joins when nothing has placed it yet. Not where it stays
+    /// — see [`Group`].
     pub group: Group,
     /// Whether a config that has never mentioned this key gets the button.
     ///
@@ -143,7 +150,7 @@ pub struct Entry {
 /// One table, so the customizer's tile and the toolbar's item cannot describe the same button
 /// differently; the action is the one thing that cannot live in a `const` and is looked up by key
 /// in [`action_for`].
-pub const CUSTOMIZABLE: [Entry; 17] = [
+pub const CUSTOMIZABLE: [Entry; 16] = [
     // ---- AI: each types its command into the session and presses Return ----
     Entry { key: "claude", id: CLAUDE_ID, label: "Claude", symbol: "claude", tip: "Run claude in this session", group: Group::Ai, default_on: true },
     Entry { key: "codex", id: CODEX_ID, label: "Codex", symbol: "openai", tip: "Run codex in this session", group: Group::Ai, default_on: true },
@@ -151,7 +158,6 @@ pub const CUSTOMIZABLE: [Entry; 17] = [
     Entry { key: "aider", id: AIDER_ID, label: "Aider", symbol: "wand.and.stars", tip: "Run aider in this session", group: Group::Ai, default_on: false },
     Entry { key: "cursor", id: CURSOR_ID, label: "Cursor", symbol: "cursorarrow.rays", tip: "Run cursor-agent in this session", group: Group::Ai, default_on: false },
     // ---- Common: the session in front of you ----
-    Entry { key: SPACE_KEY, id: SPACE_ID, label: "Space", symbol: "", tip: "", group: Group::Common, default_on: true },
     Entry { key: "home", id: HOME_ID, label: "Home", symbol: "house", tip: "cd ~", group: Group::Common, default_on: true },
     Entry { key: "copy", id: COPY_ID, label: "Copy", symbol: "doc.on.doc", tip: "Copy (⌘C)", group: Group::Common, default_on: true },
     Entry { key: "paste", id: PASTE_ID, label: "Paste", symbol: "doc.on.clipboard", tip: "Paste (⌘V)", group: Group::Common, default_on: true },
@@ -171,49 +177,87 @@ pub fn entry(key: &str) -> Option<&'static Entry> {
     CUSTOMIZABLE.iter().find(|e| e.key == key)
 }
 
-/// What the trailing group actually holds, in order: the user's arrangement, resolved against what
-/// this build knows and what they have switched off.
+/// The two rows the toolbar holds, in order: `(ai, common)`. The customizer edits exactly these, one
+/// row each, and this is what resolves them out of the stored config.
 ///
-/// Two stored keys feed this and neither is redundant. `toolbar_hidden` is the visibility, and it
-/// is the *hidden* set so a button a later version adds appears rather than staying invisible;
-/// `toolbar_order` is the arrangement, and a shown button it does not mention — exactly that newly
-/// added one — is appended in this table's own order rather than dropped.
+/// Two stored keys feed it and neither is redundant. `toolbar_hidden` is the visibility, and it is
+/// the *hidden* set so a button a later version adds appears rather than staying invisible;
+/// `toolbar_order` is the arrangement — one flat list with [`SPACE_KEY`] marking the row break, so
+/// the two rows and the toolbar's own item list are the same sequence written once.
 ///
-/// Appending is where `default_on` applies, and only there: an entry the config has never heard of
-/// joins the bar only if the table says it should, while one the user dragged in is honoured from
-/// the stored order regardless. So the newer buttons wait in the customizer's palette, and moving
-/// one into the bar is permanent the moment it lands.
-pub fn layout() -> Vec<&'static str> {
-    let shows = |k: &str| settings::toolbar_shows(k);
+/// A stored list with **no** divider is one written before the rows existed (or hand-edited): its
+/// keys are read back into the row each button's table entry names, keeping their relative order, so
+/// an arrangement never collapses into one row on upgrade.
+///
+/// A shown button the list does not mention — exactly the one a later version added — is appended to
+/// its table row. That is the only place `default_on` applies: a button the user dragged in comes
+/// back from the stored order regardless of it, so the newer buttons wait in the customizer's
+/// palette and moving one into a row is permanent the moment it lands.
+pub fn rows() -> (Vec<&'static str>, Vec<&'static str>) {
     let stored = settings::toolbar_order();
-    let mut keys: Vec<&'static str> = Vec::new();
-    for e in stored.iter().filter_map(|k| entry(k)).filter(|e| shows(e.key)) {
-        // Deduplicated here rather than trusted: `layout.conf` is hand-editable, and a repeated
-        // key would insert the *same* `NSToolbarItem` at two indices, which AppKit does not
-        // support. It is also what keeps the space a single movable entry.
-        if !keys.contains(&e.key) {
-            keys.push(e.key);
+    let split = stored.iter().position(|k| k == SPACE_KEY);
+    let mut out: [Vec<&'static str>; 2] = [Vec::new(), Vec::new()];
+    let mut mentioned: Vec<&'static str> = Vec::new();
+    for (i, k) in stored.iter().enumerate() {
+        let Some(e) = entry(k) else { continue };
+        mentioned.push(e.key);
+        if !settings::toolbar_shows(e.key) {
+            continue;
         }
+        // Deduplicated rather than trusted: `layout.conf` is hand-editable, and a repeated key
+        // would insert the *same* `NSToolbarItem` at two indices, which AppKit does not support.
+        if out[0].contains(&e.key) || out[1].contains(&e.key) {
+            continue;
+        }
+        let row = match split {
+            Some(at) => usize::from(i > at),
+            None => usize::from(e.group == Group::Common),
+        };
+        out[row].push(e.key);
     }
     for e in CUSTOMIZABLE.iter() {
-        if e.default_on && shows(e.key) && !keys.contains(&e.key) && !stored.iter().any(|k| k == e.key) {
-            keys.push(e.key);
+        if e.default_on && settings::toolbar_shows(e.key) && !mentioned.contains(&e.key) {
+            out[usize::from(e.group == Group::Common)].push(e.key);
         }
     }
+    let [ai, common] = out;
+    (ai, common)
+}
+
+/// The rows as one stored list: `ai`, the divider, `common`. What the customizer writes back and
+/// what [`ToolbarDelegate::identifiers`] reads — the divider is kept even when a row is empty, so an
+/// emptied row still says which side of the break the rest is on.
+pub fn flatten(ai: &[&'static str], common: &[&'static str]) -> Vec<&'static str> {
+    let mut keys = ai.to_vec();
+    keys.push(SPACE_KEY);
+    keys.extend_from_slice(common);
     keys
 }
 
-/// The bar a config that says nothing gets: the `default_on` keys, in the table's order. Also what
-/// the customizer's Restore Defaults goes back to — "every entry" would drag in the buttons the
-/// table deliberately keeps in the palette.
-pub fn defaults() -> Vec<&'static str> {
-    CUSTOMIZABLE.iter().filter(|e| e.default_on).map(|e| e.key).collect()
+/// What the trailing group holds, in order, as one list.
+pub fn layout() -> Vec<&'static str> {
+    let (ai, common) = rows();
+    flatten(&ai, &common)
 }
 
-/// The keys not in [`layout`] — what the customizer offers to drag back in.
+/// The bar a config that says nothing gets: the `default_on` keys in the table's order, split into
+/// their table rows. Also what the customizer's Restore Defaults goes back to — "every entry" would
+/// drag in the buttons the table deliberately keeps in the palette.
+pub fn defaults() -> Vec<&'static str> {
+    let of = |g: Group| -> Vec<&'static str> {
+        CUSTOMIZABLE.iter().filter(|e| e.default_on && e.group == g).map(|e| e.key).collect()
+    };
+    flatten(&of(Group::Ai), &of(Group::Common))
+}
+
+/// The keys in neither row — what the customizer offers to drag back in.
 pub fn removed() -> Vec<&'static str> {
-    let shown = layout();
-    CUSTOMIZABLE.iter().map(|e| e.key).filter(|k| !shown.contains(k)).collect()
+    let (ai, common) = rows();
+    CUSTOMIZABLE
+        .iter()
+        .map(|e| e.key)
+        .filter(|k| !ai.contains(k) && !common.contains(k))
+        .collect()
 }
 
 pub struct DelegateIvars {
@@ -284,17 +328,15 @@ impl ToolbarDelegate {
             ids.extend_from_slice(&[SEARCH_ID, TOGGLE_ID]);
         }
         ids.push(FLEX_ID);
-        // The user's arrangement (Settings → Toolbar), with the space they placed splitting the run
-        // into capsules. A space at either end is dropped: leading, it is a gap against the
-        // flexible space that eats the row anyway; trailing, a gap with nothing on one side of it.
-        let mut keys = layout();
-        while keys.first() == Some(&SPACE_KEY) {
-            keys.remove(0);
+        // The user's two rows (Settings → Toolbar), one capsule each. The divider between them is
+        // dropped when either row is empty: leading, it is a gap against the flexible space that
+        // eats the row anyway; trailing, a gap with nothing on one side of it.
+        let (ai, common) = rows();
+        ids.extend(ai.iter().filter_map(|k| entry(k)).map(|e| e.id));
+        if !ai.is_empty() && !common.is_empty() {
+            ids.push(SPACE_ID);
         }
-        while keys.last() == Some(&SPACE_KEY) {
-            keys.pop();
-        }
-        ids.extend(keys.iter().filter_map(|k| entry(k)).map(|e| e.id));
+        ids.extend(common.iter().filter_map(|k| entry(k)).map(|e| e.id));
         ids
     }
 
@@ -526,7 +568,7 @@ impl Toolbar {
         // space is AppKit's own item and the share button carries a menu rather than an action, so
         // both are built elsewhere; every other entry is a plain bordered image item.
         for e in CUSTOMIZABLE.iter() {
-            if e.key == SPACE_KEY || e.id == SHARE_ID {
+            if e.id == SHARE_ID {
                 continue;
             }
             built.push((e.id, e.symbol, item(mtm, e.id, e.symbol, e.label, e.tip, action_for(e.key))));
