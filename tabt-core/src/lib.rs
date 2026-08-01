@@ -1726,7 +1726,14 @@ impl Grid {
     /// exactly what a selection can reach. The alternate screen has no history, so there this is
     /// just what is on screen — which is right: vim's buffer is vim's to save, not the terminal's.
     pub fn buf_text(&self) -> String {
-        let mut lines: Vec<String> = (self.buf_top()..self.scrolled + self.rows)
+        // …and "no history" has to be enforced here, not assumed. `enter_alt` swaps `cells` and
+        // leaves `history`/`scrolled` exactly where the main screen left them — which is what lets
+        // the main screen come back intact — and `buf_cell` serves any row below `scrolled` out of
+        // that history whether or not the alt screen is up. So the range has to start at the screen
+        // on the alt screen, or exporting from inside vim writes the whole pre-vim scrollback and
+        // then vim's frame, which is neither of the two things the user could have meant.
+        let top = if self.alt { self.scrolled } else { self.buf_top() };
+        let mut lines: Vec<String> = (top..self.scrolled + self.rows)
             .map(|row| {
                 (0..self.cols)
                     .map(|col| self.buf_cell(col, row).ch)
@@ -1806,6 +1813,25 @@ mod tests {
         // Five lines through a three-row screen: the first three scrolled into history, and the
         // rows left blank under the cursor must not come out as empty lines.
         assert_eq!(g.buf_text(), "one\ntwo\nthree\nfour\nfive\n");
+    }
+
+    /// The alternate screen has no scrollback, so an export taken while a full-screen application
+    /// is up is that application's frame and nothing else. The history is still *there* — it is the
+    /// main screen's, waiting to come back — and `buf_cell` will happily serve it, so the range
+    /// `buf_text` walks has to exclude it explicitly.
+    #[test]
+    fn buf_text_on_the_alt_screen_leaves_the_main_screens_scrollback_out() {
+        let mut g = Grid::new(10, 3);
+        g.set_history_max(100);
+        for line in ["one", "two", "three", "four"] {
+            g.feed(line.as_bytes());
+            g.feed(b"\r\n");
+        }
+        g.feed(b"\x1b[?1049h"); // into the alt screen, as vim/less/htop do
+        g.feed(b"ALT");
+        assert_eq!(g.buf_text(), "ALT\n");
+        g.feed(b"\x1b[?1049l"); // and back: the main screen's history is untouched
+        assert_eq!(g.buf_text(), "one\ntwo\nthree\nfour\n");
     }
 
     use super::*;
