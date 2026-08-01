@@ -44,7 +44,7 @@ use objc2::runtime::Sel;
 use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSCompositingOperation, NSFontWeightRegular, NSImage, NSImageSymbolConfiguration,
-    NSImageSymbolScale, NSMenu, NSMenuItem, NSMenuToolbarItem, NSRectFillUsingOperation, NSToolbar,
+    NSImageSymbolScale, NSRectFillUsingOperation, NSToolbar,
     NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSToolbarItemIdentifier, NSWindow,
     NSWindowToolbarStyle,
 };
@@ -70,7 +70,6 @@ const PASTE_ID: &str = "dev.local.tabt.toolbar.paste";
 const CLEAR_LINE_ID: &str = "dev.local.tabt.toolbar.clearline";
 const CLEAR_ID: &str = "dev.local.tabt.toolbar.clear";
 const SHOT_ID: &str = "dev.local.tabt.toolbar.screenshot";
-const SHARE_ID: &str = "dev.local.tabt.toolbar.share";
 const HOME_ID: &str = "dev.local.tabt.toolbar.home";
 const CLAUDE_ID: &str = "dev.local.tabt.toolbar.claude";
 const CODEX_ID: &str = "dev.local.tabt.toolbar.codex";
@@ -81,6 +80,8 @@ const INTERRUPT_ID: &str = "dev.local.tabt.toolbar.interrupt";
 const RESTART_ID: &str = "dev.local.tabt.toolbar.restart";
 const FONT_UP_ID: &str = "dev.local.tabt.toolbar.fontup";
 const FONT_DOWN_ID: &str = "dev.local.tabt.toolbar.fontdown";
+const EXPORT_ID: &str = "dev.local.tabt.toolbar.export";
+const REVEAL_ID: &str = "dev.local.tabt.toolbar.reveal";
 /// AppKit's own item, which eats whatever width is left — it is what pins the session actions to
 /// the trailing end while the leading pair stays by the traffic lights.
 const FLEX_ID: &str = "NSToolbarFlexibleSpaceItem";
@@ -150,7 +151,7 @@ pub struct Entry {
 /// One table, so the customizer's tile and the toolbar's item cannot describe the same button
 /// differently; the action is the one thing that cannot live in a `const` and is looked up by key
 /// in [`action_for`].
-pub const CUSTOMIZABLE: [Entry; 16] = [
+pub const CUSTOMIZABLE: [Entry; 17] = [
     // ---- AI: each types its command into the session and presses Return ----
     Entry { key: "claude", id: CLAUDE_ID, label: "Claude", symbol: "claude", tip: "Run claude in this session", group: Group::Ai, default_on: true },
     Entry { key: "codex", id: CODEX_ID, label: "Codex", symbol: "openai", tip: "Run codex in this session", group: Group::Ai, default_on: true },
@@ -159,16 +160,24 @@ pub const CUSTOMIZABLE: [Entry; 16] = [
     Entry { key: "cursor", id: CURSOR_ID, label: "Cursor", symbol: "cursorarrow.rays", tip: "Run cursor-agent in this session", group: Group::Ai, default_on: false },
     // ---- Common: the session in front of you ----
     Entry { key: "home", id: HOME_ID, label: "Home", symbol: "house", tip: "cd ~", group: Group::Common, default_on: true },
-    Entry { key: "copy", id: COPY_ID, label: "Copy", symbol: "doc.on.doc", tip: "Copy (⌘C)", group: Group::Common, default_on: true },
-    Entry { key: "paste", id: PASTE_ID, label: "Paste", symbol: "doc.on.clipboard", tip: "Paste (⌘V)", group: Group::Common, default_on: true },
+    // Copy and paste start in the palette: ⌘C/⌘V are muscle memory and a selection is made with the
+    // mouse anyway, so the pair spent two of the row's slots restating the shortcut every other app
+    // has. Still one drag away for anyone who wants them.
+    Entry { key: "copy", id: COPY_ID, label: "Copy", symbol: "doc.on.doc", tip: "Copy (⌘C)", group: Group::Common, default_on: false },
+    Entry { key: "paste", id: PASTE_ID, label: "Paste", symbol: "doc.on.clipboard", tip: "Paste (⌘V)", group: Group::Common, default_on: false },
     Entry { key: "clearline", id: CLEAR_LINE_ID, label: "Clear Line", symbol: "delete.left", tip: "Clear Line (⌃U)", group: Group::Common, default_on: true },
     Entry { key: "clear", id: CLEAR_ID, label: "Clear", symbol: "eraser", tip: "Clear Screen (⌃L)", group: Group::Common, default_on: true },
     Entry { key: "screenshot", id: SHOT_ID, label: "Screenshot", symbol: "camera.viewfinder", tip: "Screenshot (⇧⌘5)", group: Group::Common, default_on: true },
-    Entry { key: "share", id: SHARE_ID, label: "Share", symbol: SHARE_SYMBOL, tip: "Export or reveal this session", group: Group::Common, default_on: true },
     Entry { key: "interrupt", id: INTERRUPT_ID, label: "Interrupt", symbol: "stop.circle", tip: "Interrupt (⌃C)", group: Group::Common, default_on: false },
     Entry { key: "restart", id: RESTART_ID, label: "Restart", symbol: "arrow.clockwise", tip: "Restart this session", group: Group::Common, default_on: false },
     Entry { key: "fontup", id: FONT_UP_ID, label: "Bigger", symbol: "plus.magnifyingglass", tip: "Increase Font Size (⌘=)", group: Group::Common, default_on: false },
     Entry { key: "fontdown", id: FONT_DOWN_ID, label: "Smaller", symbol: "minus.magnifyingglass", tip: "Decrease Font Size (⌘−)", group: Group::Common, default_on: false },
+    // The two ways a session leaves the app. They replaced a single "share" button that dropped a
+    // menu holding both: a menu is a click plus a read to reach either one, and at two items it was
+    // a submenu standing in for two buttons. They inherit its place in the default bar, so the
+    // toolbar out of the box can still do everything it could.
+    Entry { key: "export", id: EXPORT_ID, label: "Export", symbol: "arrow.down.doc", tip: "Export Text… (⇧⌘S)", group: Group::Common, default_on: true },
+    Entry { key: "reveal", id: REVEAL_ID, label: "Reveal", symbol: "folder", tip: "Reveal in Finder (⇧⌘R)", group: Group::Common, default_on: true },
 ];
 
 /// The entry with that key, if this build has one — a stored layout may name a button an older or
@@ -232,12 +241,6 @@ pub fn flatten(ai: &[&'static str], common: &[&'static str]) -> Vec<&'static str
     keys.push(SPACE_KEY);
     keys.extend_from_slice(common);
     keys
-}
-
-/// What the trailing group holds, in order, as one list.
-pub fn layout() -> Vec<&'static str> {
-    let (ai, common) = rows();
-    flatten(&ai, &common)
 }
 
 /// The bar a config that says nothing gets: the `default_on` keys in the table's order, split into
@@ -370,6 +373,10 @@ fn action_for(key: &str) -> Option<Sel> {
         "restart" => sel!(restartSession:),
         "fontup" => sel!(increaseFontSize:),
         "fontdown" => sel!(decreaseFontSize:),
+        // The same selectors the share menu's items send, so the button and the menu route cannot
+        // drift — exactly as the font pair shares ⌘=/⌘−'s.
+        "export" => sel!(exportText:),
+        "reveal" => sel!(revealInFinder:),
         // A table row added without a case here gets no action rather than a wrong one: the item
         // then validates as disabled, which is visible, where a plausible-looking default would
         // quietly fire the neighbouring button's selector.
@@ -493,45 +500,6 @@ unsafe fn tinted(img: &NSImage, tone: (f64, f64, f64)) -> Retained<NSImage> {
     out
 }
 
-/// Symbol for the share item, kept out of `spec` because that table is keyed by action and this
-/// item has a menu instead — but `apply_theme` still has to know what to re-tint.
-const SHARE_SYMBOL: &str = "square.and.arrow.up";
-
-/// The share item: one button that drops a menu rather than firing an action, holding the two ways
-/// a session leaves the app — its text to a file, its directory to Finder.
-///
-/// An `NSMenuToolbarItem` rather than a plain item that pops a menu by hand: the class exists for
-/// exactly this, and it draws the small chevron that says a click opens something.
-fn share_item(mtm: MainThreadMarker) -> (Retained<NSToolbarItem>, Retained<NSMenu>) {
-    unsafe {
-        let item = NSMenuToolbarItem::initWithItemIdentifier(mtm.alloc(), &NSString::from_str(SHARE_ID));
-        let label = NSString::from_str("Share");
-        item.setLabel(&label);
-        item.setPaletteLabel(&label);
-        item.setToolTip(Some(&NSString::from_str("Export or reveal this session")));
-        item.setBordered(true);
-        // No chevron: the row is a set of plain icon buttons, and the one arrow next to the share
-        // symbol reads as part of the glyph rather than as an affordance.
-        item.setShowsIndicator(false);
-        // The menu's items carry no target here; `Toolbar::set_target` points them at the menu
-        // target with everything else, once `main` has built it.
-        let menu = NSMenu::new(mtm);
-        for (title, action) in [
-            ("Export Text…", sel!(exportText:)),
-            ("Reveal in Finder", sel!(revealInFinder:)),
-        ] {
-            let mi = NSMenuItem::new(mtm);
-            mi.setTitle(&NSString::from_str(title));
-            mi.setAction(Some(action));
-            menu.addItem(&mi);
-        }
-        item.setMenu(&menu);
-        let up: Retained<NSToolbarItem> = Retained::into_super(item);
-        set_symbol(&up, SHARE_SYMBOL, &label);
-        (up, menu)
-    }
-}
-
 /// Owns the toolbar and its delegate. Plain Rust, held by the controller: AppKit retains the
 /// toolbar through the window, but nothing retains the delegate for us.
 pub struct Toolbar {
@@ -540,9 +508,6 @@ pub struct Toolbar {
     /// Every item this toolbar owns with the symbol it draws — kept so `set_target` can point them
     /// all at the menu target once it exists, and so `apply_theme` can re-tint them.
     items: Vec<(Retained<NSToolbarItem>, &'static str)>,
-    /// The share button's drop-down. Held because its items need the menu target pointing into
-    /// them, and that object does not exist until after the toolbar is built.
-    share_menu: Retained<NSMenu>,
     /// Whether the sidebar pair is currently in the toolbar (i.e. the sidebar is collapsed).
     shown: Cell<bool>,
 }
@@ -564,17 +529,12 @@ impl Toolbar {
             .iter()
             .map(|(id, sym, label, tip, action)| (*id, *sym, item(mtm, id, sym, label, tip, Some(*action))))
             .collect();
-        // …then everything the trailing group can hold, from the one table that describes it. The
-        // space is AppKit's own item and the share button carries a menu rather than an action, so
-        // both are built elsewhere; every other entry is a plain bordered image item.
+        // …then everything the rows can hold, from the one table that describes it: every entry is
+        // a plain bordered image item, since the divider is AppKit's own and nothing here carries a
+        // menu any more.
         for e in CUSTOMIZABLE.iter() {
-            if e.id == SHARE_ID {
-                continue;
-            }
             built.push((e.id, e.symbol, item(mtm, e.id, e.symbol, e.label, e.tip, action_for(e.key))));
         }
-        let (share, share_menu) = share_item(mtm);
-        built.push((SHARE_ID, SHARE_SYMBOL, share));
         let items: Vec<(Retained<NSToolbarItem>, &'static str)> =
             built.iter().map(|(_, sym, it)| (it.clone(), *sym)).collect();
         let delegate: Retained<ToolbarDelegate> = {
@@ -602,7 +562,7 @@ impl Toolbar {
             window.setToolbarStyle(NSWindowToolbarStyle::Unified);
             window.setToolbar(Some(&toolbar));
         }
-        Toolbar { toolbar, _delegate: delegate, items, share_menu, shown: Cell::new(true) }
+        Toolbar { toolbar, _delegate: delegate, items, shown: Cell::new(true) }
     }
 
     /// Re-tint every icon after a theme change. Unlike the `drawRect:` views in the content view,
@@ -655,14 +615,6 @@ impl Toolbar {
                 continue;
             }
             unsafe { it.setTarget(Some(target)) };
-        }
-        // The share item has no action of its own; its menu's items carry them.
-        unsafe {
-            for i in 0..self.share_menu.numberOfItems() {
-                if let Some(mi) = self.share_menu.itemAtIndex(i) {
-                    mi.setTarget(Some(target));
-                }
-            }
         }
     }
 }

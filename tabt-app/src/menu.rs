@@ -71,12 +71,30 @@ declare_class!(
             self.with(|c| c.toggle_sidebar());
         }
 
-        // The toolbar's sidebar button (see `toolbar.rs`) targets this object. Its one action is
-        // always available — there is no state in which collapsing or expanding is meaningless —
-        // so validation is a plain yes rather than the default per-selector check.
+        // Every toolbar item but `copy:`/`paste:` targets this object (see `toolbar.rs`), and AppKit
+        // asks the target to validate each one. Most of them act on the *active session*, and there
+        // is a real state with none: every tab closed, the empty-state placeholder showing. Their
+        // implementations all open with `let Some(a) = m.active else { return }`, so a blanket yes
+        // here — which is what this was, written when the toolbar held one button — drew a full row
+        // of enabled buttons that silently did nothing.
+        //
+        // Stated as the short list of items that do *not* need a session, so that a button added
+        // later defaults to the safe answer rather than to the wrong one. An item with no action at
+        // all (nothing here has one, but AppKit is free to ask about anything) is left enabled: the
+        // alternative is greying out a control this object knows nothing about.
         #[method(validateToolbarItem:)]
-        fn validate_toolbar_item(&self, _item: Option<&AnyObject>) -> bool {
-            true
+        fn validate_toolbar_item(&self, item: Option<&AnyObject>) -> bool {
+            let action: Option<Sel> = match item {
+                Some(item) => unsafe { msg_send![item, action] },
+                None => None,
+            };
+            // The sidebar pair (they act on the window), and the font pair (a setting, applied to
+            // every tab there is — including none).
+            let always = [sel!(toggleSidebar:), sel!(findSession:), sel!(increaseFontSize:), sel!(decreaseFontSize:)];
+            match action {
+                Some(a) if !always.contains(&a) => self.ask(|c| c.has_active_session()).unwrap_or(false),
+                _ => true,
+            }
         }
         #[method(renameSession:)]
         fn rename_session(&self, _s: Option<&AnyObject>) {
@@ -213,6 +231,14 @@ impl MenuTarget {
         if !p.is_null() {
             f(unsafe { &*p });
         }
+    }
+
+    /// [`Self::with`] for a question rather than a command. `None` means there is no controller to
+    /// ask — the window's menus and toolbar exist before it does — which every caller reads as
+    /// "cannot say" and answers for itself.
+    fn ask<T>(&self, f: impl FnOnce(&AppController) -> T) -> Option<T> {
+        let p = self.ivars().controller.get();
+        (!p.is_null()).then(|| f(unsafe { &*p }))
     }
 }
 

@@ -221,15 +221,19 @@ impl ToolbarEditor {
 
     /// Back to the bar a fresh config produces — [`toolbar::defaults`], not every entry: the table
     /// deliberately keeps the newer buttons in the palette, and "restore" must not drag them in.
+    ///
+    /// The hidden set goes back to **empty**, and it has to: keeping the palette's buttons out of
+    /// the restored bar is `default_on`'s job, not the hidden set's. `toolbar::rows()` appends an
+    /// unmentioned button only when its table entry says `default_on`, so the order alone already
+    /// produces exactly the default bar. Writing the palette's keys into `toolbar_hidden` — which
+    /// is what this used to do — records "the user hid these" about buttons the user never saw, and
+    /// that is the one state the hidden set is stored *as* the hidden set to avoid: a later version
+    /// that turns one of them on by default, or that reuses one of those keys, is filtered out for
+    /// this config forever, with the release notes saying the button is there and no way to tell why.
     pub fn restore_defaults(&self) {
         if let Some(c) = self.controller() {
             let order = toolbar::defaults();
-            let hidden: Vec<String> = toolbar::CUSTOMIZABLE
-                .iter()
-                .filter(|e| !order.contains(&e.key))
-                .map(|e| e.key.to_string())
-                .collect();
-            c.set_toolbar_layout(order.iter().map(|k| k.to_string()).collect(), hidden);
+            c.set_toolbar_layout(order.iter().map(|k| k.to_string()).collect(), Vec::new());
         }
         self.reload();
     }
