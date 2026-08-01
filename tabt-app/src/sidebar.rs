@@ -15,8 +15,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSBezierPath, NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightSemibold,
-    NSGraphicsContext, NSImage, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
+    NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightSemibold,
+    NSGraphicsContext, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
     NSRectClip, NSRectFill, NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
@@ -51,7 +51,11 @@ const PAD: f64 = 14.0; // content left inset
 /// edge already sits CARD_INSET below the window's, so this is that much shorter than HEADER_H.
 const TOP_INSET: f64 = HEADER_H - CARD_INSET;
 const HPAD: f64 = 10.0; // row background (selected/hover/search box) inset from the sidebar's left and right edges
-const ACTIONS_GAP: f64 = 8.0; // between the two halves of the "Terminal"/"Group" button row
+const ACTIONS_GAP: f64 = 8.0; // between the two buttons of the "Terminal"/"Group" row
+/// Width of the "Group" button. It is icon-only, so it is square on `BTN_H` rather than taking half
+/// the row: the two are not peers — a new terminal is what that row is mostly for, and a group is the
+/// occasional one — and the label it dropped is width "Terminal" can use.
+const ACTIONS_ICON_W: f64 = BTN_H;
 /// The "chip" fill shared by the search box, the two action buttons and the selected session row,
 /// so a selected session and a button read as the same surface. `CHIP_HOVER` is the same chip under
 /// the pointer. `ROW_HOVER` is every *list* row's hover wash — one step below the chip, so hovering
@@ -67,10 +71,39 @@ const UNGROUPED: usize = usize::MAX - 1;
 /// How many ⌘Z steps the search/rename boxes keep (they hold one short line, so this is plenty).
 const UNDO_DEPTH: usize = 64;
 
-/// Hue of a default-colored dot, by state: green while a job is running, neutral otherwise. A tab
-/// with an explicit color of its own keeps that instead — only the *form* then tracks the state.
-const DOT_RUNNING: (f64, f64, f64) = (52.0 / 255.0, 199.0 / 255.0, 89.0 / 255.0); // #34c759
-const DOT_IDLE: (f64, f64, f64) = (0.37, 0.37, 0.40);
+/// The session icon's box in a tab row. Wider than the old 14pt terminal glyph because it stands
+/// where the status dot used to as well, and it is now the row's one interactive mark.
+const ICON_W: f64 = 15.0;
+const ICON_H: f64 = 14.0;
+
+/// The symbol the session icon draws, resolved once.
+///
+/// `apple.terminal` is SF Symbols 4 (macOS 13) and this app targets 12, where the lookup returns
+/// nil and the icon would simply not draw — so the plain `terminal` stands in there. Asked once
+/// and cached: the sidebar repaints on hover and on every keystroke that edits a title.
+fn tab_symbol() -> &'static str {
+    thread_local! {
+        static NAME: &'static str = if view::symbol_available("apple.terminal") {
+            "apple.terminal"
+        } else {
+            "terminal"
+        };
+    }
+    NAME.with(|n| *n)
+}
+
+/// Hue of a default-colored session icon while a job is running. Idle and ended take the row's own
+/// text tiers instead, so an ordinary session is not colored at all — the green means "working",
+/// not "a terminal". A tab with an explicit color of its own keeps that instead, and only the
+/// *form* then tracks the state.
+///
+/// The theme's own green, not a fixed system one: every scheme defines one, so "working" is said in
+/// the colors the rest of the window is speaking. Same slot and same lift the picker's Green uses
+/// ([`dot_colors`]), so a running session and a tab painted green are the one green.
+fn dot_running() -> (f64, f64, f64) {
+    let t = theme::current();
+    t.on_card(t.vivid(2, 10))
+}
 
 // ---- Text hierarchy: derived from the active theme so it stays legible on light and dark themes.
 // The primary color is the theme foreground; weaker tiers blend it toward the background.
@@ -102,20 +135,37 @@ fn overlay(alpha: f64) -> Retained<NSColor> {
     rgba(f.0, f.1, f.2, alpha)
 }
 
-/// Classic status-dot colors. Index 0 = Default (auto: green when active, gray otherwise);
-/// 1..=8 are explicit colors shown regardless of active state. Kept in sync with the
-/// dot-color menu and the per-tab `dot` index persisted in the layout file.
-pub const DOT_COLORS: [(&str, (f64, f64, f64)); 9] = [
-    ("Default", (0.0, 0.0, 0.0)), // sentinel: never drawn directly (see draw_row)
-    ("Red", (255.0 / 255.0, 69.0 / 255.0, 58.0 / 255.0)),
-    ("Orange", (255.0 / 255.0, 159.0 / 255.0, 10.0 / 255.0)),
-    ("Yellow", (255.0 / 255.0, 214.0 / 255.0, 10.0 / 255.0)),
-    ("Green", (50.0 / 255.0, 215.0 / 255.0, 75.0 / 255.0)),
-    ("Blue", (10.0 / 255.0, 132.0 / 255.0, 255.0 / 255.0)),
-    ("Purple", (191.0 / 255.0, 90.0 / 255.0, 242.0 / 255.0)),
-    ("Pink", (255.0 / 255.0, 55.0 / 255.0, 95.0 / 255.0)),
-    ("Gray", (152.0 / 255.0, 152.0 / 255.0, 157.0 / 255.0)),
-];
+/// The colors a tab can be given. Index 0 = Default (auto: the state's own hue); 1..=8 are explicit
+/// colors shown regardless of what the session is doing. Kept in sync with the tab color menu and
+/// the per-tab `dot` index persisted in the layout file.
+///
+/// They are the **theme's** colors, not a fixed set of system ones: a tab marked red on Gruvbox is
+/// that scheme's red, so a colored tab belongs to the window it sits in rather than importing
+/// another palette into it. Five of the eight are the ANSI 16's own hues, each taken from whichever
+/// of its two slots actually carries the color ([`theme::Theme::vivid`]); gray is the palette's
+/// bright black, the one neutral that is not already the uncolored default's tone; and the two the
+/// ANSI set has no color for are mixed from their neighbours in the theme's own hues — orange
+/// between red and yellow, pink between magenta and red. Each is then lifted for the card it is
+/// drawn on ([`theme::Theme::on_card`]), or a scheme that puts one at the panel's own luminance
+/// would leave that tab looking uncolored.
+///
+/// The slots are **positional and permanent**: the index is what `layout.conf` stores, so renaming
+/// or reordering one silently recolors tabs a user has already marked.
+pub fn dot_colors() -> [(&'static str, (f64, f64, f64)); 9] {
+    let t = theme::current();
+    let (red, yellow, purple) = (t.vivid(1, 9), t.vivid(3, 11), t.vivid(5, 13));
+    [
+        ("Default", (0.0, 0.0, 0.0)), // sentinel: never drawn directly (see draw_session_icon)
+        ("Red", t.on_card(red)),
+        ("Orange", t.on_card(theme::mix(red, yellow, 0.5))),
+        ("Yellow", t.on_card(yellow)),
+        ("Green", t.on_card(t.vivid(2, 10))),
+        ("Blue", t.on_card(t.vivid(4, 12))),
+        ("Purple", t.on_card(purple)),
+        ("Pink", t.on_card(theme::mix(purple, red, 0.5))),
+        ("Gray", t.on_card(t.color(8))),
+    ]
+}
 
 /// Target hit by a single press (Copy, so it fits in a Cell).
 #[derive(Clone, Copy, PartialEq)]
@@ -129,7 +179,7 @@ enum Press {
     Tab(u64, usize),  // (tab id, index of its group)
     GroupMenu(usize), // "⋯" at the right of a group row; click to pop up the group menu
     TabMenu(u64),     // "⋯" at the right of a tab row; click to pop up the tab menu
-    TabDot(u64),      // the status dot at the left of a tab row; click to pick its color
+    TabDot(u64),      // the session icon at the left of a tab row; click to pick its color
     TabsLabel,        // "Sessions" section header above the ungrouped tabs (non-interactive)
     StyleMenu,        // bottom style row; click to pop up the color scheme menu
 }
@@ -183,6 +233,10 @@ pub struct SidebarIvars {
     hover_y: Cell<f64>,
     hovering: Cell<bool>,
     hover_key: Cell<HoverKey>, // what the last motion event resolved to; see HoverKey
+    /// The vertical bands of the rows `render` last drew, in its own order: `(top, height, kind)`.
+    /// Written once per redraw and read by the hover hit test, which runs per *motion event* — see
+    /// [`SidebarView::row_at_cached`] for why the two cannot be the same code path.
+    bands: RefCell<Vec<(f64, f64, Press)>>,
     tracking_added: Cell<bool>,
     // Search: query string + whether in search (focused) state.
     query: RefCell<String>,
@@ -454,6 +508,7 @@ impl SidebarView {
             redo: RefCell::new(Vec::new()),
             last_edit: Cell::new(EditKind::None),
             dot_target: Cell::new(0),
+            bands: RefCell::new(Vec::new()),
         });
         unsafe { msg_send_id![super(this), initWithFrame: frame] }
     }
@@ -492,14 +547,55 @@ impl SidebarView {
     /// press uses: it rejects list rows scrolled out of the visible band, and those are exactly the
     /// rows `render` clips away — so a hover that lands on one changes nothing on screen.
     fn hover_key_at(&self, x: f64, y: f64) -> HoverKey {
-        let snap = match self.controller() {
-            Some(c) => c.snapshot(),
-            None => return HoverKey { row: Press::None, half: 0 },
-        };
-        let (w, h) = (self.bounds().size.width, self.bounds().size.height);
-        let query = self.ivars().query.borrow().clone();
-        let row = self.row_at(&snap, y, h, &query);
+        let w = self.bounds().size.width;
+        let row = self.row_at_cached(y);
         HoverKey { row, half: u8::from(row == Press::Actions && x >= Self::actions_split_x(w)) }
+    }
+
+    /// The hit test a *motion* event runs: the same rule as [`Self::row_at`], against the bands the
+    /// last redraw recorded rather than a freshly laid-out list.
+    ///
+    /// It has to be the cheap one. AppKit delivers `mouseMoved:` per pixel of travel, and a press
+    /// happens once, so what `row_at` does per call — `snapshot()`, which clones every tab's title
+    /// and cwd, then `build_rows`, which clones every one of those again into a `Row` — is fine
+    /// there and is a sweep's worth of allocation here. It ran *before* the `HoverKey` comparison
+    /// that exists to skip the redraw, so the cache saved the painting and paid for the layout
+    /// anyway: a fast drag across a window full of sessions cost more than the unconditional
+    /// repaint the key was added to avoid.
+    ///
+    /// Reading a snapshot of the last frame is sound because that frame is what the pointer is over:
+    /// the bands are only ever stale between a model change and the redraw it already requested, and
+    /// that redraw resolves the hover from the raw pointer position, not from this key. A press
+    /// keeps using `row_at` — that one must act on the list as it is now, not as it was drawn.
+    fn row_at_cached(&self, y: f64) -> Press {
+        let bands = self.ivars().bands.borrow();
+        if bands.is_empty() {
+            // Nothing drawn yet (a motion event can precede the first redraw). Lay it out the slow
+            // way rather than answering None, which would mark the row under the pointer unhovered.
+            drop(bands);
+            let Some(ctrl) = self.controller() else { return Press::None };
+            let query = self.ivars().query.borrow().clone();
+            return self.row_at(&ctrl.snapshot(), y, &query);
+        }
+        self.hit_bands(y, bands.iter().copied())
+    }
+
+    /// Resolve a y against laid-out rows: the first band containing it wins, and a *list* row is
+    /// skipped when the point is outside the band the list is clipped to — those rows are scrolled
+    /// out of sight, and `render` does not draw them either.
+    fn hit_bands(&self, y: f64, bands: impl Iterator<Item = (f64, f64, Press)>) -> Press {
+        let footer_top = self.bounds().size.height - Self::footer_height();
+        let list_top = self.list_top();
+        for (top, h, kind) in bands {
+            let list_row = matches!(kind, Press::Group(_) | Press::Tab(..) | Press::TabsLabel);
+            if list_row && (y < list_top || y >= footer_top) {
+                continue;
+            }
+            if y >= top && y < top + h {
+                return kind;
+            }
+        }
+        Press::None
     }
 
     fn point_y(&self, event: &NSEvent) -> f64 {
@@ -507,13 +603,17 @@ impl SidebarView {
         self.convertPoint_fromView(p, None).y
     }
 
-    /// The x that separates the dual-button row's two halves. Shared by the press split in
+    /// The x that separates the dual-button row's two sides. Shared by the press split in
     /// `on_down`, the hover split in `draw_actions` and the hover key, so the three cannot drift.
-    /// Note it splits the whole row width, not just the buttons: a press in the left margin still
-    /// lands on "Terminal", which is what makes the pair feel like one control.
+    /// Note it splits the whole row width, not just the buttons: a press in either margin still
+    /// lands on the button beside it, which is what makes the pair feel like one control.
     fn actions_split_x(w: f64) -> f64 {
-        let bw = (w - 2.0 * HPAD - ACTIONS_GAP) / 2.0;
-        HPAD + bw + ACTIONS_GAP / 2.0
+        Self::actions_group_x(w) - ACTIONS_GAP / 2.0
+    }
+
+    /// Left edge of the square "Group" button, which sits at the row's trailing edge.
+    fn actions_group_x(w: f64) -> f64 {
+        w - HPAD - ACTIONS_ICON_W
     }
 
     /// Top y of the group/tab list area (below the search box, when there is one, + the two
@@ -697,6 +797,11 @@ impl SidebarView {
         }
         rows.extend(Self::footer_rows(&snap, h));
 
+        // The list is laid out; hand the hover hit test its geometry. Recorded here, at the one
+        // place that has it already, because the alternative is laying it out again per motion
+        // event — see `row_at_cached`. Positions only: nothing that would keep a title alive.
+        *self.ivars().bands.borrow_mut() = rows.iter().map(|r| (r.top, r.h, r.kind)).collect();
+
         // No background fill: this view is mounted inside the card (see `card.rs`), whose layer
         // paints the fill, border and shadow — and no separator above the settings row either, the
         // card's own rounded edge having replaced the line that used to mark that seam.
@@ -838,17 +943,16 @@ impl SidebarView {
         } else if hovered {
             round_fill(inset, 7.0, &overlay(ROW_HOVER));
         }
-        Self::draw_status_dot(row);
-        // Small terminal icon + session name. The tier depends on selection and nothing else: a
-        // row's brightness is a fact about the list, not about the session, and having unseen
-        // output raise it left every row that had printed anything sitting at full weight until it
-        // was visited — the contrast that says "this is the one you are in" gone until then. The
-        // unseen mark is a dot on the right instead (below), which says the same thing without
-        // touching the text.
+        // The session icon carries the state; the *label's* tier still depends on selection and
+        // nothing else: a row's brightness is a fact about the list, not about the session, and
+        // having unseen output raise it left every row that had printed anything sitting at full
+        // weight until it was visited — the contrast that says "this is the one you are in" gone
+        // until then. The unseen mark is a dot on the right instead (below), which says the same
+        // thing without touching the text.
         let fg = if row.selected { text_primary() } else { text_secondary() };
-        draw_symbol("terminal", rect(row.indent + 12.0, vmid(12.0), 14.0, 12.0), fg);
+        Self::draw_session_icon(row, fg, vmid(ICON_H));
         // Name truncates with an ellipsis; leaves room for the right-side meta / "⋯".
-        let name_x = row.indent + 30.0;
+        let name_x = row.indent + ICON_W + 8.0;
         draw_truncated(&row.label, rect(name_x, vmid(16.0), (w - 40.0 - name_x).max(0.0), 18.0), &self.ivars().font, fg);
         // Right side, in priority order: "⋯" while hovered (so the menu — including Unlock — is
         // reachable on any tab); then a bell, which is an event and outranks the standing facts;
@@ -868,57 +972,53 @@ impl SidebarView {
         }
     }
 
-    /// The status dot at the left of a session row.
+    /// The session icon: one glyph carrying what the session is doing *and* the color the user
+    /// picked for the tab.
     ///
-    /// Two independent axes, which is what lets it carry both meanings without either winning:
+    /// It replaced a separate status dot that sat to the left of it — two marks in a row, one of
+    /// them a bare disc, saying two halves of the same thing.
     ///
-    /// - **Hue is the user's**: an explicit dot color is drawn as chosen, whatever the session is
-    ///   doing. Only a tab left on the default color takes its hue from the state.
-    /// - **Form is the session's**: a running job is solid, an idle prompt is dimmed, and an ended
-    ///   session is a hollow ring.
+    /// **The glyph itself never changes; only its color does.** It used to swap in the filled
+    /// variant while a job ran, so the icon carried the state as *form* and the user's tab color as
+    /// *hue* at once. That is one axis too many for a 14pt glyph: the fill reads as a weight change
+    /// at that size, so a row appeared to bold itself whenever a command ran, competing with
+    /// selection — which is the only thing in this list allowed to change a row's weight.
     ///
-    /// So a blue dot on a dead session is a blue *ring* — the color survives and "dead" still
-    /// reads, and there is never a question of which one outranks the other.
+    /// So hue carries both, with the user's choice on top: an explicit tab color tints the icon in
+    /// the theme's own shade of what was chosen (see [`dot_colors`]) whatever the session is doing,
+    /// faded toward the placeholder tier once that session is dead so the color survives and "dead"
+    /// still reads. Only a tab left on the default color takes its hue from the state — green while
+    /// a job runs, and otherwise the label's own tone, so an ordinary idle row still brightens with
+    /// selection along with its text.
     ///
-    /// Note what is absent: selection. It used to make the dot green, which is why green has always
-    /// meant "the tab you are looking at" rather than "running". The row is already marked as
-    /// selected three other ways — its chip, its brighter label, its persistent "⋯".
-    fn draw_status_dot(row: &Row) {
-        // Index defensively: the dot index comes from the on-disk layout file and may be anything.
-        let hue = match DOT_COLORS.get(row.dot as usize).filter(|_| row.dot != 0) {
-            Some((_, c)) => *c,
-            None if row.state == SessionState::Running => DOT_RUNNING,
-            None => DOT_IDLE,
+    /// Note what is absent: selection, for the state's part of it. It used to make the dot green,
+    /// which is why green has always meant "the tab you are looking at" rather than "running".
+    fn draw_session_icon(row: &Row, fg: theme::Rgb, y: f64) {
+        // Index defensively: the color index comes from the on-disk layout file and may be anything.
+        let explicit = dot_colors().get(row.dot as usize).filter(|_| row.dot != 0).map(|(_, c)| *c);
+        let hue = match (explicit, row.state) {
+            (Some(c), SessionState::Ended) => theme::mix(c, text_placeholder(), 0.45),
+            (Some(c), _) => c,
+            (None, SessionState::Running) => dot_running(),
+            (None, SessionState::Ended) => text_placeholder(),
+            (None, SessionState::Idle) => fg,
         };
-        match row.state {
-            // A ring, not a disc. Sized and placed on whole/half points: at 7pt an unsnapped
-            // stroke straddles two device pixels and comes out as a smudge rather than a ring.
-            SessionState::Ended => {
-                let r = rect(row.indent - 0.5, row.top + ((row.h - 7.0) / 2.0).round() - 0.5, 7.0, 7.0);
-                round_stroke(r, 3.5, 1.2, &ns_color(hue));
-            }
-            // Idle is the same dot as running, just quieter: a prompt is not an event, and a
-            // sidebar of solid dots would say nothing about which session is actually working.
-            SessionState::Idle => {
-                let r = rect(row.indent, row.top + ((row.h - 6.0) / 2.0).round(), 6.0, 6.0);
-                round_fill(r, 3.0, &rgba(hue.0, hue.1, hue.2, 0.55));
-            }
-            SessionState::Running => {
-                let r = rect(row.indent, row.top + ((row.h - 6.0) / 2.0).round(), 6.0, 6.0);
-                round_fill(r, 3.0, &ns_color(hue));
-            }
-        }
+        draw_symbol(tab_symbol(), rect(row.indent, y, ICON_W, ICON_H), hue);
     }
 
     /// The row of side-by-side "Terminal" and "Group" buttons.
+    ///
+    /// "Group" is the icon alone, in a square button at the trailing edge: `plus.rectangle.on.folder`
+    /// draws the whole sentence its label used to spell out, and the width that frees goes to
+    /// "Terminal", the one of the two that is pressed all day.
     fn draw_actions(&self, row: &Row, w: f64) {
         let hovering = self.ivars().hovering.get() && !self.ivars().dragging.get();
         let hx = self.ivars().hover_x.get();
         let hy = self.ivars().hover_y.get();
         let in_row = hovering && hy >= row.top && hy < row.top + row.h;
-        let bw = (w - 2.0 * HPAD - ACTIONS_GAP) / 2.0;
-        let left = rect(HPAD, row.top, bw, row.h);
-        let right = rect(HPAD + bw + ACTIONS_GAP, row.top, bw, row.h);
+        let gx = Self::actions_group_x(w);
+        let left = rect(HPAD, row.top, gx - ACTIONS_GAP - HPAD, row.h);
+        let right = rect(gx, row.top, ACTIONS_ICON_W, row.h);
         let hover_left = in_row && hx < Self::actions_split_x(w);
         let hover_right = in_row && !hover_left;
 
@@ -931,7 +1031,7 @@ impl SidebarView {
 
         let rbg = if hover_right { CHIP_HOVER } else { CHIP_BG };
         round_fill(right, 7.0, &overlay(rbg));
-        self.draw_btn_content(right, "folder", "Group", text_secondary());
+        Self::draw_btn_icon(right, "plus.rectangle.on.folder", text_secondary());
     }
 
     /// Button content: icon + text, horizontally centered.
@@ -946,6 +1046,17 @@ impl SidebarView {
         unsafe {
             ns.drawAtPoint_withAttributes(NSPoint::new(start + icon_w + ig, cy - 8.0), Some(&attrs));
         }
+    }
+
+    /// Icon-only button content: the symbol centered in the button, at the size a labeled one gives
+    /// its icon plus a shade — with no text beside it to set the scale, the glyph is the button.
+    /// `draw_symbol` centers at the symbol's natural size, so a wide glyph in a square box stays
+    /// centered rather than being squeezed into it.
+    fn draw_btn_icon(r: NSRect, icon: &str, col: (f64, f64, f64)) {
+        const S: f64 = 15.0;
+        let cx = r.origin.x + r.size.width / 2.0;
+        let cy = r.origin.y + r.size.height / 2.0;
+        draw_symbol(icon, rect(cx - S / 2.0, cy - S / 2.0, S, S), col);
     }
 
     /// Shortcut hint: small monospace text right-aligned to `right_x`, vertically centered at `cy` (no background).
@@ -1105,28 +1216,18 @@ impl SidebarView {
     }
 
     /// Hit test: which row the y within the view hits (list rows are only valid within the visible area, to avoid mis-hits on scrolled-out rows).
-    fn row_at(&self, snap: &Snapshot, y: f64, h: f64, query: &str) -> Press {
-        let footer_top = h - Self::footer_height();
-        for row in &self.all_rows(snap, h, query, self.scroll()) {
-            let list_row = matches!(row.kind, Press::Group(_) | Press::Tab(..) | Press::TabsLabel);
-            if list_row && (y < self.list_top() || y >= footer_top) {
-                continue;
-            }
-            if y >= row.top && y < row.top + row.h {
-                return row.kind;
-            }
-        }
-        Press::None
+    fn row_at(&self, snap: &Snapshot, y: f64, query: &str) -> Press {
+        let rows = self.all_rows(snap, self.bounds().size.height, query, self.scroll());
+        self.hit_bands(y, rows.iter().map(|r| (r.top, r.h, r.kind)))
     }
 
     /// Pop up the "more" menu of the group/tab row at `(x, y)`, anchored at that point.
     /// Returns false when the point hits no group/tab row (nothing is shown).
     fn open_menu_at(&self, snap: &Snapshot, x: f64, y: f64) -> bool {
-        let h = self.bounds().size.height;
         let query = self.ivars().query.borrow().clone();
         self.ivars().cur_x.set(x); // so the popup positions at this point
         self.ivars().cur_y.set(y);
-        match self.row_at(snap, y, h, &query) {
+        match self.row_at(snap, y, &query) {
             Press::Group(gi) => self.open_group_menu(gi),
             Press::Tab(id, _) => self.open_tab_menu(id),
             _ => return false,
@@ -1241,9 +1342,9 @@ impl SidebarView {
         };
         let p = self.convertPoint_fromView(unsafe { event.locationInWindow() }, None);
         let (x, y) = (p.x, p.y);
-        let (w, h) = (self.bounds().size.width, self.bounds().size.height);
+        let w = self.bounds().size.width;
         let query = self.ivars().query.borrow().clone();
-        let mut press = self.row_at(&snap, y, h, &query);
+        let mut press = self.row_at(&snap, y, &query);
         // A press outside the focused input leaves it: the rename is abandoned, the search box drops
         // back to its resting look. A press inside the box is swallowed so the input keeps focus.
         // Both tests use the raw row hit, before the "⋯"/dot sub-areas below are split out of it.
@@ -1276,10 +1377,11 @@ impl SidebarView {
                 other => other,
             };
         }
-        // Clicking the status dot at the left of a tab row → open its color picker.
+        // Clicking the session icon → open its color picker. It is the same target the status dot
+        // used to be, now that the icon has absorbed it.
         if let Press::Tab(id, grp) = press {
             let indent = if grp == UNGROUPED { 16.0 } else { 26.0 };
-            if x >= indent - 3.0 && x <= indent + 11.0 {
+            if x >= indent - 3.0 && x <= indent + ICON_W + 3.0 {
                 press = Press::TabDot(id);
             }
         }
@@ -1599,18 +1701,32 @@ impl SidebarView {
         self.popup(&menu);
     }
 
-    /// Status-dot color picker: the classic colors + "Default", each with a color swatch and a
-    /// checkmark on the tab's current color.
+    /// Tab color picker: the classic colors + "Default", each with a swatch and a checkmark on the
+    /// tab's current color.
+    ///
+    /// The swatch is the **session icon itself**, in the color being offered, not the round dot it
+    /// used to be. Now that hue is the icon's only variable ([`Self::draw_session_icon`]), a disc
+    /// here would be a preview of something the sidebar never draws; the glyph shows the row exactly
+    /// as picking that entry would leave it.
+    ///
+    /// It goes to the item as a **vector** symbol image ([`view::symbol_image`]), at the point size
+    /// the row's own icon resolves to. Rasterizing it here — lockFocus over an `ICON_W`×`ICON_H`
+    /// image, then [`draw_symbol`] — would clip it: `draw_symbol` centers a symbol at its *natural*
+    /// size, which for a wide glyph overruns that box, harmlessly in an unclipped row view and
+    /// invisibly-but-really inside an image whose bounds are the clip.
     fn open_dot_menu(&self, id: u64) {
         let mtm = MainThreadMarker::new().expect("main thread");
         self.ivars().dot_target.set(id);
         // Look up this tab's current color index to check the matching item.
         let cur = self.controller().map(|c| c.tab_dot(id)).unwrap_or(0);
         let menu = NSMenu::new(mtm);
-        for (i, (name, rgb)) in DOT_COLORS.iter().enumerate() {
+        for (i, (name, rgb)) in dot_colors().iter().enumerate() {
             let item = self.menu_item(name, sel!(pickDotColor:), i as isize);
-            if i != 0 {
-                unsafe { item.setImage(Some(&Self::swatch(*rgb, mtm))) };
+            // Slot 0's color is a sentinel and must never be drawn; "Default" previews as the tone
+            // an uncolored row actually gets, so every entry in the list carries a glyph.
+            let tone = if i == 0 { text_secondary() } else { *rgb };
+            if let Some(img) = view::symbol_image(tab_symbol(), ICON_H * 0.92, tone) {
+                unsafe { item.setImage(Some(&img)) };
             }
             if i as u8 == cur {
                 unsafe {
@@ -1620,20 +1736,6 @@ impl SidebarView {
             menu.addItem(&item);
         }
         self.popup(&menu);
-    }
-
-    /// A small rounded color swatch image for a color-menu item.
-    #[allow(deprecated)] // lockFocus/unlockFocus: fine for a tiny static swatch, avoids a block-based API
-    fn swatch(rgb: (f64, f64, f64), mtm: MainThreadMarker) -> Retained<NSImage> {
-        let img = unsafe { NSImage::initWithSize(mtm.alloc(), NSSize::new(12.0, 12.0)) };
-        unsafe {
-            img.lockFocus();
-            ns_color(rgb).set();
-            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect(1.0, 1.0, 10.0, 10.0), 5.0, 5.0);
-            path.fill();
-            img.unlockFocus();
-        }
-        img
     }
 
     /// Flip the search state and start the box moving toward it. Every path that opens or closes
@@ -1678,11 +1780,17 @@ impl SidebarView {
 
     /// Enter search state and redraw (⌘F triggered from the menu).
     pub fn begin_search(&self) {
-        // ⌘F on a box that is already open and still empty closes it again: the same key that
-        // opened it, and with nothing typed there is nothing to lose by doing so. With a query in
-        // it the box stays — that text is the user's work, and ⌘F is not where they would expect
-        // to throw it away (Esc is).
-        if self.ivars().searching.get() && self.ivars().query.borrow().is_empty() {
+        // ⌘F on a box that is already open, still empty and still holding the keyboard closes it
+        // again: the same key that opened it, and with nothing typed there is nothing to lose by
+        // doing so. With a query in it the box stays — that text is the user's work, and ⌘F is not
+        // where they would expect to throw it away (Esc is).
+        //
+        // The keyboard is the load-bearing half of that test, because losing it no longer closes
+        // the box: an empty box the user has clicked away from — or left behind by ⌘B, which hands
+        // the keyboard back deliberately — is on screen and *not* listening, and there ⌘F means
+        // "put me back in it". Without this the shortcut answered by folding the box away, and the
+        // user had to press it twice to type anything.
+        if self.has_keyboard() && self.ivars().searching.get() && self.ivars().query.borrow().is_empty() {
             self.exit_search();
         } else {
             self.enter_search();

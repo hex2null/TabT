@@ -656,13 +656,30 @@ impl TermView {
         self.ivars().grid.borrow().title().to_string()
     }
 
-    /// Send bytes to the shell as if they had been typed. Used for the clear button, whose whole
-    /// point is that the *shell* does the clearing.
+    /// Send bytes to the shell as if they had been typed — the toolbar's and menu's session actions
+    /// (the AI launchers, clear, clear line, interrupt) all arrive here. "As if typed" is the whole
+    /// contract, so this has to do the two things `keyDown:` does around its own write, and both are
+    /// wrong in a way that does not look like a bug from here:
+    ///
+    /// - **An ended session is a no-op.** The controller closes the master fd when the shell exits,
+    ///   but the number stays in this ivar, and `openpty` hands the lowest free descriptor to the
+    ///   *next* tab opened — so a write guarded only on `fd >= 0` types into whatever session was
+    ///   started after this one died. `\x03` on a dead tab would interrupt a live tab's job.
+    /// - **The viewport snaps to the live bottom**, exactly as typing does: what these bytes make
+    ///   the shell print lands at the bottom, which is off-screen while the user is scrolled back
+    ///   into history. That is what made Clear look like a dead button there — the shell cleared and
+    ///   repainted its prompt, and the view went on showing the same rows of scrollback.
     pub fn send(&self, bytes: &[u8]) {
         let fd = self.ivars().master_fd.get();
-        if fd >= 0 {
-            unsafe { write_all(fd, bytes) };
+        if self.ivars().ended.get() || fd < 0 {
+            return;
         }
+        // Bound to a local so the RefMut is released before the redraw.
+        let snapped = self.ivars().grid.borrow_mut().scroll_to_bottom();
+        if snapped {
+            unsafe { self.setNeedsDisplay(true) };
+        }
+        unsafe { write_all(fd, bytes) };
     }
 
     /// Everything this session has produced — scrollback and screen — as text (Shell → Export Text).
@@ -706,17 +723,39 @@ impl TermView {
         if self.ivars().ended.get() {
             return;
         }
+        self.end_session();
+        match self.ivars().end_fn.get() {
+            None => std::process::exit(0), // No controller (single-terminal case): legacy behavior
+            Some(f) => f(self.ivars().close_ctx.get(), self.ivars().tab_id.get()),
+        }
+    }
+
+    /// Put the view into the ended state, without telling the controller: the status line, the snap
+    /// to the bottom, and the flag every input and write path checks.
+    ///
+    /// Split out of [`Self::mark_ended`] because the controller ends a session from its side too —
+    /// the Restart button hangs up a *live* shell before respawning it (`restart_active_tab`), and
+    /// `end_tab_session` is what it uses to do that. That path never reaches `mark_ended`, so
+    /// without this the model said Ended while the view still believed it was live: no placeholder
+    /// line, and `key_down` taking the live branch, which is exactly the branch that does *not*
+    /// route Enter to the restart. If the respawn then failed there was no way back into the tab
+    /// from the keyboard at all.
+    ///
+    /// Idempotent, so the two callers cannot double-print the line, and it invalidates the fd it
+    /// holds — the controller has closed it by now, and `openpty` reissues that number to the next
+    /// tab opened.
+    pub fn end_session(&self) {
+        if self.ivars().ended.get() {
+            return;
+        }
         self.ivars().ended.set(true);
+        self.ivars().master_fd.set(-1);
         {
             let mut grid = self.ivars().grid.borrow_mut();
             grid.feed(b"\r\n\x1b[33m[Session ended -- press Enter to restart]\x1b[0m");
             grid.scroll_to_bottom();
         }
         unsafe { self.setNeedsDisplay(true) };
-        match self.ivars().end_fn.get() {
-            None => std::process::exit(0), // No controller (single-terminal case): legacy behavior
-            Some(f) => f(self.ivars().close_ctx.get(), self.ivars().tab_id.get()),
-        }
     }
 
     /// Respawn a fresh shell into this (already-ended) tab in place: swap in the new master fd,
@@ -1321,26 +1360,51 @@ pub(crate) fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
+/// Whether the system has that SF Symbol at all.
+///
+/// The symbol set grows with the OS and this app targets macOS 12, so a name from a later set
+/// resolves to nil and [`draw_symbol`] then draws *nothing* — an icon that is simply absent, which
+/// is the one failure mode here that does not look like a failure. Callers that want a newer glyph
+/// ask this once and keep the answer (see `sidebar::tab_symbols`).
+pub(crate) fn symbol_available(name: &str) -> bool {
+    unsafe {
+        NSImage::imageWithSystemSymbolName_accessibilityDescription(&NSString::from_str(name), None)
+            .is_some()
+    }
+}
+
+/// An SF Symbol at `pt`, tinted hierarchically to `color`. `None` when the symbol is missing —
+/// see [`symbol_available`] for why that is the failure mode worth having.
+///
+/// Stays a **vector** image: the configuration is applied to the symbol itself rather than
+/// rasterized into a bitmap, so it draws crisply at whatever scale it lands on and, when it is
+/// handed to AppKit (a menu item's image), is sized by the recipient rather than clipped to a box
+/// chosen here.
+pub(crate) fn symbol_image(name: &str, pt: f64, color: Rgb) -> Option<Retained<NSImage>> {
+    unsafe {
+        let img = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str(name),
+            None,
+        )?;
+        let color_cfg =
+            NSImageSymbolConfiguration::configurationWithHierarchicalColor(&ns_color(color));
+        let size_cfg = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
+            pt,
+            NSFontWeightRegular,
+            NSImageSymbolScale::Medium,
+        );
+        // Merge the weight/size and coloring configurations.
+        let cfg = size_cfg.configurationByApplyingConfiguration(&color_cfg);
+        Some(img.imageWithSymbolConfiguration(&cfg).unwrap_or(img))
+    }
+}
+
 /// Draw an SF Symbol icon inside `rect` (colored hierarchically by `color`). Silently skipped when the symbol is missing.
 /// Uniformly sets point size from the rect height + Regular weight + Medium scale, making the icon as
 /// crisp and consistent as a system control (rendered the same way as the title bar's sidebar.left).
 pub(crate) fn draw_symbol(name: &str, rect: NSRect, color: Rgb) {
     unsafe {
-        let img = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(name),
-            None,
-        );
-        if let Some(img) = img {
-            let color_cfg =
-                NSImageSymbolConfiguration::configurationWithHierarchicalColor(&ns_color(color));
-            let size_cfg = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
-                rect.size.height * 0.92,
-                NSFontWeightRegular,
-                NSImageSymbolScale::Medium,
-            );
-            // Merge the weight/size and coloring configurations.
-            let cfg = size_cfg.configurationByApplyingConfiguration(&color_cfg);
-            let colored = img.imageWithSymbolConfiguration(&cfg).unwrap_or(img);
+        if let Some(colored) = symbol_image(name, rect.size.height * 0.92, color) {
             // Draw centered at the symbol's own size to avoid drawInRect stretching (e.g. "⋯" squashed into a vertical ellipse).
             let sz = colored.size();
             // …but snapped to whole points. A symbol's natural size is fractional, so centering it

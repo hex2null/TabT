@@ -90,7 +90,7 @@ struct Tab {
     /// Last title the shell reported via OSC 0/1/2, already sanitized; empty when it has reported
     /// none, which is the common case — a stock zsh on macOS never sets one.
     osc_title: String,
-    dot: u8,      // status-dot color index (0 = default/auto; 1..=8 = classic colors, see sidebar::DOT_COLORS)
+    dot: u8,      // tab color index (0 = default/auto; 1..=8 = a slot of the theme's palette, see sidebar::dot_colors)
     locked: bool, // locked tabs are protected from being closed by the user (⌘W / the tab menu)
     view: Retained<TermView>,
     master_fd: RawFd,
@@ -107,8 +107,8 @@ struct Tab {
     /// `TermView::output_seq` as of the last sample, to spot new output without the PTY path
     /// having to notify anyone.
     last_seq: u64,
-    // Whether `last_seq` has been compared against a real reading yet. See `sample_states`: the
-    // first one is a baseline, not a change.
+    // Whether this session has settled after start-up. See `sample_states`: everything a shell
+    // prints on its way to its first prompt is baseline, not activity.
     primed: bool,
     /// The shell this session is actually running. Per tab, not read from Settings: changing the
     /// setting deliberately leaves running shells alone, so the global value names what the *next*
@@ -1338,6 +1338,12 @@ impl AppController {
             t.master_fd = -1;
             t.shell_pid = -1; // tcgetpgrp(-1) fails, so has_foreground_job reports false
             t.state = SessionState::Ended;
+            // The view keeps its own copy of both facts, and this is the one path that can reach
+            // here without it already knowing: a shell that exits on its own comes through
+            // `TermView::mark_ended`, which sets the flag before calling this, but `restart_active_tab`
+            // hangs a live shell up and calls this directly. Idempotent, so the first case is a
+            // no-op rather than a second status line (see `TermView::end_session`).
+            t.view.end_session();
         }
         // Marked here rather than left to the next sample: a session that just died should not go
         // on looking alive for the best part of a second. The borrow above is scoped for the same
@@ -1369,6 +1375,14 @@ impl AppController {
                     t.shell_pid = shell_pid;
                     t.shell = shell; // a restart re-resolves it, so the setting can take effect here
                     t.reader = view::attach_reader(&t.view);
+                    // The directory the new shell was actually spawned in becomes the fallback the
+                    // tab reports until OSC 7 says otherwise — which, with a stock zsh, is never
+                    // (`/etc/zshrc` only sources that hook for Apple_Terminal). `TermView::restart`
+                    // installs a fresh Grid one line below, wiping the cwd the old shell had
+                    // reported, so without this the tab would go on naming the directory it was
+                    // *first* opened in: the row and window title would rename themselves back to
+                    // it, Reveal in Finder would open it, and the next save would persist it.
+                    t.spawn_cwd = cwd.clone();
                     t.view.restart(fd, cols, rows);
                     t.state = SessionState::Idle; // a fresh shell comes up at its prompt
                 }
@@ -1510,6 +1524,14 @@ impl AppController {
     // don't build a whole `Snapshot` — which clones every title in the window — to read one bool.
     // `snapshot()` is for drawing, hit testing and dragging, where the whole model is wanted.
 
+    /// Whether there is a session for a session action to act on. False with every tab closed (the
+    /// empty-state placeholder), which is what the toolbar validates against: every one of those
+    /// actions opens by resolving `active` and returning if there is none, so without this they
+    /// would draw enabled and do nothing.
+    pub fn has_active_session(&self) -> bool {
+        self.model.borrow().active.is_some()
+    }
+
     /// Whether the given tab is locked (protected from user-initiated close).
     pub fn is_tab_locked(&self, id: u64) -> bool {
         self.model.borrow().tabs.iter().find(|t| t.id == id).map(|t| t.locked).unwrap_or(false)
@@ -1535,7 +1557,7 @@ impl AppController {
         self.model.borrow().groups.get(gi).map(|g| g.name.clone()).unwrap_or_default()
     }
 
-    /// Set a tab's status-dot color (index into sidebar::DOT_COLORS; 0 = default/auto).
+    /// Set a tab's color (index into sidebar::dot_colors; 0 = default/auto).
     pub fn set_tab_dot(&self, id: u64, dot: u8) {
         {
             let mut m = self.model.borrow_mut();
@@ -1666,21 +1688,6 @@ impl AppController {
                 // marking the tab in front of you would be noise, and `select` clears them anyway.
                 let seq = t.view.output_seq();
                 let background = active != Some(t.id);
-                // A session's own start-up counts for nothing: at spawn `last_seq` is 0 and the
-                // shell has not printed its prompt yet, so the first sample after a restore would
-                // otherwise mark every tab in the layout as having unseen output — the whole
-                // sidebar, on every launch, until each one had been clicked. The first observation
-                // only establishes the baseline.
-                if !t.primed {
-                    t.primed = true;
-                    t.last_seq = seq;
-                } else if seq != t.last_seq {
-                    t.last_seq = seq;
-                    if background && !t.activity {
-                        t.activity = true;
-                        changed = true;
-                    }
-                }
                 // Drained every sample whether or not it is used: the flag latches in the grid, so
                 // leaving it unread would ring the next time this tab happened to go background.
                 if t.view.take_bell() && background && !t.bell {
@@ -1698,6 +1705,23 @@ impl AppController {
                 };
                 if t.state != now {
                     t.state = now;
+                    changed = true;
+                }
+                // A session's own start-up counts for nothing, or a restored layout would mark
+                // every tab in it as having unseen output — the whole sidebar, on every launch,
+                // until each row had been clicked. So a tab is unprimed until it has *settled*:
+                // seen at a prompt, having printed nothing for a whole sample. Baselining on the
+                // first sample instead (what this did) is not enough — that sample lands 800ms in,
+                // typically before a forked shell has finished its rc files, so it baselines the
+                // silence and the prompt itself arrives as "new output" one tick later. Until then
+                // `last_seq` still tracks, so the start-up chatter is swallowed rather than
+                // arriving in a lump the moment the tab primes.
+                let quiet = seq == t.last_seq;
+                t.last_seq = seq;
+                if !t.primed {
+                    t.primed = quiet && now != SessionState::Running;
+                } else if !quiet && background && !t.activity {
+                    t.activity = true;
                     changed = true;
                 }
             }
@@ -1987,7 +2011,6 @@ impl AppController {
         }
     }
 
-    /// Clear the screen (⌘K).
     /// Type `cmd` into the active session and run it — what the toolbar's `claude` / `codex`
     /// buttons do. Deliberately the same as typing it: the shell resolves the name on `$PATH`, and
     /// if something is already running there the text lands in that program, exactly as it would
