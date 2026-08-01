@@ -147,14 +147,38 @@ thread_local! {
     // Inheriting the active tab's directory is what the app did before the setting existed, so it
     // stays the default: an upgrade must not change where ⌘T lands.
     static NEW_TAB_DIR: Cell<NewTabDir> = const { Cell::new(NewTabDir::Active) };
+    // Toolbar buttons the user has switched off (see `toolbar_shows`).
+    static TOOLBAR_HIDDEN: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    // The order the user dragged them into (see `toolbar_order`). Empty = the built-in order.
+    static TOOLBAR_ORDER: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Whether the sidebar/header separator borders are drawn.
-pub fn show_border() -> bool {
-    SHOW_BORDER.with(|c| c.get())
+/// Whether a toolbar button is shown. Stored as the *hidden* set, so a button added by a later
+/// version appears by default rather than staying invisible on an older config.
+pub fn toolbar_shows(key: &str) -> bool {
+    TOOLBAR_HIDDEN.with(|h| !h.borrow().iter().any(|k| k == key))
 }
-pub fn set_show_border(v: bool) {
-    SHOW_BORDER.with(|c| c.set(v));
+
+pub fn toolbar_hidden() -> Vec<String> {
+    TOOLBAR_HIDDEN.with(|h| h.borrow().clone())
+}
+
+pub fn set_toolbar_hidden(v: Vec<String>) {
+    TOOLBAR_HIDDEN.with(|h| *h.borrow_mut() = v);
+}
+
+/// The order the toolbar's buttons were dragged into, by their short keys.
+///
+/// Deliberately a *second* key beside the hidden set rather than a single ordered list of what is
+/// shown: "absent from the order" cannot tell a button the user removed from one this build has
+/// and the config's version did not, and the second of those has to appear (the same rule
+/// `toolbar_hidden` exists for). Resolving the two is [`crate::toolbar::layout`].
+pub fn toolbar_order() -> Vec<String> {
+    TOOLBAR_ORDER.with(|o| o.borrow().clone())
+}
+
+pub fn set_toolbar_order(v: Vec<String>) {
+    TOOLBAR_ORDER.with(|o| *o.borrow_mut() = v);
 }
 
 /// How the text cursor is drawn.

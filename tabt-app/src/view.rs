@@ -80,6 +80,11 @@ pub type RestartFn = fn(*const c_void, u64);
 /// Argument-less command callback (e.g. ⌘B to collapse the sidebar).
 pub type CmdFn = fn(*const c_void);
 
+/// Callback for a change in what the shell reports *about* the session rather than into it — its
+/// OSC title or its OSC 7 cwd — as (context, tab id). Fired only on an actual change, so the
+/// controller may treat every call as worth a sidebar refresh (see `on_readable`).
+pub type MetaFn = fn(*const c_void, u64);
+
 pub struct TermViewIvars {
     grid: RefCell<Grid>,
     // Mutable: `restart()` swaps in a fresh fd after the previous shell has ended.
@@ -91,6 +96,15 @@ pub struct TermViewIvars {
     end_fn: Cell<Option<EndFn>>,
     restart_fn: Cell<Option<RestartFn>>,
     toggle_fn: Cell<Option<CmdFn>>, // ⌘B to collapse the sidebar
+    meta_fn: Cell<Option<MetaFn>>,  // the shell reported a new title/cwd
+    // Last title/cwd handed to `meta_fn`, so a read that changed neither costs two string compares
+    // and no allocation. The PTY delivers output continuously; the title changes once in a while.
+    last_title: RefCell<String>,
+    last_cwd: RefCell<String>,
+    // Bumped once per read that produced output. The controller samples it to notice that a
+    // background session has printed something; a counter rather than a flag so nothing has to be
+    // cleared on the PTY path, which is the hottest one in the app.
+    output_seq: Cell<u64>,
     // The shell exited (EOF/read error) and hasn't been restarted yet: input is ignored except
     // Enter, which triggers `restart_fn`. See `mark_ended`/`restart`.
     ended: Cell<bool>,
@@ -571,6 +585,10 @@ impl TermView {
             end_fn: Cell::new(None),
             restart_fn: Cell::new(None),
             toggle_fn: Cell::new(None),
+            meta_fn: Cell::new(None),
+            last_title: RefCell::new(String::new()),
+            last_cwd: RefCell::new(String::new()),
+            output_seq: Cell::new(0),
             ended: Cell::new(false),
             scroll_accum: Cell::new(0.0),
             mouse_held: RefCell::new(Vec::new()),
@@ -612,22 +630,89 @@ impl TermView {
         self.ivars().sel_head.set(None);
     }
 
-    /// Clear screen (⌘K): directly feed ED(2) + cursor home to the Grid.
-    pub fn clear(&self) {
-        let mut grid = self.ivars().grid.borrow_mut();
-        grid.feed(b"\x1b[2J\x1b[H");
-        grid.scroll_to_bottom(); // a cleared screen has nothing to read back to
-        drop(grid);
-        unsafe { self.setNeedsDisplay(true) };
-    }
-
-    /// Bind the owning tab id, end/restart callbacks, and ⌘B collapse callback (called by AppController after creation).
-    pub fn attach(&self, ctx: *const c_void, tab_id: u64, end: EndFn, restart: RestartFn, toggle: CmdFn) {
+    /// Bind the owning tab id, end/restart callbacks, the ⌘B collapse callback and the title/cwd
+    /// change callback (called by AppController after creation).
+    pub fn attach(&self, ctx: *const c_void, tab_id: u64, end: EndFn, restart: RestartFn, toggle: CmdFn, meta: MetaFn) {
         self.ivars().tab_id.set(tab_id);
         self.ivars().close_ctx.set(ctx);
         self.ivars().end_fn.set(Some(end));
         self.ivars().restart_fn.set(Some(restart));
         self.ivars().toggle_fn.set(Some(toggle));
+        self.ivars().meta_fn.set(Some(meta));
+    }
+
+    /// Counter of reads that produced output; see `output_seq` in the ivars.
+    pub fn output_seq(&self) -> u64 {
+        self.ivars().output_seq.get()
+    }
+
+    /// Whether a BEL arrived since this was last called, clearing the flag.
+    pub fn take_bell(&self) -> bool {
+        self.ivars().grid.borrow_mut().take_bell()
+    }
+
+    /// The shell's last reported title (OSC 0/1/2); empty when it has never set one.
+    pub fn title(&self) -> String {
+        self.ivars().grid.borrow().title().to_string()
+    }
+
+    /// Send bytes to the shell as if they had been typed — the toolbar's and menu's session actions
+    /// (the AI launchers, clear, clear line, interrupt) all arrive here. "As if typed" is the whole
+    /// contract, so this has to do the two things `keyDown:` does around its own write, and both are
+    /// wrong in a way that does not look like a bug from here:
+    ///
+    /// - **An ended session is a no-op.** The controller closes the master fd when the shell exits,
+    ///   but the number stays in this ivar, and `openpty` hands the lowest free descriptor to the
+    ///   *next* tab opened — so a write guarded only on `fd >= 0` types into whatever session was
+    ///   started after this one died. `\x03` on a dead tab would interrupt a live tab's job.
+    /// - **The viewport snaps to the live bottom**, exactly as typing does: what these bytes make
+    ///   the shell print lands at the bottom, which is off-screen while the user is scrolled back
+    ///   into history. That is what made Clear look like a dead button there — the shell cleared and
+    ///   repainted its prompt, and the view went on showing the same rows of scrollback.
+    pub fn send(&self, bytes: &[u8]) {
+        let fd = self.ivars().master_fd.get();
+        if self.ivars().ended.get() || fd < 0 {
+            return;
+        }
+        // Bound to a local so the RefMut is released before the redraw.
+        let snapped = self.ivars().grid.borrow_mut().scroll_to_bottom();
+        if snapped {
+            unsafe { self.setNeedsDisplay(true) };
+        }
+        unsafe { write_all(fd, bytes) };
+    }
+
+    /// Everything this session has produced — scrollback and screen — as text (Shell → Export Text).
+    pub fn text(&self) -> String {
+        self.ivars().grid.borrow().buf_text()
+    }
+
+    /// Fire `meta_fn` if the grid's title or cwd differs from what was last reported. Compares
+    /// borrowed strings, so a read that changed neither — the overwhelming majority — allocates
+    /// nothing.
+    fn notify_meta_if_changed(&self) {
+        let (title_changed, cwd_changed) = {
+            let grid = self.ivars().grid.borrow();
+            (*self.ivars().last_title.borrow() != grid.title(), *self.ivars().last_cwd.borrow() != grid.cwd())
+        };
+        if !title_changed && !cwd_changed {
+            return;
+        }
+        {
+            let grid = self.ivars().grid.borrow();
+            if title_changed {
+                *self.ivars().last_title.borrow_mut() = grid.title().to_string();
+            }
+            if cwd_changed {
+                *self.ivars().last_cwd.borrow_mut() = grid.cwd().to_string();
+            }
+        }
+        // The grid borrow is dropped before calling out: the controller reads this view back
+        // through `title()`/`cwd()`, and a live borrow here would be a RefCell panic — which
+        // `panic = "abort"` turns into a dead app rather than one bad tab.
+        if let Some(f) = self.ivars().meta_fn.get() {
+            f(self.ivars().close_ctx.get(), self.ivars().tab_id.get());
+        }
     }
 
     /// The shell exited (EOF or a fatal read error): print a status line into the grid, flip into
@@ -638,17 +723,39 @@ impl TermView {
         if self.ivars().ended.get() {
             return;
         }
+        self.end_session();
+        match self.ivars().end_fn.get() {
+            None => std::process::exit(0), // No controller (single-terminal case): legacy behavior
+            Some(f) => f(self.ivars().close_ctx.get(), self.ivars().tab_id.get()),
+        }
+    }
+
+    /// Put the view into the ended state, without telling the controller: the status line, the snap
+    /// to the bottom, and the flag every input and write path checks.
+    ///
+    /// Split out of [`Self::mark_ended`] because the controller ends a session from its side too —
+    /// the Restart button hangs up a *live* shell before respawning it (`restart_active_tab`), and
+    /// `end_tab_session` is what it uses to do that. That path never reaches `mark_ended`, so
+    /// without this the model said Ended while the view still believed it was live: no placeholder
+    /// line, and `key_down` taking the live branch, which is exactly the branch that does *not*
+    /// route Enter to the restart. If the respawn then failed there was no way back into the tab
+    /// from the keyboard at all.
+    ///
+    /// Idempotent, so the two callers cannot double-print the line, and it invalidates the fd it
+    /// holds — the controller has closed it by now, and `openpty` reissues that number to the next
+    /// tab opened.
+    pub fn end_session(&self) {
+        if self.ivars().ended.get() {
+            return;
+        }
         self.ivars().ended.set(true);
+        self.ivars().master_fd.set(-1);
         {
             let mut grid = self.ivars().grid.borrow_mut();
             grid.feed(b"\r\n\x1b[33m[Session ended -- press Enter to restart]\x1b[0m");
             grid.scroll_to_bottom();
         }
         unsafe { self.setNeedsDisplay(true) };
-        match self.ivars().end_fn.get() {
-            None => std::process::exit(0), // No controller (single-terminal case): legacy behavior
-            Some(f) => f(self.ivars().close_ctx.get(), self.ivars().tab_id.get()),
-        }
     }
 
     /// Respawn a fresh shell into this (already-ended) tab in place: swap in the new master fd,
@@ -741,10 +848,12 @@ impl TermView {
             }
         }
         if dirty {
+            self.ivars().output_seq.set(self.ivars().output_seq.get().wrapping_add(1));
             // Output means the cursor is where the eye is: show it, whatever half of the blink
             // cycle the timer left it in.
             settings::show_cursor_phase();
             unsafe { self.setNeedsDisplay(true) };
+            self.notify_meta_if_changed();
         }
     }
 
@@ -1251,26 +1360,51 @@ pub(crate) fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
+/// Whether the system has that SF Symbol at all.
+///
+/// The symbol set grows with the OS and this app targets macOS 12, so a name from a later set
+/// resolves to nil and [`draw_symbol`] then draws *nothing* — an icon that is simply absent, which
+/// is the one failure mode here that does not look like a failure. Callers that want a newer glyph
+/// ask this once and keep the answer (see `sidebar::tab_symbols`).
+pub(crate) fn symbol_available(name: &str) -> bool {
+    unsafe {
+        NSImage::imageWithSystemSymbolName_accessibilityDescription(&NSString::from_str(name), None)
+            .is_some()
+    }
+}
+
+/// An SF Symbol at `pt`, tinted hierarchically to `color`. `None` when the symbol is missing —
+/// see [`symbol_available`] for why that is the failure mode worth having.
+///
+/// Stays a **vector** image: the configuration is applied to the symbol itself rather than
+/// rasterized into a bitmap, so it draws crisply at whatever scale it lands on and, when it is
+/// handed to AppKit (a menu item's image), is sized by the recipient rather than clipped to a box
+/// chosen here.
+pub(crate) fn symbol_image(name: &str, pt: f64, color: Rgb) -> Option<Retained<NSImage>> {
+    unsafe {
+        let img = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str(name),
+            None,
+        )?;
+        let color_cfg =
+            NSImageSymbolConfiguration::configurationWithHierarchicalColor(&ns_color(color));
+        let size_cfg = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
+            pt,
+            NSFontWeightRegular,
+            NSImageSymbolScale::Medium,
+        );
+        // Merge the weight/size and coloring configurations.
+        let cfg = size_cfg.configurationByApplyingConfiguration(&color_cfg);
+        Some(img.imageWithSymbolConfiguration(&cfg).unwrap_or(img))
+    }
+}
+
 /// Draw an SF Symbol icon inside `rect` (colored hierarchically by `color`). Silently skipped when the symbol is missing.
 /// Uniformly sets point size from the rect height + Regular weight + Medium scale, making the icon as
 /// crisp and consistent as a system control (rendered the same way as the title bar's sidebar.left).
 pub(crate) fn draw_symbol(name: &str, rect: NSRect, color: Rgb) {
     unsafe {
-        let img = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(name),
-            None,
-        );
-        if let Some(img) = img {
-            let color_cfg =
-                NSImageSymbolConfiguration::configurationWithHierarchicalColor(&ns_color(color));
-            let size_cfg = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
-                rect.size.height * 0.92,
-                NSFontWeightRegular,
-                NSImageSymbolScale::Medium,
-            );
-            // Merge the weight/size and coloring configurations.
-            let cfg = size_cfg.configurationByApplyingConfiguration(&color_cfg);
-            let colored = img.imageWithSymbolConfiguration(&cfg).unwrap_or(img);
+        if let Some(colored) = symbol_image(name, rect.size.height * 0.92, color) {
             // Draw centered at the symbol's own size to avoid drawInRect stretching (e.g. "⋯" squashed into a vertical ellipse).
             let sz = colored.size();
             // …but snapped to whole points. A symbol's natural size is fractional, so centering it

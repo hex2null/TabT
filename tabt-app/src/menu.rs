@@ -70,9 +70,83 @@ declare_class!(
         fn toggle_sidebar(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.toggle_sidebar());
         }
+
+        // Every toolbar item but `copy:`/`paste:` targets this object (see `toolbar.rs`), and AppKit
+        // asks the target to validate each one. Most of them act on the *active session*, and there
+        // is a real state with none: every tab closed, the empty-state placeholder showing. Their
+        // implementations all open with `let Some(a) = m.active else { return }`, so a blanket yes
+        // here — which is what this was, written when the toolbar held one button — drew a full row
+        // of enabled buttons that silently did nothing.
+        //
+        // Stated as the short list of items that do *not* need a session, so that a button added
+        // later defaults to the safe answer rather than to the wrong one. An item with no action at
+        // all (nothing here has one, but AppKit is free to ask about anything) is left enabled: the
+        // alternative is greying out a control this object knows nothing about.
+        #[method(validateToolbarItem:)]
+        fn validate_toolbar_item(&self, item: Option<&AnyObject>) -> bool {
+            let action: Option<Sel> = match item {
+                Some(item) => unsafe { msg_send![item, action] },
+                None => None,
+            };
+            // The sidebar pair (they act on the window), and the font pair (a setting, applied to
+            // every tab there is — including none).
+            let always = [sel!(toggleSidebar:), sel!(findSession:), sel!(increaseFontSize:), sel!(decreaseFontSize:)];
+            match action {
+                Some(a) if !always.contains(&a) => self.ask(|c| c.has_active_session()).unwrap_or(false),
+                _ => true,
+            }
+        }
         #[method(renameSession:)]
         fn rename_session(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.rename_active_tab());
+        }
+        #[method(lastSession:)]
+        fn last_session(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.select_recent_tab());
+        }
+        #[method(takeScreenshot:)]
+        fn take_screenshot(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.open_screenshot_ui());
+        }
+        #[method(clearLine:)]
+        fn clear_line(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.clear_line_active());
+        }
+        #[method(goHome:)]
+        fn go_home(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("cd ~"));
+        }
+        #[method(runClaude:)]
+        fn run_claude(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("claude"));
+        }
+        #[method(runCodex:)]
+        fn run_codex(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("codex"));
+        }
+        #[method(runGemini:)]
+        fn run_gemini(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("gemini"));
+        }
+        #[method(runAider:)]
+        fn run_aider(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("aider"));
+        }
+        #[method(runCursor:)]
+        fn run_cursor(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.run_in_active("cursor-agent"));
+        }
+        #[method(interruptSession:)]
+        fn interrupt_session(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.interrupt_active());
+        }
+        #[method(restartSession:)]
+        fn restart_session(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.restart_active_tab());
+        }
+        #[method(exportText:)]
+        fn export_text(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.export_active_text());
         }
         #[method(revealInFinder:)]
         fn reveal_in_finder(&self, _s: Option<&AnyObject>) {
@@ -124,19 +198,19 @@ declare_class!(
         // As the window delegate: re-center the traffic lights after macOS relays them out on resize.
         #[method(windowDidResize:)]
         fn window_did_resize(&self, _n: Option<&AnyObject>) {
-            self.with(|c| c.reposition_traffic_lights());
+            self.with(|c| c.sync_top_strip());
         }
 
         // Cold start: the one-shot call in main runs before AppKit finalizes the button layout, which
         // then resets them. Re-apply once the window is shown/keyed so they land centered on first launch.
         #[method(windowDidBecomeKey:)]
         fn window_did_become_key(&self, _n: Option<&AnyObject>) {
-            self.with(|c| c.reposition_traffic_lights());
+            self.with(|c| c.sync_top_strip());
         }
 
         #[method(windowDidExpose:)]
         fn window_did_expose(&self, _n: Option<&AnyObject>) {
-            self.with(|c| c.reposition_traffic_lights());
+            self.with(|c| c.sync_top_strip());
         }
     }
 );
@@ -157,6 +231,14 @@ impl MenuTarget {
         if !p.is_null() {
             f(unsafe { &*p });
         }
+    }
+
+    /// [`Self::with`] for a question rather than a command. `None` means there is no controller to
+    /// ask — the window's menus and toolbar exist before it does — which every caller reads as
+    /// "cannot say" and answers for itself.
+    fn ask<T>(&self, f: impl FnOnce(&AppController) -> T) -> Option<T> {
+        let p = self.ivars().controller.get();
+        (!p.is_null()).then(|| f(unsafe { &*p }))
     }
 }
 
@@ -245,8 +327,15 @@ pub fn build_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarge
     add(mtm, &shell, "New Group", Some(sel!(newGroup:)), Some(target), "n", true);
     shell.addItem(&NSMenuItem::separatorItem(mtm));
     add(mtm, &shell, "Rename Session", Some(sel!(renameSession:)), Some(target), "r", false);
+    // A fresh shell in the same tab and the same directory. Reachable from the keyboard as Enter on
+    // an *ended* session, but not otherwise, so the toolbar's button needs a menu item beside it.
+    add(mtm, &shell, "Restart Session", Some(sel!(restartSession:)), Some(target), "", false);
     add(mtm, &shell, "Reveal in Finder", Some(sel!(revealInFinder:)), Some(target), "r", true);
+    // ⇧⌘S, the system's own "save a copy of this" shortcut.
+    add(mtm, &shell, "Export Text…", Some(sel!(exportText:)), Some(target), "s", true);
     shell.addItem(&NSMenuItem::separatorItem(mtm));
+    // ⌘~ (that is, ⇧⌘` — the same physical key): flip back to the session you came from.
+    add(mtm, &shell, "Last Session", Some(sel!(lastSession:)), Some(target), "`", true);
     add(mtm, &shell, "Close Tab", Some(sel!(closeTab:)), Some(target), "w", false);
 
     // ---- Edit (target=nil → first responder TermView) ----

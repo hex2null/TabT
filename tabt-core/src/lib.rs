@@ -332,7 +332,11 @@ pub struct Grid {
     esc_intermediate: u8,
 
     // ---- Window title received via OSC ----
-    pub title: String,
+    title: String,
+    // ---- BEL seen in ground state since the last `take_bell` ----
+    // Not every 0x07 counts: the byte also terminates an OSC string, and that path consumes it
+    // without ever reaching `execute`, so a title report cannot ring the bell.
+    bell: bool,
     // ---- Current working directory reported via OSC 7 (local path parsed from a file:// URL) ----
     cwd: String,
 
@@ -390,6 +394,7 @@ impl Grid {
             shift_out: false,
             esc_intermediate: 0,
             title: String::new(),
+            bell: false,
             cwd: String::new(),
             replies: Vec::new(),
             state: State::Ground,
@@ -523,12 +528,25 @@ impl Grid {
         changed
     }
 
-    /// Whether the cursor is shown (DECTCEM), for the rendering layer's reference.
     /// Current working directory (reported via OSC 7; empty when the shell hasn't reported it).
     pub fn cwd(&self) -> &str {
         &self.cwd
     }
 
+    /// Window title last reported via OSC 0/1/2; empty when the shell has never set one, which is
+    /// the common case (a title is only emitted by shells configured to send it).
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Whether a BEL arrived since this was last called, clearing the flag. Consuming rather than
+    /// peeking: the app layer marks the session and that mark is cleared by being seen, so a bell
+    /// must not be reported twice.
+    pub fn take_bell(&mut self) -> bool {
+        core::mem::take(&mut self.bell)
+    }
+
+    /// Whether the cursor is shown (DECTCEM), for the rendering layer's reference.
     pub fn cursor_visible(&self) -> bool {
         self.cursor_visible
     }
@@ -892,7 +910,8 @@ impl Grid {
                 self.pending_wrap = false;
                 self.cursor.0 = 0;
             }
-            _ => {} // BEL (0x07) and others: ignored
+            0x07 => self.bell = true, // BEL: latched for the app layer to pick up (see `take_bell`)
+            _ => {}                   // everything else: ignored
         }
     }
 
@@ -1700,6 +1719,41 @@ impl Grid {
     }
 
     /// For dumb rendering / tests: export as per-row text (with trailing whitespace stripped).
+    /// The whole buffer as text — the scrollback first, then the screen — one line per row, with
+    /// each line's trailing blanks removed and the blank rows below the last content dropped.
+    ///
+    /// Addressed through `buf_cell`, so it covers exactly what the user can scroll back to, and
+    /// exactly what a selection can reach. The alternate screen has no history, so there this is
+    /// just what is on screen — which is right: vim's buffer is vim's to save, not the terminal's.
+    pub fn buf_text(&self) -> String {
+        // …and "no history" has to be enforced here, not assumed. `enter_alt` swaps `cells` and
+        // leaves `history`/`scrolled` exactly where the main screen left them — which is what lets
+        // the main screen come back intact — and `buf_cell` serves any row below `scrolled` out of
+        // that history whether or not the alt screen is up. So the range has to start at the screen
+        // on the alt screen, or exporting from inside vim writes the whole pre-vim scrollback and
+        // then vim's frame, which is neither of the two things the user could have meant.
+        let top = if self.alt { self.scrolled } else { self.buf_top() };
+        let mut lines: Vec<String> = (top..self.scrolled + self.rows)
+            .map(|row| {
+                (0..self.cols)
+                    .map(|col| self.buf_cell(col, row).ch)
+                    .filter(|&ch| ch != '\0') // drop wide-char trailer placeholders
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        // A screen is mostly empty below the prompt; exporting that as fifty blank lines is noise.
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let mut out = lines.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn to_lines(&self) -> Vec<String> {
         (0..self.rows)
             .map(|r| {
@@ -1748,6 +1802,38 @@ fn hex_digit(b: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn buf_text_exports_scrollback_then_screen_without_trailing_blanks() {
+        let mut g = Grid::new(10, 3);
+        g.set_history_max(100);
+        for line in ["one", "two", "three", "four", "five"] {
+            g.feed(line.as_bytes());
+            g.feed(b"\r\n");
+        }
+        // Five lines through a three-row screen: the first three scrolled into history, and the
+        // rows left blank under the cursor must not come out as empty lines.
+        assert_eq!(g.buf_text(), "one\ntwo\nthree\nfour\nfive\n");
+    }
+
+    /// The alternate screen has no scrollback, so an export taken while a full-screen application
+    /// is up is that application's frame and nothing else. The history is still *there* — it is the
+    /// main screen's, waiting to come back — and `buf_cell` will happily serve it, so the range
+    /// `buf_text` walks has to exclude it explicitly.
+    #[test]
+    fn buf_text_on_the_alt_screen_leaves_the_main_screens_scrollback_out() {
+        let mut g = Grid::new(10, 3);
+        g.set_history_max(100);
+        for line in ["one", "two", "three", "four"] {
+            g.feed(line.as_bytes());
+            g.feed(b"\r\n");
+        }
+        g.feed(b"\x1b[?1049h"); // into the alt screen, as vim/less/htop do
+        g.feed(b"ALT");
+        assert_eq!(g.buf_text(), "ALT\n");
+        g.feed(b"\x1b[?1049l"); // and back: the main screen's history is untouched
+        assert_eq!(g.buf_text(), "one\ntwo\nthree\nfour\n");
+    }
+
     use super::*;
 
     #[test]
@@ -2507,8 +2593,84 @@ mod tests {
     fn osc_sets_title() {
         let mut g = Grid::new(10, 1);
         g.feed(b"\x1b]0;hello\x07X");
-        assert_eq!(g.title, "hello");
+        assert_eq!(g.title(), "hello");
         assert_eq!(g.cell(0, 0).ch, 'X');
+    }
+
+    #[test]
+    fn osc_1_and_2_set_the_title_too() {
+        // xterm splits the icon name (1) from the window title (2); a terminal with one title bar
+        // treats all three as the same string, and the app reads whichever arrived last.
+        for intro in [&b"\x1b]1;"[..], &b"\x1b]2;"[..]] {
+            let mut g = Grid::new(10, 1);
+            let mut seq = intro.to_vec();
+            seq.extend_from_slice(b"named\x07");
+            g.feed(&seq);
+            assert_eq!(g.title(), "named");
+        }
+    }
+
+    #[test]
+    fn osc_title_accepts_the_st_terminator() {
+        let mut g = Grid::new(10, 1);
+        g.feed(b"\x1b]2;via-st\x1b\\X");
+        assert_eq!(g.title(), "via-st");
+        assert_eq!(g.cell(0, 0).ch, 'X'); // the ST is consumed, not printed
+    }
+
+    #[test]
+    fn osc_title_replaces_rather_than_appends() {
+        let mut g = Grid::new(10, 1);
+        g.feed(b"\x1b]0;first\x07");
+        g.feed(b"\x1b]0;second\x07");
+        assert_eq!(g.title(), "second");
+    }
+
+    #[test]
+    fn empty_osc_title_clears_it() {
+        // The app treats an empty title as "the shell has nothing to say" and falls back to the
+        // cwd/shell name, so clearing has to be distinguishable from never having been set.
+        let mut g = Grid::new(10, 1);
+        g.feed(b"\x1b]0;something\x07");
+        g.feed(b"\x1b]0;\x07");
+        assert_eq!(g.title(), "");
+    }
+
+    #[test]
+    fn over_long_osc_title_is_truncated_without_panicking() {
+        // The OSC buffer is capped; a remote host can send far more than that. Whatever survives
+        // has to be valid UTF-8, since the app slices it by chars when it sanitizes.
+        let mut g = Grid::new(10, 1);
+        let mut seq = b"\x1b]0;".to_vec();
+        seq.extend_from_slice("中".repeat(2000).as_bytes()); // 6000 bytes, well past the 1024 cap
+        seq.push(0x07);
+        g.feed(&seq);
+        let title = g.title();
+        assert!(title.len() <= 1024, "buffer cap not applied: {} bytes", title.len());
+        // The cap counts bytes and can land mid-character; from_utf8_lossy repairs that, so what
+        // comes out is always printable. This is the boundary the app then re-truncates by chars.
+        assert!(!title.is_empty());
+        assert!(title.starts_with('中'));
+    }
+
+    #[test]
+    fn bel_rings_the_bell_once() {
+        let mut g = Grid::new(10, 1);
+        assert!(!g.take_bell());
+        g.feed(b"a\x07b");
+        assert!(g.take_bell());
+        assert!(!g.take_bell()); // consumed, so a mark is never reported twice
+        assert_eq!(g.to_lines()[0], "ab"); // BEL prints nothing
+    }
+
+    #[test]
+    fn osc_terminator_does_not_ring_the_bell() {
+        // The BEL that ends an OSC string is consumed by the OSC state, so setting a title must
+        // not look like a bell — otherwise every prompt of a title-setting shell would mark the tab.
+        let mut g = Grid::new(10, 1);
+        g.feed(b"\x1b]0;quiet\x07");
+        assert_eq!(g.title(), "quiet");
+        assert!(!g.take_bell());
     }
 
     #[test]

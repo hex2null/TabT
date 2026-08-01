@@ -22,7 +22,7 @@ use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{NSAutoresizingMaskOptions, NSColor, NSView};
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
+use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
 use crate::theme;
 use crate::view::{ns_color, ns_color_bg};
@@ -43,12 +43,28 @@ const SHADOW_RADIUS_LIGHT: f64 = 9.0;
 /// off-screen or the tail of the shadow stays visible as a smudge down the window edge. Taken from
 /// the wider of the two radii, since the parking distance cannot depend on the theme in force.
 pub const SHADOW_REACH: f64 = SHADOW_RADIUS_LIGHT * 2.0;
+/// Corner radius of the window itself, measured off a screenshot: capture the corner over a light
+/// theme, find where the window's own color starts on each scanline, and fit — every sample from
+/// 6pt to 15pt down the edge lands within a few tenths of this. There is no API that answers it.
+const WINDOW_RADIUS: f64 = 26.0;
+
 /// Corner radius of the card.
 ///
-/// Concentric with the window: macOS rounds the window itself at ~24pt, and an inset shape stays
-/// concentric with its container at `outer − inset`. Anything smaller reads as a chip sitting in
-/// the corner rather than a panel following it.
-const CARD_RADIUS: f64 = 24.0 - CARD_INSET;
+/// Concentric with the window: an inset shape stays concentric with its container at
+/// `outer − inset`. Anything smaller reads as a chip sitting in the corner rather than a panel
+/// following it — and anything *equal* to the window's would bulge past it, since the card's corner
+/// sits CARD_INSET further in.
+const CARD_RADIUS: f64 = WINDOW_RADIUS - CARD_INSET;
+
+/// Round `layer`'s corners the way the window rounds its own: a continuous curve (the "squircle"),
+/// not the circular arc a plain `cornerRadius` gives.
+///
+/// This is the half of "match the window" that the radius cannot do on its own — at the same
+/// radius the two shapes still part company visibly, the circular one turning sooner and flatter.
+unsafe fn set_continuous_corners(layer: *mut AnyObject) {
+    let continuous = NSString::from_str("continuous");
+    let _: () = msg_send![layer, setCornerCurve: &*continuous];
+}
 
 /// Build the card and mount `content` inside it, filling the card's bounds.
 pub fn new(mtm: MainThreadMarker, frame: NSRect, content: &NSView) -> Retained<NSView> {
@@ -65,6 +81,7 @@ pub fn new(mtm: MainThreadMarker, frame: NSRect, content: &NSView) -> Retained<N
         let content_layer: *mut AnyObject = msg_send![content, layer];
         if !content_layer.is_null() {
             let _: () = msg_send![content_layer, setCornerRadius: CARD_RADIUS];
+            set_continuous_corners(content_layer);
             let _: () = msg_send![content_layer, setMasksToBounds: true];
         }
         card.addSubview(content);
@@ -84,6 +101,7 @@ pub fn apply_theme(card: &NSView) {
             return;
         }
         let _: () = msg_send![layer, setCornerRadius: CARD_RADIUS];
+        set_continuous_corners(layer);
         // Unmasked on purpose: the clip that keeps the sidebar's drawing inside the corners is on
         // the content layer (see `new`), because masking here would cut the shadow off.
         let _: () = msg_send![layer, setMasksToBounds: false];

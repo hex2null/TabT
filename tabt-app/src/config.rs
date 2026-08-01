@@ -29,8 +29,9 @@
 //! [group]
 //! name = Default
 //! collapsed = false
-//! tab = Terminal 1
+//! tab = tabt
 //! cwd = /Users/me/proj
+//! auto = true
 //! tab = server
 //!
 //! [group]
@@ -39,7 +40,14 @@
 //! tab = api
 //! ```
 //!
-//! Note: values are not escaped -- a newline in a group name/tab title would corrupt the format (renaming should forbid it).
+//! `auto = true` marks a tab whose title the app derived (from the shell's OSC title) rather than
+//! one the user chose with a rename; the app is free to replace a derived title, never a chosen
+//! one. It is written only for the derived case, so **an absent `auto` means pinned** — which is
+//! what makes a config written before the key existed keep its renames.
+//!
+//! Note: values are not escaped -- a newline in a group name/tab title would corrupt the format,
+//! so every title goes through `sanitize_label` on the way in *and* on the way out. That matters
+//! more than it used to: a title can now arrive from the shell via OSC, i.e. from a remote host.
 //!
 //! [`parse`] and [`render`] are the whole format; [`load`] and [`save`] are just `fs` around them.
 //! The split is what makes the format testable: `load()` reads a path under `$HOME`, so a test
@@ -55,19 +63,30 @@ use std::path::PathBuf;
 
 use crate::settings::{CursorShape, NewTabDir};
 
-/// Highest valid status-dot color index (must match sidebar::DOT_COLORS: indices 0..=8).
+/// Highest valid tab color index (must match sidebar::dot_colors: indices 0..=8).
 const MAX_DOT: u8 = 8;
 
-/// Persistent state of one tab (title + last working directory + status-dot color index + lock).
+/// Persistent state of one tab, in both directions: what [`parse`] reads back and what the caller
+/// hands to [`save`]. One struct rather than the tuple this used to be — it is at five fields, and
+/// `auto` is a bool next to two others that a positional form makes easy to transpose.
 pub struct TabState {
     pub title: String,
     pub cwd: String,
-    pub dot: u8,      // 0 = default/auto; 1..=8 = classic colors (see sidebar::DOT_COLORS)
+    pub dot: u8,      // 0 = default/auto; 1..=8 = a named slot of the theme's palette (sidebar::dot_colors)
     pub locked: bool, // locked tabs are protected from being closed (⌘W / the tab menu's Close)
+    /// Whether `title` was *derived* (from the shell's OSC title, or the directory) rather than
+    /// chosen by the user with ⌘R — in which case the app is free to re-derive it and the stored
+    /// value is only there to keep the file readable and the first frame after launch correct.
+    ///
+    /// Written as `auto = true` and **absent means false**, i.e. pinned. That inversion is what
+    /// makes every config written before this key existed safe: those titles were all either
+    /// renames or the old auto-generated "Terminal <n>", and treating them as pinned keeps the
+    /// renames rather than letting the first OSC title overwrite them.
+    pub auto: bool,
 }
 
-/// One tab as the caller hands it back to [`save`]: title, cwd, dot color, locked.
-pub type SavedTab = (String, String, u8, bool);
+/// One tab as the caller hands it back to [`save`].
+pub type SavedTab = TabState;
 /// One group as the caller hands it back to [`save`]: name, collapsed, its tabs.
 pub type SavedGroup = (String, bool, Vec<SavedTab>);
 
@@ -79,9 +98,21 @@ pub struct Settings {
     pub font_size: f64,
     pub sidebar_w: f64,
     pub sidebar_right: bool, // true = sidebar on the right
-    pub show_border: bool,   // whether to draw the sidebar/header separator lines
     pub window_w: f64,       // saved window content width (0 = use the built-in default)
     pub window_h: f64,       // saved window content height (0 = use the built-in default)
+    // Saved window position (AppKit screen coordinates, bottom-left origin). `None` — the key being
+    // absent — means "no saved position, center it", which is what every config written before this
+    // existed says. It cannot be a sentinel number the way the size is: 0 is a real coordinate, and
+    // so is a negative one, on a display sitting above or left of the main one.
+    // Toolbar buttons switched off in Settings → Toolbar, by their short keys. Stored as the
+    // hidden set so a button a later version adds shows up rather than staying hidden.
+    pub toolbar_hidden: Vec<String>,
+    // The order the customizer's drag left them in, by the same keys. Empty = the built-in order;
+    // a key this build does not know is dropped, and a shown key the list does not mention is
+    // appended (see `toolbar::layout`).
+    pub toolbar_order: Vec<String>,
+    pub window_x: Option<f64>,
+    pub window_y: Option<f64>,
     pub cursor_shape: CursorShape,
     pub cursor_blink: bool,
     pub scrollback: usize,   // lines of history per terminal
@@ -105,9 +136,12 @@ impl Default for Settings {
             font_size: crate::settings::DEFAULT_SIZE,
             sidebar_w: crate::sidebar::SIDEBAR_W,
             sidebar_right: false,
-            show_border: false,
             window_w: 0.0,
             window_h: 0.0,
+            toolbar_hidden: Vec::new(),
+            toolbar_order: Vec::new(),
+            window_x: None,
+            window_y: None,
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
             scrollback: tabt_core::DEFAULT_HISTORY_MAX,
@@ -238,12 +272,21 @@ pub fn parse(text: &str) -> Layout {
                     }
                 }
                 "sidebar_right" => s.sidebar_right = truthy(value),
-                "show_border" => s.show_border = truthy(value),
                 "window_width" => {
                     if let Ok(n) = value.parse::<f64>() {
                         s.window_w = n;
                     }
                 }
+                "toolbar_hidden" => {
+                    s.toolbar_hidden =
+                        value.split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_string).collect()
+                }
+                "toolbar_order" => {
+                    s.toolbar_order =
+                        value.split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_string).collect()
+                }
+                "window_x" => s.window_x = value.parse::<f64>().ok(),
+                "window_y" => s.window_y = value.parse::<f64>().ok(),
                 "window_height" => {
                     if let Ok(n) = value.parse::<f64>() {
                         s.window_h = n;
@@ -290,7 +333,9 @@ pub fn parse(text: &str) -> Layout {
     // When entirely empty (no ungrouped tabs and no tabs inside groups), add one ungrouped tab so a terminal is available.
     let total_tabs = ungrouped.len() + groups.iter().map(|g| g.2.len()).sum::<usize>();
     if total_tabs == 0 {
-        ungrouped.push(TabState { title: "Terminal 1".to_string(), cwd: String::new(), dot: 0, locked: false });
+        // No title: the app derives one from where the shell lands. Naming it here would make a
+        // first-launch tab look like the user had chosen that name, and it would then be kept.
+        ungrouped.push(TabState { title: String::new(), cwd: String::new(), dot: 0, locked: false, auto: true });
     }
 
     Layout { settings: s, ungrouped, groups }
@@ -300,7 +345,7 @@ pub fn parse(text: &str) -> Layout {
 /// the nearest one above them.
 fn read_tab_key(tabs: &mut Vec<TabState>, key: &str, value: &str) {
     match key {
-        "tab" => tabs.push(TabState { title: value.to_string(), cwd: String::new(), dot: 0, locked: false }),
+        "tab" => tabs.push(TabState { title: value.to_string(), cwd: String::new(), dot: 0, locked: false, auto: false }),
         "cwd" => {
             if let Some(t) = tabs.last_mut() {
                 t.cwd = value.to_string();
@@ -316,6 +361,11 @@ fn read_tab_key(tabs: &mut Vec<TabState>, key: &str, value: &str) {
                 t.locked = truthy(value);
             }
         }
+        "auto" => {
+            if let Some(t) = tabs.last_mut() {
+                t.auto = truthy(value);
+            }
+        }
         _ => {}
     }
 }
@@ -323,6 +373,59 @@ fn read_tab_key(tabs: &mut Vec<TabState>, key: &str, value: &str) {
 /// A boolean value: `true` (any case) or `1`; anything else is false.
 fn truthy(value: &str) -> bool {
     value.eq_ignore_ascii_case("true") || value == "1"
+}
+
+/// The longest label kept. A title is drawn into a sidebar row a couple of hundred points wide, so
+/// anything beyond this is invisible either way; the cap exists to stop a remote host from writing
+/// an unbounded line into the config file.
+const MAX_LABEL: usize = 200;
+
+/// Whether a character may appear in a tab or group label.
+///
+/// Rejects control characters — a newline in a value would corrupt the config format, which does no
+/// escaping — and the private-use block AppKit maps its function keys into, so a stray arrow key
+/// cannot type a glyph into a rename box.
+pub fn is_typable(ch: char) -> bool {
+    !ch.is_control() && !('\u{E000}'..='\u{F8FF}').contains(&ch)
+}
+
+/// Reduce arbitrary text to something safe to store as a label and draw in a row.
+///
+/// Both label sources run through this: what the user types into the rename box, and the OSC 0/1/2
+/// title, which arrives from whatever is on the other end of the PTY — possibly a remote host over
+/// ssh — and is therefore untrusted input reaching both the sidebar and `layout.conf`.
+///
+/// Truncation counts **characters, not bytes**: the OSC payload is bytes repaired by
+/// `from_utf8_lossy`, and slicing that by byte offset would panic mid-character. Under
+/// `panic = "abort"` that is the whole app, not one tab.
+///
+/// An empty result means "no usable label", which every caller treats as absent rather than as a
+/// blank name.
+pub fn sanitize_label(s: &str) -> String {
+    s.chars().filter(|c| is_typable(*c)).take(MAX_LABEL).collect::<String>().trim().to_string()
+}
+
+/// The longest stored path. `PATH_MAX` on macOS, which no real cwd exceeds — the cap is here for
+/// the same reason [`MAX_LABEL`] is, to bound what an invented one can write into the file.
+const MAX_PATH: usize = 1024;
+
+/// Reduce a shell-reported working directory to something safe to store.
+///
+/// The second untrusted string that reaches this file, and for a while the only one not filtered:
+/// a tab's cwd is whatever OSC 7 reported, `Grid::osc_dispatch` percent-decodes that payload with
+/// no filtering at all, and `render` writes it into a format that does no escaping. So
+/// `\x1b]7;file://h/tmp/%0Alock%20%3D%20true` — one escape sequence, from any host the user has
+/// ssh'd to — used to append a `lock = true` line of its own to the entry, and the tab came back
+/// from the next launch locked and refusing ⌘W. The `%0A[group]` form is worse: it opens a section,
+/// and every tab below it in the file is read back into a group that was never created.
+///
+/// Control characters are the whole of the attack (a value cannot span two lines without one), so
+/// they are the whole of the filter — unlike a label, a path is free to hold anything else it likes.
+/// Truncation counts **characters, not bytes**, for the reason [`sanitize_label`] does: the payload
+/// is bytes repaired by `from_utf8_lossy`, and slicing that by byte offset panics mid-character.
+/// Trimmed because [`parse`] trims what it reads, so an untrimmed path would not round-trip anyway.
+pub fn sanitize_path(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(MAX_PATH).collect::<String>().trim().to_string()
 }
 
 /// Write the layout back.
@@ -335,16 +438,24 @@ pub fn save(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) {
 fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String {
     // For each tab, write one tab= line and optional cwd=/dot=/lock= lines.
     let write_tabs = |out: &mut String, tabs: &[SavedTab]| {
-        for (title, cwd, dot, locked) in tabs {
-            out.push_str(&format!("tab = {}\n", title));
+        for t in tabs {
+            // Both untrusted strings are sanitized on the way out as well as on the way in: this is
+            // the last point before either becomes a line in a file with no escaping, and a newline
+            // in one would corrupt it. The title arrives from OSC 0/1/2 and the cwd from OSC 7 —
+            // same PTY, same possibly-remote host, same lack of any escaping to protect them.
+            out.push_str(&format!("tab = {}\n", sanitize_label(&t.title)));
+            let cwd = sanitize_path(&t.cwd);
             if !cwd.is_empty() {
                 out.push_str(&format!("cwd = {}\n", cwd));
             }
-            if *dot != 0 {
-                out.push_str(&format!("dot = {}\n", dot));
+            if t.dot != 0 {
+                out.push_str(&format!("dot = {}\n", t.dot));
             }
-            if *locked {
+            if t.locked {
                 out.push_str("lock = true\n");
+            }
+            if t.auto {
+                out.push_str("auto = true\n");
             }
         }
     };
@@ -356,10 +467,19 @@ fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String
     out.push_str(&format!("font_size = {}\n", s.font_size));
     out.push_str(&format!("sidebar_width = {}\n", s.sidebar_w));
     out.push_str(&format!("sidebar_right = {}\n", s.sidebar_right));
-    out.push_str(&format!("show_border = {}\n", s.show_border));
     if s.window_w > 0.0 && s.window_h > 0.0 {
         out.push_str(&format!("window_width = {}\n", s.window_w));
         out.push_str(&format!("window_height = {}\n", s.window_h));
+    }
+    if !s.toolbar_hidden.is_empty() {
+        out.push_str(&format!("toolbar_hidden = {}\n", s.toolbar_hidden.join(",")));
+    }
+    if !s.toolbar_order.is_empty() {
+        out.push_str(&format!("toolbar_order = {}\n", s.toolbar_order.join(",")));
+    }
+    if let (Some(x), Some(y)) = (s.window_x, s.window_y) {
+        out.push_str(&format!("window_x = {}\n", x));
+        out.push_str(&format!("window_y = {}\n", y));
     }
     out.push_str(&format!("cursor_shape = {}\n", s.cursor_shape.name()));
     out.push_str(&format!("cursor_blink = {}\n", s.cursor_blink));
@@ -389,8 +509,97 @@ fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String
 mod tests {
     use super::*;
 
+    /// A pinned tab (the user named it); `auto_tab` is the derived-title counterpart.
     fn tab(title: &str, cwd: &str, dot: u8, locked: bool) -> SavedTab {
-        (title.to_string(), cwd.to_string(), dot, locked)
+        TabState { title: title.to_string(), cwd: cwd.to_string(), dot, locked, auto: false }
+    }
+
+    fn auto_tab(title: &str, cwd: &str) -> SavedTab {
+        TabState { title: title.to_string(), cwd: cwd.to_string(), dot: 0, locked: false, auto: true }
+    }
+
+    /// A config written before `auto` existed — every v0.3.0 one — has to restore *pinned*, or the
+    /// first title the shell reports would overwrite a name the user had chosen. This is the whole
+    /// reason the key is written for the derived case rather than the chosen one.
+    #[test]
+    fn a_tab_without_the_auto_key_is_pinned() {
+        let back = parse("[tabs]\ntab = My Build\ncwd = /srv\n");
+        assert_eq!(back.ungrouped[0].title, "My Build");
+        assert!(!back.ungrouped[0].auto);
+    }
+
+    /// And the key is honored when present, in a group as well as at the top level.
+    #[test]
+    fn the_auto_key_is_read_in_both_sections() {
+        let back = parse("[tabs]\ntab = ~\nauto = true\n\n[group]\nname = W\ntab = api\nauto = true\ntab = kept\n");
+        assert!(back.ungrouped[0].auto);
+        assert!(back.groups[0].2[0].auto);
+        assert!(!back.groups[0].2[1].auto); // the key attaches to the nearest tab above it only
+    }
+
+    /// A newline is the one character that would actually corrupt the format: `parse` splits on
+    /// lines, so the tail of a title would come back as a bogus key.
+    #[test]
+    fn sanitize_strips_control_characters() {
+        assert_eq!(sanitize_label("build\nlock = true"), "buildlock = true");
+        assert_eq!(sanitize_label("a\tb\rc"), "abc");
+        assert_eq!(sanitize_label("\u{1b}]0;nested"), "]0;nested");
+    }
+
+    /// `=`, `[` and `#` are safe in a *value* — `parse` splits on the first `=` and takes the rest
+    /// verbatim — so the sanitizer must not mangle a legitimate title that contains them.
+    #[test]
+    fn sanitize_keeps_punctuation_and_unicode() {
+        assert_eq!(sanitize_label("make test [2/3] #ci"), "make test [2/3] #ci");
+        assert_eq!(sanitize_label("中文 ~/项目"), "中文 ~/项目");
+    }
+
+    /// The cap counts characters, never bytes: an OSC title is bytes through `from_utf8_lossy`, and
+    /// byte-slicing one mid-character panics — which `panic = "abort"` turns into a dead app.
+    #[test]
+    fn sanitize_truncates_by_characters_not_bytes() {
+        let long = "中".repeat(500);
+        let out = sanitize_label(&long);
+        assert_eq!(out.chars().count(), MAX_LABEL);
+        assert!(out.chars().all(|c| c == '中'));
+    }
+
+    /// An unusable title has to come back empty so the caller can fall through to the next rung of
+    /// the naming chain rather than showing a blank row.
+    #[test]
+    fn sanitize_yields_empty_for_nothing_usable() {
+        assert_eq!(sanitize_label(""), "");
+        assert_eq!(sanitize_label("\n\t\r"), "");
+        assert_eq!(sanitize_label("   "), "");
+        assert_eq!(sanitize_label("\u{f8ff}"), ""); // the private-use block AppKit's function keys live in
+    }
+
+    /// A sanitized title has to survive the config round trip unchanged, since that is where it
+    /// goes next.
+    #[test]
+    fn sanitized_title_round_trips_through_the_config() {
+        let title = sanitize_label("deploy [prod] = go");
+        let text = render(&Settings::default(), &[tab(&title, "/tmp", 0, false)], &[]);
+        let back = parse(&text);
+        assert_eq!(back.ungrouped[0].title, title);
+    }
+
+    /// An OSC 7 cwd is as untrusted as an OSC 0/1/2 title and reaches the same unescaped file, so a
+    /// newline in one must not be able to write a second key. Both payloads below are what one
+    /// escape sequence from a remote host produces: the first used to lock the tab it followed, the
+    /// second to open a section and sweep every tab under it into a group nobody made.
+    #[test]
+    fn an_injected_cwd_cannot_write_a_second_key() {
+        let text = render(
+            &Settings::default(),
+            &[tab("one", "/tmp/\nlock = true", 0, false), tab("two", "/tmp/\n[group]\nname = x", 0, false)],
+            &[],
+        );
+        let back = parse(&text);
+        assert_eq!(back.ungrouped.len(), 2, "an injected [group] split the tab list");
+        assert!(!back.groups.iter().any(|g| g.0 == "x"), "an injected section became a group");
+        assert!(!back.ungrouped[0].locked, "an injected lock line locked the tab");
+        assert_eq!(back.ungrouped[0].cwd, "/tmp/lock = true");
     }
 
     /// Everything written must come back, so a settings change survives the next launch. Goes
@@ -404,9 +613,12 @@ mod tests {
             font_size: 15.0,
             sidebar_w: 240.0,
             sidebar_right: true,
-            show_border: true,
             window_w: 1200.0,
             window_h: 800.0,
+            toolbar_hidden: vec!["copy".to_string(), "share".to_string()],
+            toolbar_order: vec!["clear".to_string(), "space".to_string(), "claude".to_string()],
+            window_x: Some(-40.0),
+            window_y: Some(-120.5),
             cursor_shape: CursorShape::Underline,
             cursor_blink: true,
             scrollback: 12_000,
@@ -415,7 +627,7 @@ mod tests {
             padding: 4.0,
             opacity: 0.85,
         };
-        let ungrouped = vec![tab("Loose", "/tmp", 3, true)];
+        let ungrouped = vec![tab("Loose", "/tmp", 3, true), auto_tab("~", "/Users/me")];
         let groups = vec![("Work".to_string(), true, vec![tab("api", "/srv", 0, false), tab("web", "", 8, false)])];
 
         let back = parse(&render(&s, &ungrouped, &groups));
@@ -426,8 +638,12 @@ mod tests {
         assert_eq!(g.font_size, 15.0);
         assert_eq!(g.sidebar_w, 240.0);
         assert!(g.sidebar_right);
-        assert!(g.show_border);
         assert_eq!((g.window_w, g.window_h), (1200.0, 800.0));
+        // Negative and fractional on purpose: a display above or left of the main one gives both,
+        // and the size fields' "0 means unset" trick would swallow the first of them.
+        assert_eq!((g.window_x, g.window_y), (Some(-40.0), Some(-120.5)));
+        assert_eq!(g.toolbar_hidden, vec!["copy".to_string(), "share".to_string()]);
+        assert_eq!(g.toolbar_order, vec!["clear".to_string(), "space".to_string(), "claude".to_string()]);
         assert!(g.cursor_shape == CursorShape::Underline);
         assert!(g.cursor_blink);
         assert_eq!(g.scrollback, 12_000);
@@ -436,11 +652,14 @@ mod tests {
         assert_eq!(g.padding, 4.0);
         assert_eq!(g.opacity, 0.85);
 
-        assert_eq!(back.ungrouped.len(), 1);
+        assert_eq!(back.ungrouped.len(), 2);
         assert_eq!(back.ungrouped[0].title, "Loose");
         assert_eq!(back.ungrouped[0].cwd, "/tmp");
         assert_eq!(back.ungrouped[0].dot, 3);
         assert!(back.ungrouped[0].locked);
+        assert!(!back.ungrouped[0].auto); // pinned: the user named this one
+        assert_eq!(back.ungrouped[1].title, "~");
+        assert!(back.ungrouped[1].auto); // derived: the app may re-derive it
 
         assert_eq!(back.groups.len(), 1);
         let (name, collapsed, tabs) = &back.groups[0];
@@ -488,6 +707,8 @@ dot = 99
     fn empty_config_yields_one_tab() {
         let l = parse("");
         assert_eq!(l.ungrouped.len(), 1);
+        // Deliberately unnamed: the app names it after the directory the shell starts in.
+        assert_eq!(l.ungrouped[0].title, "");
         assert!(l.groups.is_empty());
         assert_eq!(l.settings.style, crate::theme::DEFAULT_NAME);
     }

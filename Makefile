@@ -57,6 +57,9 @@ bundle: build
 	# Credits shown by the standard About panel (the app menu's "About"); carries the repository
 	# link. Same rule as above: it has to land before codesign.
 	cp bundle/Credits.rtf "$(BUNDLE)/Resources/"
+	# Artwork for the toolbar's claude/codex buttons (toolbar::bundled_image). Same rule again:
+	# a resource added after codesign invalidates the signature.
+	cp bundle/claude.png bundle/openai.png "$(BUNDLE)/Resources/"
 	@if security find-certificate -c "$(CERT_NAME)" >/dev/null 2>&1; then \
 		codesign --force --sign "$(CERT_NAME)" "$(APP)"; \
 	else \
@@ -79,8 +82,15 @@ release:
 
 # Drag-to-Applications disk image, always built from the release identity. Set SIGN_ID /
 # NOTARY_PROFILE (see bundle/make-dmg.sh) to produce one that Gatekeeper accepts on other Macs.
+#
+# The release bundle is removed once it is inside the image: the .dmg *is* the deliverable, and
+# leaving dist/TabT.app behind puts a second, launchable copy of the shipping identity next to the
+# development one — same config directory and same `tabt` process name as an installed TabT, so
+# `open dist/TabT.app` and `killall tabt` stop meaning what they look like they mean. Only on
+# success, so a failed image leaves the bundle there to inspect.
 dmg: release
 	APP=dist/TabT.app bash bundle/make-dmg.sh
+	rm -rf dist/TabT.app
 
 # These pass the same identity as `build` so alternating with `make run` doesn't flip
 # TABT_APP_NAME/TABT_CONFIG_DIR and force a full relink of tabt-app every time.

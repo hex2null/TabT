@@ -99,17 +99,76 @@ impl Theme {
         (target / contrast).min(0.20)
     }
 
-    /// Subtle separator/border line color derived from the theme (background nudged toward the
-    /// foreground), so borders read correctly on dark and light themes alike.
-    pub fn border(&self) -> Rgb {
-        mix(self.bg, self.fg, 0.10)
+    /// The accent the sidebar's focused inputs draw in — the ring around the search and rename
+    /// boxes, and the selection behind their text.
+    ///
+    /// Taken from the theme's own blue: every scheme defines one, and it is the same family the
+    /// theme picker's miniature already uses for a path, so a focused box reads as belonging to the
+    /// scheme rather than to the app. It was a fixed amber until it had to live on half a dozen
+    /// light themes and a green phosphor.
+    ///
+    /// Which of the palette's two blues is *the* blue is [`Theme::vivid`]'s question, not this one's
+    /// — this used to read palette 12 outright, which on Solarized is one of the base grays the
+    /// scheme builds its text hierarchy from, so the ring there was drawn in the body text's own
+    /// tone. Then lifted toward the foreground when it does not separate from the card it is drawn
+    /// on ([`Theme::on_card`]): this is a hairline ring, and a blue that sits at the card's own
+    /// luminance — xterm's `#0000ee` on a near-black panel, which is what the base palette gives a
+    /// theme that sets no colors of its own — disappears into it. A monochrome phosphor theme
+    /// ignores SGR entirely and its palette means nothing, so there the phosphor itself is the
+    /// accent.
+    pub fn accent(&self) -> Rgb {
+        if self.mono {
+            return self.fg;
+        }
+        self.on_card(self.vivid(4, 12))
     }
 
-    /// Separator drawn on the sidebar panel. The panel carries [`Theme::card_bg`] and its content is
-    /// quieter than the terminal's, so the shared [`Theme::border`] sinks into it — this is one step
-    /// stronger, enough for the edge to read as a rim.
-    pub fn sidebar_border(&self) -> Rgb {
-        mix(self.bg, self.fg, 0.20)
+    /// One of the theme's 16 ANSI colors, normalized to the [0,1] components the drawing code uses.
+    /// Out of range yields the foreground rather than panicking — the palette is indexed from
+    /// hand-written tables, and under `panic = "abort"` a slip there is the whole app.
+    pub fn color(&self, i: usize) -> Rgb {
+        match self.palette.get(i) {
+            Some(&(r, g, b)) => (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0),
+            None => self.fg,
+        }
+    }
+
+    /// The more *colorful* of a palette pair — a normal slot and its bright counterpart (e.g. red:
+    /// 1 and 9) — for app chrome that has to name a hue rather than reproduce a scheme's SGR output.
+    ///
+    /// Which half of the 16 carries the colors is a convention, and it is not universal. On most
+    /// schemes the bright half is a lighter version of the normal one and either would do. Solarized
+    /// spends 8..15 on its *base tones* instead — its bright green, yellow, blue and cyan are the
+    /// grays the scheme builds its text hierarchy from — so reading a "green" out of the bright half
+    /// there yields four marks that are the same gray as each other and as the theme's body text.
+    /// Comparing chroma picks the slot that actually holds the color, on that scheme and on the ones
+    /// where the choice does not matter alike.
+    pub fn vivid(&self, a: usize, b: usize) -> Rgb {
+        let (ca, cb) = (self.color(a), self.color(b));
+        if chroma(ca) >= chroma(cb) {
+            ca
+        } else {
+            cb
+        }
+    }
+
+    /// A palette color made visible *on the sidebar card*, for chrome the app draws there — the
+    /// focused input's ring, a session icon's hue.
+    ///
+    /// A palette color is authored to be read on the theme's terminal background, and the card is a
+    /// step away from that; more to the point, a scheme is free to put a color right at the card's
+    /// own luminance — xterm's `#0000ee` on a near-black panel, which is what the base palette gives
+    /// a theme that sets no colors of its own — and there the mark simply disappears. Lifting it
+    /// toward the foreground keeps its hue and buys the separation, and at none at all it lands on
+    /// the foreground itself, which the card is guaranteed to show: the theme's body text is drawn
+    /// on it.
+    pub fn on_card(&self, c: Rgb) -> Rgb {
+        const MIN: f64 = 0.18; // luminance separation a mark needs from the card to be seen
+        let d = (luminance(c) - luminance(self.card_bg())).abs();
+        if d >= MIN {
+            return c;
+        }
+        mix(c, self.fg, ((MIN - d) / MIN).clamp(0.0, 1.0))
     }
 }
 
@@ -121,6 +180,12 @@ pub fn mix(a: Rgb, b: Rgb, t: f64) -> Rgb {
 /// Perceptual-ish luminance of an Rgb (0..1), used to tell light themes from dark ones.
 fn luminance(c: Rgb) -> f64 {
     0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2
+}
+
+/// How much color an Rgb carries (0 = a neutral gray, 1 = a primary): the HSV saturation's
+/// numerator, which is all [`Theme::vivid`] needs to rank two candidates.
+fn chroma(c: Rgb) -> f64 {
+    c.0.max(c.1).max(c.2) - c.0.min(c.1).min(c.2)
 }
 
 /// One entry of the theme registry: the name shown in the settings pop-up and stored in

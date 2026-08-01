@@ -24,6 +24,8 @@ mod sidebar;
 mod theme;
 mod theme_grid;
 mod toggle;
+mod toolbar;
+mod toolbar_editor;
 mod view;
 
 use objc2::msg_send;
@@ -36,7 +38,7 @@ use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 use card::{CARD_GAP, CARD_INSET};
 use divider::DIVIDER_W;
 use sidebar::{SidebarView, SIDEBAR_W};
-use toggle::{ToggleButton, TOGGLE_W};
+use toggle::{StripAction, StripButton, TOGGLE_W};
 
 const CONTENT_W: f64 = 1000.0;
 const CONTENT_H: f64 = 620.0;
@@ -118,9 +120,11 @@ fn main() {
         ),
     );
 
-    // Collapse button: a floating view repositioned by the controller (sidebar top-right when
-    // expanded, window top-left over the terminal when collapsed).
-    let toggle_btn = ToggleButton::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(TOGGLE_W + 12.0, TOGGLE_W)));
+    // The card's top-strip buttons: search and collapse, floating views the controller parks at the
+    // card's far end (and slides off screen with the card on a collapse).
+    let btn_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(TOGGLE_W + 12.0, TOGGLE_W));
+    let search_btn = StripButton::new(mtm, btn_frame, StripAction::Search);
+    let toggle_btn = StripButton::new(mtm, btn_frame, StripAction::Collapse);
 
     unsafe {
         // Sidebar card: fixed width, pinned left, resizes with height (the sidebar view inside it
@@ -134,14 +138,17 @@ fn main() {
             NSAutoresizingMaskOptions::NSViewWidthSizable
                 | NSAutoresizingMaskOptions::NSViewHeightSizable,
         );
+        // Strip buttons: pinned to the top, left-anchored (the controller sets their exact frames
+        // in relayout).
+        for b in [&search_btn, &toggle_btn] {
+            b.setAutoresizingMask(
+                NSAutoresizingMaskOptions::NSViewMinYMargin | NSAutoresizingMaskOptions::NSViewMaxXMargin,
+            );
+        }
         // Divider bar: fixed on the seam (HeightSizable resizes with height, MaxXMargin lets its right side track width).
         divider.setAutoresizingMask(
             NSAutoresizingMaskOptions::NSViewHeightSizable
                 | NSAutoresizingMaskOptions::NSViewMaxXMargin,
-        );
-        // Toggle: pinned to the top, left-anchored (the controller sets its exact frame in relayout).
-        toggle_btn.setAutoresizingMask(
-            NSAutoresizingMaskOptions::NSViewMinYMargin | NSAutoresizingMaskOptions::NSViewMaxXMargin,
         );
         // Host first, card above it. Both the terminal and the header fill their whole rect, so with
         // the card underneath the host would clip the card's shadow where it reaches past the
@@ -150,7 +157,8 @@ fn main() {
         container.addSubview(&host);
         container.addSubview(&card);
         container.addSubview(&divider); // above the seam, takes over dragging
-        container.addSubview(&toggle_btn); // topmost, floats in the title-bar zone
+        container.addSubview(&search_btn); // topmost, floats over the card's top strip
+        container.addSubview(&toggle_btn);
     }
     window.setContentView(Some(&container));
 
@@ -161,6 +169,7 @@ fn main() {
         sidebar.clone(),
         card.clone(),
         host.clone(),
+        search_btn.clone(),
         toggle_btn.clone(),
         divider.clone(),
     );
@@ -170,16 +179,17 @@ fn main() {
     let menu_target = menu::MenuTarget::new(mtm);
     menu_target.set_controller(std::rc::Rc::as_ptr(&controller));
     menu::build_menu(mtm, &app, &menu_target);
+    controller.set_toolbar_target(&menu_target); // the toolbar's sidebar button sends toggleSidebar:
     // The same object serves as both the app delegate (save on quit) and the window delegate
     // (re-center traffic lights on resize).
     let _: () = unsafe { msg_send![&*app, setDelegate: &*menu_target] };
     let _: () = unsafe { msg_send![&*window, setDelegate: &*menu_target] };
 
-    window.center();
+    controller.place_window(); // the saved position, or centered when there is none
     window.makeKeyAndOrderFront(None);
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
-    controller.reposition_traffic_lights(); // center the traffic lights in the taller title bar
+    controller.sync_top_strip(); // center the traffic lights + align the toolbar in the taller title bar
 
     // controller (Rc) and menu_target must live until the event loop ends; app.run() never returns.
     let _controller = controller;
