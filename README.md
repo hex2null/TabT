@@ -20,17 +20,26 @@ sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT
    legible on light and dark alike. They are plain data, not code: edit `~/.tabt/themes.conf` to
    change one or add your own.
 5. **Fonts** — 9 classic monospace families, adjustable live with ⌘= / ⌘- / ⌘0.
-6. **Settings dialog** (⌘,) — four panes, everything applied live and saved at once: *Theme*
+6. **Settings dialog** (⌘,) — five panes, everything applied live and saved at once: *Theme*
    (a grid of preview cards, each a miniature of the app in that theme rather than a name in a
-   list), *Appearance* (font, size, sidebar side, border, padding, background opacity),
-   *Terminal* (cursor shape, blink, scrollback depth) and *Shell* (which shell to run, and whether
-   a new tab opens in your home directory or the active tab's).
-7. **Per-tab status dot** — click a tab's dot to give it a color.
-8. **Persistence** — layout, groups, tabs, theme, font, and window size are restored on launch.
-9. **Mouse support in TUIs** — clicks, drags and the wheel are reported to the running application
+   list), *Appearance* (font, size, sidebar side, border, padding, background opacity), *Toolbar*
+   (below), *Terminal* (cursor shape, blink, scrollback depth) and *Shell* (which shell to run, and
+   whether a new tab opens in your home directory or the active tab's).
+7. **A toolbar you arrange by dragging it** — the title bar carries two groups of buttons: the AI
+   launchers (Claude and Codex out of the box; Gemini, Aider and Cursor waiting in the palette),
+   which type their command into the session and press Return, and actions on the session in front
+   of you — home, clear line, clear, screenshot, export text, reveal in Finder, and more. The
+   *Toolbar* settings pane is the toolbar itself, drawn at full size: drag a button to reorder it,
+   or out of its row to put it away.
+8. **Live session state** — each row's icon shows whether that session is running a job, sitting at
+   a prompt, or has exited, and a background tab is marked when it prints something you haven't seen
+   or rings the bell. Click a session's icon to give it a color of your own.
+9. **Persistence** — layout, groups, tabs, theme, font, and window position and size are restored on
+   launch.
+10. **Mouse support in TUIs** — clicks, drags and the wheel are reported to the running application
    (vim, tmux, htop, lazygit), in both the legacy and the SGR encoding; hold ⇧ to select text
    instead.
-10. **VT/ANSI core** — SGR colors and text attributes, cursor/scroll/erase operations, alternate
+11. **VT/ANSI core** — SGR colors and text attributes, cursor/scroll/erase operations, alternate
     screen buffer, DEC private modes and IRM, tab stops, the DEC line-drawing charset, DSR/DA,
     OSC title and cwd reporting, UTF-8.
 
@@ -68,9 +77,10 @@ This builds a release binary, bundles it into `dist/TabT Dev.app`, code-signs it
 | ⌘R | Rename session | | ⌘= / ⌘- / ⌘0 | Font size ± / reset |
 | ⌘, | Settings | | ⌘C / ⌘V / ⌘A | Copy / paste / select all |
 | ⇧⌘R | Reveal cwd in Finder | | ⌃↩ | Session context menu |
+| ⇧⌘S | Export session text | | ⌘~ | Last session |
 
 Also: double-click the header to zoom the window, double-click a tab/group name to rename it,
-and click a tab's status dot to set its color. While an application is using the mouse itself,
+and click a session's icon to set its color. While an application is using the mouse itself,
 hold ⇧ to select text with it instead.
 
 ## Development
@@ -79,7 +89,7 @@ A two-crate Cargo workspace: `tabt-core` (the VT/ANSI engine — pure logic, zer
 runs and tests on any platform) and `tabt-app` (the AppKit UI layer via `objc2`, macOS-only).
 
 ```sh
-make test    # tabt-core unit tests, then tabt-app's (the themes.conf parser)
+make test    # tabt-core unit tests, then tabt-app's (themes.conf parser, layout.conf round trip)
 make run     # build, bundle into dist/, and launch the app
 make dmg     # build the release app and package dist/TabT-<version>.dmg
 make echo    # standalone PTY echo loop, a debugging tool; run in a real terminal, not an IDE panel
