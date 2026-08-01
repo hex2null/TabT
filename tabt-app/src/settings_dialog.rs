@@ -50,7 +50,13 @@ const ROW_H: f64 = 38.0;
 /// fixed frame and a palette taller than it is clipped rather than scrolled, so the size has to be
 /// the worst case and not the usual one. The theme grid scrolls and the control panes hold less, so
 /// both simply use what they need of it.
-const PANE_H: f64 = 456.0;
+///
+/// It grew when the palette split per group: the tiles still wrap into the same three rows, but the
+/// two halves wrap *independently* and each carries a label, so the worst case gained two headings
+/// and the gap between them. The previous value fit the old worst case to the point — it was exactly
+/// `PANE_H - RESET_H` — so there was nothing left to absorb them, and the last tile row came out
+/// from under the clip on top of the Restore Defaults button.
+const PANE_H: f64 = 508.0;
 /// Gap between the top of a pane and its first row.
 const PANE_TOP: f64 = 20.0;
 /// Room the Toolbar pane leaves at its bottom for the Restore Defaults button.

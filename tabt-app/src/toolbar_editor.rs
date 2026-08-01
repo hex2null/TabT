@@ -7,11 +7,17 @@
 //! it, the 44pt item box and the capsule measured off a live window's own item views — so the pane
 //! and the title bar show the same row of buttons rather than an illustration of one.
 //!
-//! **One editable row per group** ([`toolbar::Group`]): AI, then Common. The row a button sits in
-//! *is* its group, so dragging one across the gap moves it between them, and the toolbar is those
-//! two rows with a space between — one capsule each. That is also why there is no "Space" tile: the
-//! break between the capsules is the break between the rows, and a button that could be dragged
-//! either side of it would be saying the same thing twice.
+//! **One editable row per group** ([`toolbar::Group`]): AI, then Common, drawn as the toolbar draws
+//! them — one capsule each with a space between. That is why there is no "Space" tile: the break
+//! between the capsules is the break between the rows, and a button that could be dragged either
+//! side of it would be saying the same thing twice.
+//!
+//! **A button's group is the button's, not the row's.** The AI row is the launchers and nothing
+//! else, so a drag cannot carry one across the gap — the other row simply is not a drop target, and
+//! releasing over it removes the button rather than moving it. What the user arranges is the order
+//! within a row. The palette below is split the same way for the same reason: one undivided pile of
+//! removed buttons would offer a Claude tile to the Common row and then refuse the drop, so each
+//! half is labeled and holds only what its row can take.
 //!
 //! It is deliberately **not** a picture of the whole title bar. The traffic lights and the session
 //! title used to be drawn here for realism, and they cost the row most of its width for nothing an
@@ -80,6 +86,12 @@ const TILE_GAP: f64 = 10.0;
 /// Gap between the last row and the palette's heading, and the height a heading occupies.
 const PALETTE_TOP: f64 = 20.0;
 const HEADING_H: f64 = 20.0;
+/// The palette is split per group, so each half needs naming under the one "Not in the toolbar"
+/// heading. Deliberately smaller than [`HEADING_H`] and separated by less than [`PALETTE_TOP`]: the
+/// pane is a fixed height and clips rather than scrolls, so a second full-weight heading and a
+/// second full gap is height the last tile row cannot spare.
+const SUBHEAD_H: f64 = 17.0;
+const SECTION_GAP: f64 = 8.0;
 
 /// How far the pointer must travel before a press becomes a drag. Below this the gesture is a
 /// click, and a click here does nothing at all (see the module docs).
@@ -91,8 +103,8 @@ enum Press {
     None,
     /// A button in a row: which row, and where in it.
     Row(usize, usize),
-    /// A tile in the palette, by its position there.
-    Palette(usize),
+    /// A tile in a palette: which group's, and where in it.
+    Palette(usize, usize),
 }
 
 /// No drop target — the pointer is over neither row, which for a button already in one means
@@ -105,8 +117,9 @@ pub struct EditorIvars {
     /// from [`toolbar::rows`] and pushed back to the controller on mouse-up, so a drag in flight
     /// never touches the real toolbar.
     rows: RefCell<Vec<Vec<&'static str>>>,
-    /// The buttons currently in neither row, in the table's own order.
-    palette: RefCell<Vec<&'static str>>,
+    /// The buttons currently in neither row, one list per group like `rows` and in the same order,
+    /// because a tile can only be dropped into its own group's row.
+    palette: RefCell<Vec<Vec<&'static str>>>,
     press: Cell<Press>,
     start: Cell<NSPoint>,
     cur: Cell<NSPoint>,
@@ -185,7 +198,7 @@ impl ToolbarEditor {
         let this = this.set_ivars(EditorIvars {
             controller: Cell::new(std::ptr::null()),
             rows: RefCell::new(vec![Vec::new(); toolbar::Group::ALL.len()]),
-            palette: RefCell::new(Vec::new()),
+            palette: RefCell::new(vec![Vec::new(); toolbar::Group::ALL.len()]),
             press: Cell::new(Press::None),
             start: Cell::new(NSPoint::new(0.0, 0.0)),
             cur: Cell::new(NSPoint::new(0.0, 0.0)),
@@ -215,7 +228,8 @@ impl ToolbarEditor {
     pub fn reload(&self) {
         let (ai, common) = toolbar::rows();
         *self.ivars().rows.borrow_mut() = vec![ai, common];
-        *self.ivars().palette.borrow_mut() = toolbar::removed();
+        let (ai_out, common_out) = toolbar::removed();
+        *self.ivars().palette.borrow_mut() = vec![ai_out, common_out];
         unsafe { self.setNeedsDisplay(true) };
     }
 
@@ -241,10 +255,20 @@ impl ToolbarEditor {
     /// How tall the pane's content is, so the dialog can place what goes under it. Measured against
     /// the *worst* case — every button in the palette — because the pane is a fixed size and a
     /// palette taller than its frame is clipped, not scrolled.
+    /// Per *section*, not over the whole table: the halves wrap independently, so five AI buttons and
+    /// twelve common ones are two rows plus one, which `ceil(17 / cols)` would under-count by a whole
+    /// row — and the shortfall is invisible until the bottom tiles are already cut off.
     pub fn height(&self, width: f64) -> f64 {
-        let all: Vec<&'static str> = toolbar::CUSTOMIZABLE.iter().map(|e| e.key).collect();
-        let rows = all.len().div_ceil(self.cols(width));
-        self.palette_top() + HEADING_H + rows as f64 * (TILE_H + TILE_GAP)
+        let cols = self.cols(width);
+        let mut h = self.palette_top() + HEADING_H;
+        for (i, g) in toolbar::Group::ALL.iter().enumerate() {
+            let n = toolbar::CUSTOMIZABLE.iter().filter(|e| e.group == *g).count();
+            h += SUBHEAD_H + n.div_ceil(cols).max(1) as f64 * (TILE_H + TILE_GAP);
+            if i + 1 < toolbar::Group::ALL.len() {
+                h += SECTION_GAP;
+            }
+        }
+        h
     }
 
     // ---- geometry ----
@@ -281,12 +305,29 @@ impl ToolbarEditor {
         (((width - 2.0 * PAD_X + TILE_GAP) / (TILE_W + TILE_GAP)).floor() as usize).max(1)
     }
 
-    fn tile_rect(&self, i: usize) -> NSRect {
+    /// How many tile rows group `g`'s palette occupies. Never zero: an empty half still has to hold
+    /// the line its "nothing here" note is drawn on, and reserving it keeps the half below from
+    /// sliding up and down as the last tile leaves.
+    fn palette_rows(&self, count: usize) -> usize {
+        count.div_ceil(self.cols(self.frame().size.width)).max(1)
+    }
+
+    /// Top of group `g`'s half of the palette — its sub-heading; the tiles start [`SUBHEAD_H`] below.
+    fn section_top(&self, g: usize) -> f64 {
+        let mut y = self.palette_top() + HEADING_H;
+        for prev in 0..g {
+            let n = self.ivars().palette.borrow()[prev].len();
+            y += SUBHEAD_H + self.palette_rows(n) as f64 * (TILE_H + TILE_GAP) + SECTION_GAP;
+        }
+        y
+    }
+
+    fn tile_rect(&self, g: usize, i: usize) -> NSRect {
         let cols = self.cols(self.frame().size.width);
         let (col, row) = (i % cols, i / cols);
         rect(
             PAD_X + col as f64 * (TILE_W + TILE_GAP),
-            self.palette_top() + HEADING_H + row as f64 * (TILE_H + TILE_GAP),
+            self.section_top(g) + SUBHEAD_H + row as f64 * (TILE_H + TILE_GAP),
             TILE_W,
             TILE_H,
         )
@@ -332,21 +373,45 @@ impl ToolbarEditor {
             }
             return Press::None;
         }
-        for i in 0..self.ivars().palette.borrow().len() {
-            if contains(self.tile_rect(i), p) {
-                return Press::Palette(i);
+        for g in 0..toolbar::Group::ALL.len() {
+            for i in 0..self.ivars().palette.borrow()[g].len() {
+                if contains(self.tile_rect(g, i), p) {
+                    return Press::Palette(g, i);
+                }
             }
         }
         Press::None
     }
 
+    /// The group the button being dragged belongs to, which is the only row that will take it. Read
+    /// from the press rather than the drop, because [`Self::drop_target`] runs on every motion event
+    /// and the press is the only end of the gesture that names a button.
+    fn dragged_group(&self) -> Option<usize> {
+        let key = match self.ivars().press.get() {
+            Press::Row(g, i) => self.ivars().rows.borrow()[g].get(i).copied(),
+            Press::Palette(g, i) => self.ivars().palette.borrow()[g].get(i).copied(),
+            Press::None => None,
+        }?;
+        let group = toolbar::entry(key)?.group;
+        toolbar::Group::ALL.iter().position(|g| *g == group)
+    }
+
     /// Where the dragged button would land: `(row, index)`, or [`NO_DROP`] when the pointer is over
     /// neither row.
+    ///
+    /// A row only takes its **own** group's buttons, so the pointer being over the other one is not a
+    /// drop target at all — for a tile it means nothing happens, and for a button already placed it
+    /// reads as "remove", the same as the pointer being outside both. Refusing here rather than at
+    /// mouse-up is what keeps the insertion line from promising a drop that will not happen.
     fn drop_target(&self, p: NSPoint) -> (usize, usize) {
+        let mine = self.dragged_group();
         for g in 0..toolbar::Group::ALL.len() {
             let row = self.row_rect(g);
             if !contains(row, p) {
                 continue;
+            }
+            if mine != Some(g) {
+                return NO_DROP;
             }
             let keys = self.preview_keys(g);
             let rects = self.item_rects(&keys, row);
@@ -382,13 +447,14 @@ impl ToolbarEditor {
                         let at = drop_at.min(rows[drop_row].len());
                         rows[drop_row].insert(at, key);
                     } else {
-                        // Dragged out of both rows: removed, and offered back in the palette at the
-                        // place the table would put it, not at the end of a growing pile.
-                        insert_by_table(&mut palette, key);
+                        // Dragged out of its row: removed, and offered back in its own half of the
+                        // palette at the place the table would put it, not at the end of a growing
+                        // pile. `g` is that half — a row only ever held its own group's buttons.
+                        insert_by_table(&mut palette[g], key);
                     }
                 }
-                Press::Palette(i) if i < palette.len() && landed => {
-                    let key = palette.remove(i);
+                Press::Palette(g, i) if i < palette[g].len() && landed => {
+                    let key = palette[g].remove(i);
                     let at = drop_at.min(rows[drop_row].len());
                     rows[drop_row].insert(at, key);
                 }
@@ -399,7 +465,8 @@ impl ToolbarEditor {
         let rows = self.ivars().rows.borrow();
         let order: Vec<String> =
             toolbar::flatten(&rows[0], &rows[1]).iter().map(|k| k.to_string()).collect();
-        let mut hidden: Vec<String> = self.ivars().palette.borrow().iter().map(|k| k.to_string()).collect();
+        let mut hidden: Vec<String> =
+            self.ivars().palette.borrow().iter().flatten().map(|k| k.to_string()).collect();
         // A key this build does not know is one a *newer* version hid, and it is not the
         // customizer's to drop: the editor only ever saw the buttons in this table, so anything
         // else is carried through untouched rather than rewritten out by the first drag. The
@@ -434,7 +501,7 @@ impl ToolbarEditor {
         let secondary = unsafe { NSColor::secondaryLabelColor() };
 
         draw_text(
-            "Drag a button to arrange it, to the other row to move it there, or out to remove it.",
+            "Drag a button to arrange its row, or out of it to remove. Each row takes its own buttons.",
             NSPoint::new(PAD_X, 8.0),
             &caption,
             &secondary,
@@ -526,39 +593,46 @@ impl ToolbarEditor {
             }
         }
 
-        // ---- The palette: what is in neither row ----
+        // ---- The palette: what is in neither row, split the same way the rows are ----
+        // A tile can only be dropped into its own group's row, so the halves are labeled: one
+        // undivided pile would be inviting a Claude tile into the Common row and then refusing it.
         let palette = self.ivars().palette.borrow().clone();
         draw_text("Not in the toolbar", NSPoint::new(PAD_X, self.palette_top()), &heading, &secondary);
         let skip = match (dragging, self.ivars().press.get()) {
             // The tile being dragged is under the pointer instead of in its slot.
-            (true, Press::Palette(i)) => Some(i),
+            (true, Press::Palette(g, i)) => Some((g, i)),
             _ => None,
         };
-        for (i, k) in palette.iter().enumerate() {
-            if Some(i) == skip {
-                continue;
+        let faint = unsafe { NSColor::tertiaryLabelColor() };
+        for (g, group) in toolbar::Group::ALL.iter().enumerate() {
+            let top = self.section_top(g);
+            draw_text(group.label(), NSPoint::new(PAD_X, top), &tile_font, &faint);
+            for (i, k) in palette[g].iter().enumerate() {
+                if skip == Some((g, i)) {
+                    continue;
+                }
+                let r = self.tile_rect(g, i);
+                let icon = rect(r.origin.x + (TILE_W - ICON_BOX) / 2.0, r.origin.y + 8.0, ICON_BOX, ICON_BOX);
+                self.draw_entry(k, icon, tone);
+                if let Some(e) = toolbar::entry(k) {
+                    draw_centered(e.label, rect(r.origin.x, r.origin.y + 30.0, TILE_W, 14.0), &tile_font, &secondary);
+                }
             }
-            let r = self.tile_rect(i);
-            let icon = rect(r.origin.x + (TILE_W - ICON_BOX) / 2.0, r.origin.y + 8.0, ICON_BOX, ICON_BOX);
-            self.draw_entry(k, icon, tone);
-            if let Some(e) = toolbar::entry(k) {
-                draw_centered(e.label, rect(r.origin.x, r.origin.y + 30.0, TILE_W, 14.0), &tile_font, &secondary);
+            if palette[g].is_empty() {
+                draw_text(
+                    "All in the toolbar.",
+                    NSPoint::new(PAD_X, top + SUBHEAD_H + 2.0),
+                    &tile_font,
+                    &faint,
+                );
             }
-        }
-        if palette.is_empty() {
-            draw_text(
-                "Every button is in the toolbar.",
-                NSPoint::new(PAD_X, self.palette_top() + HEADING_H + 4.0),
-                &tile_font,
-                &unsafe { NSColor::tertiaryLabelColor() },
-            );
         }
 
         // ---- The button under the pointer, drawn last so it rides over everything ----
         if dragging {
             let key = match self.ivars().press.get() {
                 Press::Row(g, i) => self.ivars().rows.borrow()[g].get(i).copied(),
-                Press::Palette(i) => palette.get(i).copied(),
+                Press::Palette(g, i) => palette[g].get(i).copied(),
                 Press::None => None,
             };
             if let Some(k) = key {

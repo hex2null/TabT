@@ -101,10 +101,10 @@ pub const SPACE_KEY: &str = "space";
 /// Which half of the toolbar a button sits in: the AI launchers, or the actions that operate on the
 /// session already in front of you. One capsule each, in this order.
 ///
-/// A button's group is **the row the user put it in**, not a fixed property of the button: the
-/// customizer draws one editable row per group and dragging across the gap moves a button between
-/// them. [`Entry::group`] is only where a button starts — the row it joins the first time it is
-/// placed, and the row an older config's arrangement is read back into when it recorded no divider.
+/// A button's group is **a fixed property of the button** ([`Entry::group`]), not the row it was
+/// dropped in. The AI row is the launchers and nothing else: what belongs there is decided by what
+/// the button *is*, so the customizer offers each row only its own buttons and a drag cannot carry
+/// one across the gap. The user arranges the order within a row; the split itself is the table's.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Group {
     Ai,
@@ -194,9 +194,13 @@ pub fn entry(key: &str) -> Option<&'static Entry> {
 /// `toolbar_order` is the arrangement — one flat list with [`SPACE_KEY`] marking the row break, so
 /// the two rows and the toolbar's own item list are the same sequence written once.
 ///
-/// A stored list with **no** divider is one written before the rows existed (or hand-edited): its
-/// keys are read back into the row each button's table entry names, keeping their relative order, so
-/// an arrangement never collapses into one row on upgrade.
+/// **Which row a key lands in is the table's answer, never the stored list's.** [`Entry::group`] is
+/// a fixed property of the button, so the divider's position is read for nothing here: a config that
+/// records `claude` after it — an older one, a hand-edited one, or one written before the group was
+/// fixed — is silently resolved back into the AI row rather than honored or rejected. That is the
+/// same rule the rest of this format follows, where anything odd resolves instead of erroring. The
+/// stored list still decides the *order within* each row, which is the whole of what the user
+/// arranges.
 ///
 /// A shown button the list does not mention — exactly the one a later version added — is appended to
 /// its table row. That is the only place `default_on` applies: a button the user dragged in comes
@@ -204,10 +208,9 @@ pub fn entry(key: &str) -> Option<&'static Entry> {
 /// palette and moving one into a row is permanent the moment it lands.
 pub fn rows() -> (Vec<&'static str>, Vec<&'static str>) {
     let stored = settings::toolbar_order();
-    let split = stored.iter().position(|k| k == SPACE_KEY);
     let mut out: [Vec<&'static str>; 2] = [Vec::new(), Vec::new()];
     let mut mentioned: Vec<&'static str> = Vec::new();
-    for (i, k) in stored.iter().enumerate() {
+    for k in stored.iter() {
         let Some(e) = entry(k) else { continue };
         mentioned.push(e.key);
         if !settings::toolbar_shows(e.key) {
@@ -218,11 +221,7 @@ pub fn rows() -> (Vec<&'static str>, Vec<&'static str>) {
         if out[0].contains(&e.key) || out[1].contains(&e.key) {
             continue;
         }
-        let row = match split {
-            Some(at) => usize::from(i > at),
-            None => usize::from(e.group == Group::Common),
-        };
-        out[row].push(e.key);
+        out[usize::from(e.group == Group::Common)].push(e.key);
     }
     for e in CUSTOMIZABLE.iter() {
         if e.default_on && settings::toolbar_shows(e.key) && !mentioned.contains(&e.key) {
@@ -253,14 +252,20 @@ pub fn defaults() -> Vec<&'static str> {
     flatten(&of(Group::Ai), &of(Group::Common))
 }
 
-/// The keys in neither row — what the customizer offers to drag back in.
-pub fn removed() -> Vec<&'static str> {
+/// The keys in neither row — what the customizer offers to drag back in, **split the same way the
+/// rows are**. A palette tile can only be dropped into its own group's row, so one undivided pile of
+/// them would be offering a Claude tile to the Common row and refusing the drop; each group is shown
+/// what it can actually take.
+pub fn removed() -> (Vec<&'static str>, Vec<&'static str>) {
     let (ai, common) = rows();
-    CUSTOMIZABLE
-        .iter()
-        .map(|e| e.key)
-        .filter(|k| !ai.contains(k) && !common.contains(k))
-        .collect()
+    let out = |g: Group| -> Vec<&'static str> {
+        CUSTOMIZABLE
+            .iter()
+            .filter(|e| e.group == g && !ai.contains(&e.key) && !common.contains(&e.key))
+            .map(|e| e.key)
+            .collect()
+    };
+    (out(Group::Ai), out(Group::Common))
 }
 
 pub struct DelegateIvars {
