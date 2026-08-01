@@ -63,7 +63,7 @@ use std::path::PathBuf;
 
 use crate::settings::{CursorShape, NewTabDir};
 
-/// Highest valid status-dot color index (must match sidebar::DOT_COLORS: indices 0..=8).
+/// Highest valid tab color index (must match sidebar::dot_colors: indices 0..=8).
 const MAX_DOT: u8 = 8;
 
 /// Persistent state of one tab, in both directions: what [`parse`] reads back and what the caller
@@ -72,7 +72,7 @@ const MAX_DOT: u8 = 8;
 pub struct TabState {
     pub title: String,
     pub cwd: String,
-    pub dot: u8,      // 0 = default/auto; 1..=8 = classic colors (see sidebar::DOT_COLORS)
+    pub dot: u8,      // 0 = default/auto; 1..=8 = a named slot of the theme's palette (sidebar::dot_colors)
     pub locked: bool, // locked tabs are protected from being closed (⌘W / the tab menu's Close)
     /// Whether `title` was *derived* (from the shell's OSC title, or the directory) rather than
     /// chosen by the user with ⌘R — in which case the app is free to re-derive it and the stored
@@ -405,6 +405,29 @@ pub fn sanitize_label(s: &str) -> String {
     s.chars().filter(|c| is_typable(*c)).take(MAX_LABEL).collect::<String>().trim().to_string()
 }
 
+/// The longest stored path. `PATH_MAX` on macOS, which no real cwd exceeds — the cap is here for
+/// the same reason [`MAX_LABEL`] is, to bound what an invented one can write into the file.
+const MAX_PATH: usize = 1024;
+
+/// Reduce a shell-reported working directory to something safe to store.
+///
+/// The second untrusted string that reaches this file, and for a while the only one not filtered:
+/// a tab's cwd is whatever OSC 7 reported, `Grid::osc_dispatch` percent-decodes that payload with
+/// no filtering at all, and `render` writes it into a format that does no escaping. So
+/// `\x1b]7;file://h/tmp/%0Alock%20%3D%20true` — one escape sequence, from any host the user has
+/// ssh'd to — used to append a `lock = true` line of its own to the entry, and the tab came back
+/// from the next launch locked and refusing ⌘W. The `%0A[group]` form is worse: it opens a section,
+/// and every tab below it in the file is read back into a group that was never created.
+///
+/// Control characters are the whole of the attack (a value cannot span two lines without one), so
+/// they are the whole of the filter — unlike a label, a path is free to hold anything else it likes.
+/// Truncation counts **characters, not bytes**, for the reason [`sanitize_label`] does: the payload
+/// is bytes repaired by `from_utf8_lossy`, and slicing that by byte offset panics mid-character.
+/// Trimmed because [`parse`] trims what it reads, so an untrimmed path would not round-trip anyway.
+pub fn sanitize_path(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(MAX_PATH).collect::<String>().trim().to_string()
+}
+
 /// Write the layout back.
 pub fn save(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) {
     let _ = fs::create_dir_all(dir());
@@ -416,11 +439,14 @@ fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String
     // For each tab, write one tab= line and optional cwd=/dot=/lock= lines.
     let write_tabs = |out: &mut String, tabs: &[SavedTab]| {
         for t in tabs {
-            // Sanitized on the way out as well as on the way in: this is the last point before a
-            // title becomes a line in a file with no escaping, and a newline here would corrupt it.
+            // Both untrusted strings are sanitized on the way out as well as on the way in: this is
+            // the last point before either becomes a line in a file with no escaping, and a newline
+            // in one would corrupt it. The title arrives from OSC 0/1/2 and the cwd from OSC 7 —
+            // same PTY, same possibly-remote host, same lack of any escaping to protect them.
             out.push_str(&format!("tab = {}\n", sanitize_label(&t.title)));
-            if !t.cwd.is_empty() {
-                out.push_str(&format!("cwd = {}\n", t.cwd));
+            let cwd = sanitize_path(&t.cwd);
+            if !cwd.is_empty() {
+                out.push_str(&format!("cwd = {}\n", cwd));
             }
             if t.dot != 0 {
                 out.push_str(&format!("dot = {}\n", t.dot));
@@ -556,6 +582,24 @@ mod tests {
         let text = render(&Settings::default(), &[tab(&title, "/tmp", 0, false)], &[]);
         let back = parse(&text);
         assert_eq!(back.ungrouped[0].title, title);
+    }
+
+    /// An OSC 7 cwd is as untrusted as an OSC 0/1/2 title and reaches the same unescaped file, so a
+    /// newline in one must not be able to write a second key. Both payloads below are what one
+    /// escape sequence from a remote host produces: the first used to lock the tab it followed, the
+    /// second to open a section and sweep every tab under it into a group nobody made.
+    #[test]
+    fn an_injected_cwd_cannot_write_a_second_key() {
+        let text = render(
+            &Settings::default(),
+            &[tab("one", "/tmp/\nlock = true", 0, false), tab("two", "/tmp/\n[group]\nname = x", 0, false)],
+            &[],
+        );
+        let back = parse(&text);
+        assert_eq!(back.ungrouped.len(), 2, "an injected [group] split the tab list");
+        assert!(!back.groups.iter().any(|g| g.0 == "x"), "an injected section became a group");
+        assert!(!back.ungrouped[0].locked, "an injected lock line locked the tab");
+        assert_eq!(back.ungrouped[0].cwd, "/tmp/lock = true");
     }
 
     /// Everything written must come back, so a settings change survives the next launch. Goes
