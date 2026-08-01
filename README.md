@@ -5,9 +5,13 @@
 A small, fast native terminal emulator for macOS, written in Rust on top of AppKit. Multi-tab
 sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT/ANSI core.
 
-![TabT on a light theme: a floating sidebar of grouped sessions beside a terminal showing the curl man page](screenshot1.jpeg)
+![TabT with no session open: a floating sidebar card listing two sessions and five collapsed groups, the toolbar's two button capsules in the title bar, and the app's placeholder — the TabT cat, New Terminal ⌘T, New Group ⇧⌘N — centered in the terminal pane](screenshot1.jpeg)
 
-![The same window on a dark theme](screenshot2.jpeg)
+![The same window on a darker theme, the whole UI — card, sidebar, title bar and terminal — following it](screenshot2.jpeg)
+
+![A session in front: the header's meta line reads tabt · ~/Code/tabt · zsh, the sidebar row for it is selected and its icon green while the job runs, and Claude Code's banner fills the terminal](screenshot3.jpeg)
+
+![The Settings dialog open on its Theme pane: a scrolling grid of preview cards — Ayu Light, Catppuccin Latte, Catppuccin Mocha, Dracula, GitHub Light, Gruvbox Dark, Gruvbox Light, Nord — each a miniature of the app in that theme with its own ANSI swatches, Dracula selected](screenshot4.jpeg)
 
 ## Features
 
@@ -42,8 +46,6 @@ sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT
 11. **VT/ANSI core** — SGR colors and text attributes, cursor/scroll/erase operations, alternate
     screen buffer, DEC private modes and IRM, tab stops, the DEC line-drawing charset, DSR/DA,
     OSC title and cwd reporting, UTF-8.
-
-![The Settings dialog open on its Theme pane: a scrolling grid of preview cards — Ayu Light, Catppuccin Latte, Catppuccin Mocha, Dracula, GitHub Light, Gruvbox Dark — each a miniature of the app in that theme with its own ANSI swatches, Catppuccin Mocha selected](screenshot3.jpeg)
 
 ## Install
 
