@@ -39,6 +39,15 @@ use crate::view::{self, TermView};
 /// animations — long enough to read as motion, short enough not to sit in the way.
 const SIDEBAR_ANIM: f64 = 0.22;
 
+/// The narrowest the terminal pane may become, and through it the narrowest the window may be
+/// dragged (see [`AppController::sync_window_min_width`]).
+///
+/// About forty columns at the default font — a width a wrapped `ls` or a git log still reads at, and
+/// the point below which the pane stops being a terminal and starts being a sliver. It is a fixed
+/// number of points rather than a number of columns, because the sidebar it has to be added to is
+/// measured in points too and the window limit has to hold while the user is changing the font.
+const MIN_TERM_W: f64 = 320.0;
+
 /// Where the session name starts, measured from the terminal's own left edge.
 const TITLE_INSET: f64 = 16.0;
 
@@ -339,12 +348,57 @@ impl AppController {
     }
 
     /// Drag to adjust the sidebar width (ignored when collapsed).
+    ///
+    /// Bounded by the window as well as by `MIN_SIDEBAR_W`..`MAX_SIDEBAR_W`: the same rule
+    /// [`Self::sync_window_min_width`] enforces from the other side, since a divider dragged to the
+    /// far edge squeezes the terminal exactly as a window dragged narrow does. The window's own
+    /// minimum keeps the room here from falling below `MIN_SIDEBAR_W`, but the `max` guards it
+    /// anyway — a config restored from before that minimum existed can start narrower, and
+    /// `clamp` with a max below its min panics, which under `panic = "abort"` is the app.
     pub fn set_sidebar_width(&self, w: f64) {
         if self.collapsed.get() {
             return;
         }
-        self.sidebar_w.set(w.clamp(MIN_SIDEBAR_W, MAX_SIDEBAR_W));
+        let room = self.content_width() - CARD_INSET - CARD_GAP - MIN_TERM_W;
+        let max = MAX_SIDEBAR_W.min(room.max(MIN_SIDEBAR_W));
+        self.sidebar_w.set(w.clamp(MIN_SIDEBAR_W, max));
         self.relayout();
+    }
+
+    /// Width of the window's content area — what the layout is measured in, and what the window's
+    /// minimum is expressed in.
+    fn content_width(&self) -> f64 {
+        self.window.contentView().map(|c| c.bounds().size.width).unwrap_or(0.0)
+    }
+
+    /// Stop the window being resized narrower than the sidebar plus a usable terminal.
+    ///
+    /// Without a minimum the window shrinks until the card is all there is: the terminal pane goes
+    /// to nothing, `dims()` floors it at one column, and the shell is left rendering into a strip.
+    /// The limit has to be *recomputed*, not set once at startup, because half of it is the sidebar
+    /// width — a divider drag and a collapse both move it, and both come through `relayout`.
+    ///
+    /// Only the width is constrained; the height keeps AppKit's own behavior (a `0` in an
+    /// `NSSize` minimum means "no minimum", which is what this window has always had vertically).
+    ///
+    /// A window already narrower than the new limit is widened to it, which `setContentMinSize:`
+    /// does not do on its own — it constrains the next resize and leaves the current frame alone.
+    /// Two cases reach that: a `layout.conf` written before this limit existed, and expanding the
+    /// sidebar back into a window that was narrowed while it was collapsed. The delta is applied to
+    /// the *frame*, so whatever the border insets are they stay out of the arithmetic.
+    fn sync_window_min_width(&self) {
+        let min = if self.collapsed.get() {
+            MIN_TERM_W
+        } else {
+            CARD_INSET + self.sidebar_w.get() + CARD_GAP + MIN_TERM_W
+        };
+        unsafe { self.window.setContentMinSize(NSSize::new(min, 0.0)) };
+        let short = min - self.content_width();
+        if short > 0.0 {
+            let mut f = self.window.frame();
+            f.size.width += short;
+            self.window.setFrame_display(f, true);
+        }
     }
 
     /// Divider drag: window coordinate x -> sidebar card width. The cursor tracks the middle of the
@@ -527,6 +581,9 @@ impl AppController {
     /// and set the autoresizing mask (on window resize: the sidebar keeps a fixed width against the edge, host fills the rest).
     fn relayout(&self) {
         use NSAutoresizingMaskOptions as M;
+        // First, because it can widen the window: everything below measures against that width, and
+        // the sidebar half of the limit is exactly what the callers of this method just changed.
+        self.sync_window_min_width();
         let full = self
             .window
             .contentView()
