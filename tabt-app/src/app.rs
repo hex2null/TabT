@@ -1444,6 +1444,11 @@ impl AppController {
     fn went_empty(&self) {
         self.show_placeholder();
         self.update_title();
+        // Paired with the title, for the reason `deselect` pairs them: `teardown_tab` has already
+        // cleared `active`, so the meta line resolves to empty — but only if someone asks it to.
+        // Without this the last session's directory and shell stay under the placeholder, naming a
+        // tab that is gone.
+        self.update_header();
         self.refresh_sidebar();
         self.save();
     }
