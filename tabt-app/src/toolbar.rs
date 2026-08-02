@@ -159,7 +159,7 @@ pub const CUSTOMIZABLE: [Entry; 17] = [
     Entry { key: "aider", id: AIDER_ID, label: "Aider", symbol: "wand.and.stars", tip: "Run aider in this session", group: Group::Ai, default_on: false },
     Entry { key: "cursor", id: CURSOR_ID, label: "Cursor", symbol: "cursorarrow.rays", tip: "Run cursor-agent in this session", group: Group::Ai, default_on: false },
     // ---- Common: the session in front of you ----
-    Entry { key: "home", id: HOME_ID, label: "Home", symbol: "house", tip: "cd ~", group: Group::Common, default_on: true },
+    Entry { key: "home", id: HOME_ID, label: "Home", symbol: "house", tip: "cd ~", group: Group::Common, default_on: false },
     // Copy and paste start in the palette: ⌘C/⌘V are muscle memory and a selection is made with the
     // mouse anyway, so the pair spent two of the row's slots restating the shortcut every other app
     // has. Still one drag away for anyone who wants them.
