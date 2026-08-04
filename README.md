@@ -62,7 +62,7 @@ make run     # build, bundle into dist/TabT Dev.app, code-sign, launch
 | ⌘R | Rename session | | ⌘= / ⌘- / ⌘0 | Font size ± / reset |
 | ⌘, | Settings | | ⌘C / ⌘V / ⌘A | Copy / paste / select all |
 | ⇧⌘R | Reveal cwd in Finder | | ⌃↩ | Session context menu |
-| ⇧⌘S | Export session text | | ⌘~ | Last session |
+| ⇧⌘S | Export session text | | ⌘` | Last session |
 
 Also: double-click the header to zoom the window, double-click a tab/group name to rename it, click
 a session's icon to set its color.
