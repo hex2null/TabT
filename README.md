@@ -33,6 +33,8 @@ self-drawn sidebar, and a dependency-free VT/ANSI core. macOS 12 or later.
 - **VT/ANSI core** — SGR colors and attributes, cursor/scroll/erase, alternate screen, DEC private
   modes, IRM, tab stops, line-drawing charset, DSR/DA, OSC title and cwd, UTF-8, wide characters.
 - **Persistence** — layout, groups, tabs, theme, font, window position and size restored on launch.
+  A restored session's shell starts the first time you open that tab, so a twenty-tab layout costs
+  one shell at launch rather than twenty.
 
 ## Install
 
