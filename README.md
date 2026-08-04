@@ -33,6 +33,8 @@ self-drawn sidebar, and a dependency-free VT/ANSI core. macOS 12 or later.
 - **VT/ANSI core** — SGR colors and attributes, cursor/scroll/erase, alternate screen, DEC private
   modes, IRM, tab stops, line-drawing charset, DSR/DA, OSC title and cwd, UTF-8, wide characters.
 - **Persistence** — layout, groups, tabs, theme, font, window position and size restored on launch.
+  A restored session's shell starts the first time you open that tab, so a twenty-tab layout costs
+  one shell at launch rather than twenty.
 
 ## Install
 
@@ -62,7 +64,7 @@ make run     # build, bundle into dist/TabT Dev.app, code-sign, launch
 | ⌘R | Rename session | | ⌘= / ⌘- / ⌘0 | Font size ± / reset |
 | ⌘, | Settings | | ⌘C / ⌘V / ⌘A | Copy / paste / select all |
 | ⇧⌘R | Reveal cwd in Finder | | ⌃↩ | Session context menu |
-| ⇧⌘S | Export session text | | ⌘~ | Last session |
+| ⇧⌘S | Export session text | | ⌘` | Last session |
 
 Also: double-click the header to zoom the window, double-click a tab/group name to rename it, click
 a session's icon to set its color.

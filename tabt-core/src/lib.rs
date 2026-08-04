@@ -1080,7 +1080,42 @@ impl Grid {
         self.params.get(i).copied().unwrap_or(0)
     }
 
+    /// A CSI carrying a private prefix (`?`, `>`, `<`, `=`) is a **different command** from the
+    /// same final byte without one, so it is routed separately rather than falling through to the
+    /// standard table below. Only the DEC private modes are acted on; everything else is dropped.
+    ///
+    /// Dispatching on the final byte alone is what made vim underline everything from the second
+    /// screenful on: it probes modifyOtherKeys with `CSI ? 4 m` and sets it with `CSI > 4 ; 2 m`,
+    /// and both arrived at `sgr()` as a plain SGR 4 — underline on, with no `CSI 24 m` ever coming
+    /// to turn it off again, so every cell drawn afterwards carried it.
+    ///
+    /// Two of the drops are deliberate rather than incidental, because both used to reach a
+    /// *reply*:
+    ///
+    /// - Secondary DA (`CSI > c`) is left **unanswered** rather than given the primary reply it
+    ///   fell through to. It is an optional probe — vim asks, times out and moves on — and the
+    ///   reply's job is to name an xterm patch level, which would invite exactly the version-gated
+    ///   sequences this terminal does not implement.
+    /// - DECXCPR (`CSI ? 6 n`) **is** still answered, in its own `CSI ? r ; c R` form. A program
+    ///   that asks where the cursor is blocks until it hears back (see [`Self::report_status`]),
+    ///   and dropping it silently is the one failure in this family that hangs rather than
+    ///   degrades.
+    fn csi_dispatch_private(&mut self, f: u8) {
+        match (self.private, f) {
+            (b'?', b'h') => self.set_mode(true),
+            (b'?', b'l') => self.set_mode(false),
+            (b'?', b'n') if self.praw(0) == 6 => {
+                let (row, col) = (self.cursor.1 + 1, self.cursor.0 + 1);
+                self.replies.extend_from_slice(format!("\x1b[?{};{}R", row, col).as_bytes());
+            }
+            _ => {}
+        }
+    }
+
     fn csi_dispatch(&mut self, f: u8) {
+        if self.private != 0 {
+            return self.csi_dispatch_private(f);
+        }
         match f {
             b'A' => self.move_up(self.p1(0)),
             b'B' | b'e' => self.move_down(self.p1(0)),
@@ -2548,6 +2583,42 @@ mod tests {
         let mut g = Grid::new(10, 1);
         g.feed(b"\x1b[?2004hhi\x1b[?2004l");
         assert_eq!(g.to_lines()[0], "hi");
+    }
+
+    #[test]
+    fn private_prefixed_csi_is_not_sgr() {
+        // vim probes modifyOtherKeys with `CSI ? 4 m` and sets it with `CSI > 4 ; 2 m`. Neither is
+        // SGR: dispatching on the final byte alone turned both into SGR 4 (underline), and since
+        // nothing ever sends `CSI 24 m` to undo a query, every cell vim drew from its second
+        // screenful on came out underlined.
+        let mut g = Grid::new(10, 1);
+        g.feed(b"\x1b[>4;2m\x1b[?4mhi");
+        assert_eq!(g.to_lines()[0], "hi");
+        assert_eq!(g.cell(0, 0).flags, 0);
+        // The same final byte with no prefix is still SGR, and still turns underline on.
+        g.feed(b"\x1b[4mx");
+        assert_eq!(g.cell(2, 0).flags, UNDERLINE);
+    }
+
+    #[test]
+    fn decxcpr_still_answers() {
+        // The one private-prefixed query that must not be dropped: a program asking where the
+        // cursor is waits for the reply. It answers in DECXCPR's own `CSI ? r ; c R` form.
+        let mut g = Grid::new(10, 5);
+        g.feed(b"\x1b[3;5H\x1b[?6n");
+        assert_eq!(g.take_replies(), b"\x1b[?3;5R");
+        // and the unprefixed CPR is unaffected
+        g.feed(b"\x1b[6n");
+        assert_eq!(g.take_replies(), b"\x1b[3;5R");
+    }
+
+    #[test]
+    fn private_prefixed_csi_does_not_move_or_erase() {
+        // The guard covers the whole table, not just SGR: a prefixed final that happens to match a
+        // cursor or erase command must do nothing either.
+        let mut g = Grid::new(10, 2);
+        g.feed(b"abc\x1b[?1;1H\x1b[?2Jx");
+        assert_eq!(g.to_lines()[0], "abcx");
     }
 
     #[test]

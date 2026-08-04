@@ -334,8 +334,10 @@ pub fn build_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarge
     // ⇧⌘S, the system's own "save a copy of this" shortcut.
     add(mtm, &shell, "Export Text…", Some(sel!(exportText:)), Some(target), "s", true);
     shell.addItem(&NSMenuItem::separatorItem(mtm));
-    // ⌘~ (that is, ⇧⌘` — the same physical key): flip back to the session you came from.
-    add(mtm, &shell, "Last Session", Some(sel!(lastSession:)), Some(target), "`", true);
+    // ⌘`: flip back to the session you came from — the unshifted key, so it is one chord rather
+    // than two. It shadows the system's "Move focus to next window", which is a no-op here: the app
+    // has a single window and its sessions are tabs inside it, not windows to cycle.
+    add(mtm, &shell, "Last Session", Some(sel!(lastSession:)), Some(target), "`", false);
     add(mtm, &shell, "Close Tab", Some(sel!(closeTab:)), Some(target), "w", false);
 
     // ---- Edit (target=nil → first responder TermView) ----
