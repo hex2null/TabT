@@ -72,6 +72,11 @@ pub enum SessionState {
     Running,
     /// The shell is sitting at its prompt.
     Idle,
+    /// The tab was restored from `layout.conf` and has no shell yet: nothing has been forked for it,
+    /// and nothing will be until it is selected (see `start_tab_session`). Distinct from `Ended`,
+    /// which is a session that *had* a shell — an ended tab is dimmed and its header says so,
+    /// neither of which is true of a tab that has simply not been opened yet.
+    Dormant,
     /// The shell exited and has not been restarted; the tab is a placeholder (see `end_tab_session`).
     Ended,
 }
@@ -95,7 +100,11 @@ struct Tab {
     view: Retained<TermView>,
     master_fd: RawFd,
     shell_pid: libc::pid_t, // the shell's own pid/pgid; used to detect a foreground job (pty::has_foreground_job)
-    reader: view::ReaderToken,
+    /// The GCD source draining this tab's master fd. `None` exactly when there is no shell to
+    /// drain — a `Dormant` tab that has never been started, or an `Ended` one whose reader was
+    /// cancelled. An `Option` rather than a cancelled token, because a token cannot be built
+    /// without a live fd to hang it off.
+    reader: Option<view::ReaderToken>,
     spawn_cwd: String, // working directory at spawn time: cwd fallback when OSC 7 has not reported
     /// Last sampled state; see `sample_states`. Kept on the tab rather than recomputed per draw.
     state: SessionState,
@@ -779,6 +788,10 @@ impl AppController {
         let m = self.model.borrow();
         let meta = match m.active.and_then(|a| m.tabs.iter().find(|t| t.id == a)) {
             Some(t) if t.state == SessionState::Ended => "session ended".to_string(),
+            // No shell yet, so no shell to name — `t.shell` is empty until one is exec'd, and the
+            // usual "<cwd> · <shell>" would render a dangling separator. Reachable only in the gap
+            // between selecting a dormant tab and its shell starting.
+            Some(t) if t.state == SessionState::Dormant => home_relative(&t.cwd()),
             Some(t) => {
                 let shell = t.shell.rsplit('/').next().unwrap_or(&t.shell);
                 format!("{} · {}", home_relative(&t.cwd()), shell)
@@ -829,14 +842,19 @@ impl AppController {
             _ => None,
         });
         self.relayout();
-        // Spawn ungrouped tabs first (rendered at the top), then each group. A tab that fails to
-        // spawn (e.g. the system is out of file descriptors) is silently skipped — restore
-        // whatever we can rather than aborting the whole session restore.
+        // Restore ungrouped tabs first (rendered at the top), then each group. **None of them gets
+        // a shell here.** A restored tab comes back `Dormant` — row, title, cwd and grid, but no
+        // fork — and `select` is what starts one (`start_tab_session`). So a saved layout of twenty
+        // sessions costs one login shell at launch rather than twenty, all of them racing through
+        // their rc files at once for tabs the user may never open. It also removes the failure mode
+        // this loop used to carry: creating a dormant tab touches neither the process table nor the
+        // fd table, so a restore can no longer silently drop tabs when either is exhausted — that
+        // can now only fail one tab at a time, at the moment it is opened.
         // `auto` says the stored title was derived and may be re-derived; its absence means the
         // user chose it. A config written before that key existed therefore restores pinned, which
         // is what keeps every rename made by an older version.
         for t in layout.ungrouped {
-            let _ = self.spawn_tab(None, t.title, !t.auto, &t.cwd, t.dot, t.locked);
+            self.dormant_tab(None, t.title, !t.auto, &t.cwd, t.dot, t.locked);
         }
         for (name, collapsed, tabs) in layout.groups {
             let gi = {
@@ -845,14 +863,16 @@ impl AppController {
                 m.groups.len() - 1
             };
             for t in tabs {
-                let _ = self.spawn_tab(Some(gi), t.title, !t.auto, &t.cwd, t.dot, t.locked);
+                self.dormant_tab(Some(gi), t.title, !t.auto, &t.cwd, t.dot, t.locked);
             }
         }
         let first = self.model.borrow().tabs.first().map(|t| t.id);
         match first {
+            // Starts this one session, and only this one: everything else stays dormant until it is
+            // selected.
             Some(id) => self.select(id),
-            // Every saved tab failed to spawn (e.g. the system is out of file descriptors at
-            // launch) — show the empty-state placeholder instead of a blank host view.
+            // Nothing was saved (a first run, or a layout whose every tab was closed) — show the
+            // empty-state placeholder instead of a blank host view.
             None => self.show_placeholder(),
         }
         self.save(); // persist once, ensuring ~/.tabt exists and reflects the current layout
@@ -887,6 +907,36 @@ impl AppController {
     /// Returns `None` if the PTY/process itself couldn't be spawned (e.g. out of file
     /// descriptors) — the caller must skip creating this one tab without disturbing any others.
     fn spawn_tab(&self, group: Option<usize>, title: String, pinned: bool, cwd: &str, dot: u8, locked: bool) -> Option<u64> {
+        let (cols, rows) = self.dims();
+        let session = pty::spawn(cols as u16, rows as u16, cwd)?;
+        Some(self.new_tab(group, title, pinned, cwd, dot, locked, Some(session)))
+    }
+
+    /// Create a tab with **no shell behind it** — the restore path (see `bootstrap`). The row, the
+    /// grid and the view all exist; the fork does not happen until the tab is selected
+    /// (`start_tab_session`).
+    ///
+    /// Unlike [`Self::spawn_tab`] this cannot fail: there is nothing here that touches the process
+    /// table or the file descriptor table, which is the point — a restored layout of twenty tabs
+    /// costs twenty grids at launch instead of twenty login shells.
+    fn dormant_tab(&self, group: Option<usize>, title: String, pinned: bool, cwd: &str, dot: u8, locked: bool) -> u64 {
+        self.new_tab(group, title, pinned, cwd, dot, locked, None)
+    }
+
+    /// Build the view + model entry for one tab and file it into its group. `session` is the result
+    /// of [`pty::spawn`] when the tab starts with a shell, and `None` for a dormant one — the only
+    /// difference between the two is the fd the view is given, whether a reader is attached to it,
+    /// and the state the row starts in.
+    fn new_tab(
+        &self,
+        group: Option<usize>,
+        title: String,
+        pinned: bool,
+        cwd: &str,
+        dot: u8,
+        locked: bool,
+        session: Option<(RawFd, libc::pid_t, String)>,
+    ) -> u64 {
         let id = {
             let mut m = self.model.borrow_mut();
             let id = m.next_id;
@@ -894,12 +944,21 @@ impl AppController {
             id
         };
         let (cols, rows) = self.dims();
-        let (fd, shell_pid, shell) = pty::spawn(cols as u16, rows as u16, cwd)?;
+        // A dormant tab's view is built on fd -1. Every write path already guards on that (see
+        // `TermView::send`), so nothing typed into it can reach a shell that does not exist; the fd
+        // is swapped in by `TermView::restart` when the session finally starts.
+        let (fd, shell_pid, shell) = match session {
+            Some((fd, pid, shell)) => (fd, pid, shell),
+            // No shell yet, so no shell *name* yet either: `shell` records what this session is
+            // actually running, and resolving it now would name whatever Settings says today rather
+            // than what this tab will eventually exec.
+            None => (-1, -1, String::new()),
+        };
         let frame = self.host.bounds();
         let v = TermView::new(self.mtm, frame, fd, cols, rows);
         v.set_scrollback(settings::scrollback());
         v.attach(self as *const AppController as *const c_void, id, end_cb, restart_cb, toggle_cb, meta_cb);
-        let reader = view::attach_reader(&v);
+        let reader = (fd >= 0).then(|| view::attach_reader(&v));
 
         let mut m = self.model.borrow_mut();
         m.tabs.push(Tab {
@@ -915,7 +974,7 @@ impl AppController {
             reader,
             // Assume idle until the first sample: a tab that has only just spawned is at a prompt,
             // and guessing Running would flash every new tab.
-            state: SessionState::Idle,
+            state: if fd >= 0 { SessionState::Idle } else { SessionState::Dormant },
             activity: false,
             bell: false,
             last_seq: 0,
@@ -924,14 +983,16 @@ impl AppController {
             // Record where the shell actually starts, not what was requested: `pty::spawn` falls
             // back to HOME on an empty cwd, and leaving that blank here would leave a fresh tab
             // with no directory to be named after or revealed in Finder until OSC 7 reports one —
-            // which a stock zsh never does.
+            // which a stock zsh never does. A dormant tab needs it for a fourth reason: it is the
+            // only cwd it has until it starts, so the row's name, Reveal in Finder, the directory
+            // it will eventually be spawned in, and what `save` writes back all come from here.
             spawn_cwd: if cwd.is_empty() { std::env::var("HOME").unwrap_or_default() } else { cwd.to_string() },
         });
         match group {
             Some(gi) if gi < m.groups.len() => m.groups[gi].tabs.push(id),
             _ => m.ungrouped.push(id),
         }
-        Some(id)
+        id
     }
 
     pub fn select(&self, id: u64) {
@@ -961,6 +1022,12 @@ impl AppController {
                 g.collapsed = false;
             }
         }
+        // A restored tab has no shell until it is looked at, and this is the moment it is. Deliberately
+        // *outside* the borrow above: `start_tab_session` takes the model mutably and then calls
+        // `refresh_sidebar`/`update_header`, which take it again — under `panic = "abort"` a RefCell
+        // clash here is the whole app, at launch. Before `layout_active`, so the view is sized and
+        // `TIOCSWINSZ` reaches a shell that already exists.
+        self.start_tab_session(id);
         self.layout_active();
         self.refresh_sidebar();
         self.update_title();
@@ -1300,10 +1367,15 @@ impl AppController {
             }
             m.tabs.remove(idx)
         };
-        view::cancel_reader(&removed.reader);
+        // A dormant or ended tab has neither: closing it releases only the view.
+        if let Some(r) = &removed.reader {
+            view::cancel_reader(r);
+        }
         unsafe {
             removed.view.removeFromSuperview();
-            libc::close(removed.master_fd);
+            if removed.master_fd >= 0 {
+                libc::close(removed.master_fd);
+            }
         }
         drop(removed); // Retained<TermView> is released here, safely
         true
@@ -1333,8 +1405,14 @@ impl AppController {
             let Some(t) = m.tabs.iter_mut().find(|t| t.id == id) else {
                 return;
             };
-            view::cancel_reader(&t.reader);
-            unsafe { libc::close(t.master_fd) };
+            // Both are already absent on a dormant tab that failed to start — it never had a reader
+            // and its fd is the placeholder -1, so neither is unconditionally safe to act on.
+            if let Some(r) = t.reader.take() {
+                view::cancel_reader(&r);
+            }
+            if t.master_fd >= 0 {
+                unsafe { libc::close(t.master_fd) };
+            }
             t.master_fd = -1;
             t.shell_pid = -1; // tcgetpgrp(-1) fails, so has_foreground_job reports false
             t.state = SessionState::Ended;
@@ -1355,8 +1433,30 @@ impl AppController {
         self.update_header();
     }
 
-    /// Respawn a fresh shell into a tab whose previous one already ended (see `end_tab_session`),
-    /// reusing its last known working directory. Fired when the user presses Enter on an ended tab.
+    /// Start a `Dormant` tab's shell — the first time it is selected (see `bootstrap`). A no-op on
+    /// every other tab, which is what lets `select` call it unconditionally: a live session must not
+    /// be respawned by being clicked, and an `Ended` one is the user's to restart with Enter.
+    ///
+    /// The work is [`Self::restart_tab`]'s, unchanged: a dormant tab and an ended one differ only in
+    /// whether they ever had a shell, and starting one is the same fork into the same recorded cwd.
+    fn start_tab_session(&self, id: u64) {
+        let dormant = self
+            .model
+            .borrow()
+            .tabs
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.state == SessionState::Dormant)
+            .unwrap_or(false);
+        if dormant {
+            self.restart_tab(id);
+        }
+    }
+
+    /// Respawn a fresh shell into a tab that has none: one whose previous shell ended (see
+    /// `end_tab_session`), or one restored from the layout that was never started
+    /// (`start_tab_session`). Reuses the tab's last known working directory. Fired by Enter on an
+    /// ended tab, and by selecting a dormant one.
     pub fn restart_tab(&self, id: u64) {
         let cwd = match self.model.borrow().tabs.iter().find(|t| t.id == id) {
             Some(t) => t.cwd(),
@@ -1365,7 +1465,16 @@ impl AppController {
         let (cols, rows) = self.dims();
         let (fd, shell_pid, shell) = match pty::spawn(cols as u16, rows as u16, &cwd) {
             Some(v) => v,
-            None => return, // out of fds/process table etc.: leave the tab ended, nothing else to do
+            // Out of fds/process table etc., or a configured shell that is not executable. An
+            // already-ended tab is left ended, which already says so on screen and already retries
+            // on Enter. A *dormant* one says nothing at all — its view is blank and its own Enter is
+            // swallowed by the `fd < 0` guard — so it is ended here explicitly, which buys both: the
+            // "[Session ended — press Enter to restart]" line, and a retry through the one path that
+            // is known to work.
+            None => {
+                self.end_tab_session(id);
+                return;
+            }
         };
         {
             let mut m = self.model.borrow_mut();
@@ -1374,7 +1483,12 @@ impl AppController {
                     t.master_fd = fd;
                     t.shell_pid = shell_pid;
                     t.shell = shell; // a restart re-resolves it, so the setting can take effect here
-                    t.reader = view::attach_reader(&t.view);
+                    // A shell that is only now starting has its whole start-up still ahead of it, so
+                    // it has to re-earn its baseline: leaving `primed` set (as selecting the tab just
+                    // did, and as an earlier session may have) makes the new shell's first prompt
+                    // read as unseen output the moment the user switches away from it — the exact
+                    // whole-sidebar marking `sample_states` documents at length.
+                    t.primed = false;
                     // The directory the new shell was actually spawned in becomes the fallback the
                     // tab reports until OSC 7 says otherwise — which, with a stock zsh, is never
                     // (`/etc/zshrc` only sources that hook for Apple_Terminal). `TermView::restart`
@@ -1383,7 +1497,14 @@ impl AppController {
                     // *first* opened in: the row and window title would rename themselves back to
                     // it, Reveal in Finder would open it, and the next save would persist it.
                     t.spawn_cwd = cwd.clone();
+                    // Strictly before `attach_reader` below. `view::attach_reader` builds its
+                    // dispatch source on the fd the *view* is holding, not on the one passed here,
+                    // and until `restart` swaps the new one in that is still the -1 the session was
+                    // left with — a source on an invalid descriptor, which never fires. The tab then
+                    // has a live shell it can be typed into and no reader draining it, so it sits
+                    // blank forever: the restart appears to do nothing at all.
                     t.view.restart(fd, cols, rows);
+                    t.reader = Some(view::attach_reader(&t.view));
                     t.state = SessionState::Idle; // a fresh shell comes up at its prompt
                 }
                 None => {
@@ -1689,6 +1810,14 @@ impl AppController {
             let active = m.active;
             let mut changed = false;
             for t in &mut m.tabs {
+                // A tab with no shell yet has nothing to sample and nothing to say. It must be
+                // skipped *before* the fd test below, which reads a missing shell as a dead one:
+                // without this, every restored tab would relabel itself `Ended` 800ms after launch —
+                // dimmed in the sidebar, "session ended" in the header — which is the whole feature
+                // undone by the one code path that never looks at how a session came to have no fd.
+                if t.state == SessionState::Dormant {
+                    continue;
+                }
                 // Unseen output and an unseen bell, both only for a tab you are not looking at —
                 // marking the tab in front of you would be noise, and `select` clears them anyway.
                 let seq = t.view.output_seq();
@@ -2067,7 +2196,14 @@ impl AppController {
         let Some(id) = self.model.borrow().active else { return };
         let live = {
             let m = self.model.borrow();
-            m.tabs.iter().find(|t| t.id == id).map(|t| t.state != SessionState::Ended).unwrap_or(false)
+            // Stated as the states that *have* a shell rather than as "not Ended": a dormant tab has
+            // none either, and taking one down — hanging up pid -1, printing "[Session ended]" over
+            // a blank grid — would be a teardown of something that was never up.
+            m.tabs
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| matches!(t.state, SessionState::Running | SessionState::Idle))
+                .unwrap_or(false)
         };
         if live {
             if self.tab_has_foreground_job(id)

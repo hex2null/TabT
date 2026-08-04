@@ -1001,7 +1001,10 @@ impl SidebarView {
             (Some(c), _) => c,
             (None, SessionState::Running) => dot_running(),
             (None, SessionState::Ended) => text_placeholder(),
-            (None, SessionState::Idle) => fg,
+            // A tab whose shell has not been started yet is drawn exactly as an idle one, and that
+            // is the point rather than an omission: it is a session the user has simply not opened,
+            // and marking it would advertise an implementation detail as a state worth reading.
+            (None, SessionState::Idle | SessionState::Dormant) => fg,
         };
         draw_symbol(tab_symbol(), rect(row.indent, y, ICON_W, ICON_H), hue);
     }
