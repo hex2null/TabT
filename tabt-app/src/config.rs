@@ -6,8 +6,10 @@
 //! (cwd). On next launch a new shell is spawned directly in the restored cwd.
 //!
 //! The format is hand-written INI (no serde, to keep binary size down): `[section]` headers +
-//! `key = value` lines. Ungrouped tabs go in an optional single `[tabs]` section (rendered at the top of the list);
-//! groups are represented by **repeated `[group]` sections** to preserve order and allow duplicate names. Within a section each `tab = title` is
+//! `key = value` lines. The sidebar's top level holds sessions and groups in one order, and the file
+//! stores it as one sequence of sections: sessions belonging to no group go in `[tabs]` sections and
+//! groups in `[group]` sections, **both repeatable**, and the order they appear in is the order the
+//! sidebar draws them (repeated sections also preserve duplicate group names). Within a section each `tab = title` is
 //! one tab, optionally followed by a `cwd = path` line (belonging to the nearest tab). Lines starting with `#`/`;` and
 //! blank lines are ignored.
 //!
@@ -87,8 +89,9 @@ pub struct TabState {
 
 /// One tab as the caller hands it back to [`save`].
 pub type SavedTab = TabState;
-/// One group as the caller hands it back to [`save`]: name, collapsed, its tabs.
-pub type SavedGroup = (String, bool, Vec<SavedTab>);
+/// One top-level entry on the way out; the same shape [`parse`] reads back, groups included
+/// ([`ParsedGroup`]).
+pub type SavedItem = Item;
 
 /// Everything in the `[settings]` block: the app-wide preferences, all of them live-editable
 /// through the settings dialog and written back on every change.
@@ -153,11 +156,22 @@ impl Default for Settings {
     }
 }
 
-/// The layout read back: the settings block + the ungrouped tabs + each group.
+/// The layout read back: the settings block + the sidebar's top level, in file order.
 pub struct Layout {
     pub settings: Settings,
-    pub ungrouped: Vec<TabState>, // tabs not belonging to any group (rendered at the top of the list)
-    pub groups: Vec<ParsedGroup>,
+    pub items: Vec<Item>,
+}
+
+/// One top-level entry: a run of sessions belonging to no group, or a group.
+///
+/// A `[tabs]` section is a **run** rather than one tab because that is exactly what the section is
+/// — `cwd`/`dot`/`lock`/`auto` attach to the nearest `tab =` above them, so the tabs of one section
+/// have to stay in one list for [`read_tab_key`] to fill. Loose sessions and groups interleave, so
+/// there can be any number of `[tabs]` sections and their position among the `[group]` ones is
+/// what says where those sessions sit in the sidebar.
+pub enum Item {
+    Tabs(Vec<TabState>),
+    Group(ParsedGroup),
 }
 
 /// A group as parsed: name, collapsed, its tabs.
@@ -209,7 +223,7 @@ pub fn bundled_themes_file() -> Option<PathBuf> {
 enum Section {
     None,
     Settings,
-    Tabs, // [tabs]: ungrouped tabs
+    Tabs, // [tabs]: a run of sessions belonging to no group
     Group,
 }
 
@@ -223,8 +237,7 @@ pub fn load() -> Layout {
 /// so this must never fail.
 pub fn parse(text: &str) -> Layout {
     let mut s = Settings::default();
-    let mut ungrouped: Vec<TabState> = Vec::new();
-    let mut groups: Vec<ParsedGroup> = Vec::new();
+    let mut items: Vec<Item> = Vec::new();
     let mut section = Section::None;
 
     for raw in text.lines() {
@@ -237,10 +250,15 @@ pub fn parse(text: &str) -> Layout {
         if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             match name.trim() {
                 "settings" => section = Section::Settings,
-                "tabs" => section = Section::Tabs,
+                // Each section header opens a new entry, so the document's order *is* the
+                // sidebar's: a `[tabs]` run written between two groups reads back between them.
+                "tabs" => {
+                    section = Section::Tabs;
+                    items.push(Item::Tabs(Vec::new()));
+                }
                 "group" => {
                     section = Section::Group;
-                    groups.push((String::new(), false, Vec::new()));
+                    items.push(Item::Group((String::new(), false, Vec::new())));
                 }
                 _ => section = Section::None, // unknown section: ignore its keys
             }
@@ -315,9 +333,13 @@ pub fn parse(text: &str) -> Layout {
                 }
                 _ => {} // unknown key: ignored, so a newer version's config stays readable
             },
-            Section::Tabs => read_tab_key(&mut ungrouped, key, value),
+            Section::Tabs => {
+                if let Some(Item::Tabs(run)) = items.last_mut() {
+                    read_tab_key(run, key, value);
+                }
+            }
             Section::Group => {
-                if let Some(g) = groups.last_mut() {
+                if let Some(Item::Group(g)) = items.last_mut() {
                     match key {
                         "name" => g.0 = value.to_string(),
                         "collapsed" => g.1 = truthy(value),
@@ -330,15 +352,22 @@ pub fn parse(text: &str) -> Layout {
         }
     }
 
-    // When entirely empty (no ungrouped tabs and no tabs inside groups), add one ungrouped tab so a terminal is available.
-    let total_tabs = ungrouped.len() + groups.iter().map(|g| g.2.len()).sum::<usize>();
+    // When entirely empty (no loose tabs and no tabs inside groups), add one loose tab so a
+    // terminal is available.
+    let total_tabs: usize = items
+        .iter()
+        .map(|i| match i {
+            Item::Tabs(run) => run.len(),
+            Item::Group(g) => g.2.len(),
+        })
+        .sum();
     if total_tabs == 0 {
         // No title: the app derives one from where the shell lands. Naming it here would make a
         // first-launch tab look like the user had chosen that name, and it would then be kept.
-        ungrouped.push(TabState { title: String::new(), cwd: String::new(), dot: 0, locked: false, auto: true });
+        items.push(Item::Tabs(vec![TabState { title: String::new(), cwd: String::new(), dot: 0, locked: false, auto: true }]));
     }
 
-    Layout { settings: s, ungrouped, groups }
+    Layout { settings: s, items }
 }
 
 /// The tab-level keys, shared by `[tabs]` and `[group]`: `tab` opens a new one, the rest attach to
@@ -429,13 +458,13 @@ pub fn sanitize_path(s: &str) -> String {
 }
 
 /// Write the layout back.
-pub fn save(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) {
+pub fn save(s: &Settings, items: &[SavedItem]) {
     let _ = fs::create_dir_all(dir());
-    let _ = fs::write(file(), render(s, ungrouped, groups));
+    let _ = fs::write(file(), render(s, items));
 }
 
 /// Render the config text: the counterpart of [`parse`], and the whole of the write side.
-fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String {
+fn render(s: &Settings, items: &[SavedItem]) -> String {
     // For each tab, write one tab= line and optional cwd=/dot=/lock= lines.
     let write_tabs = |out: &mut String, tabs: &[SavedTab]| {
         for t in tabs {
@@ -492,15 +521,24 @@ fn render(s: &Settings, ungrouped: &[SavedTab], groups: &[SavedGroup]) -> String
     if !s.shell.is_empty() {
         out.push_str(&format!("shell = {}\n", s.shell));
     }
-    if !ungrouped.is_empty() {
-        out.push_str("\n[tabs]\n");
-        write_tabs(&mut out, ungrouped);
-    }
-    for (name, collapsed, tabs) in groups {
-        out.push_str("\n[group]\n");
-        out.push_str(&format!("name = {}\n", name));
-        out.push_str(&format!("collapsed = {}\n", collapsed));
-        write_tabs(&mut out, tabs);
+    // In list order, which is the whole of how the interleaving is stored: a `[tabs]` run before
+    // a `[group]` section is a set of loose sessions sitting above that group in the sidebar.
+    for item in items {
+        match item {
+            // An empty run would read back as nothing at all, so it is simply not written.
+            Item::Tabs(tabs) => {
+                if !tabs.is_empty() {
+                    out.push_str("\n[tabs]\n");
+                    write_tabs(&mut out, tabs);
+                }
+            }
+            Item::Group((name, collapsed, tabs)) => {
+                out.push_str("\n[group]\n");
+                out.push_str(&format!("name = {}\n", name));
+                out.push_str(&format!("collapsed = {}\n", collapsed));
+                write_tabs(&mut out, tabs);
+            }
+        }
     }
     out
 }
@@ -518,23 +556,58 @@ mod tests {
         TabState { title: title.to_string(), cwd: cwd.to_string(), dot: 0, locked: false, auto: true }
     }
 
+    /// Every session belonging to no group, in list order — each `[tabs]` run flattened, which is
+    /// what the app does with them as well.
+    fn loose(l: &Layout) -> Vec<&TabState> {
+        l.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Tabs(run) => Some(run),
+                Item::Group(_) => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn groups(l: &Layout) -> Vec<&ParsedGroup> {
+        l.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group(g) => Some(g),
+                Item::Tabs(_) => None,
+            })
+            .collect()
+    }
+
+    /// The top level as a readable sketch: a loose session is its title, a group its name in
+    /// braces. What the interleaving tests actually assert on.
+    fn shape(l: &Layout) -> Vec<String> {
+        l.items
+            .iter()
+            .flat_map(|i| match i {
+                Item::Tabs(run) => run.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+                Item::Group(g) => vec![format!("{{{}}}", g.0)],
+            })
+            .collect()
+    }
+
     /// A config written before `auto` existed — every v0.3.0 one — has to restore *pinned*, or the
     /// first title the shell reports would overwrite a name the user had chosen. This is the whole
     /// reason the key is written for the derived case rather than the chosen one.
     #[test]
     fn a_tab_without_the_auto_key_is_pinned() {
         let back = parse("[tabs]\ntab = My Build\ncwd = /srv\n");
-        assert_eq!(back.ungrouped[0].title, "My Build");
-        assert!(!back.ungrouped[0].auto);
+        assert_eq!(loose(&back)[0].title, "My Build");
+        assert!(!loose(&back)[0].auto);
     }
 
     /// And the key is honored when present, in a group as well as at the top level.
     #[test]
     fn the_auto_key_is_read_in_both_sections() {
         let back = parse("[tabs]\ntab = ~\nauto = true\n\n[group]\nname = W\ntab = api\nauto = true\ntab = kept\n");
-        assert!(back.ungrouped[0].auto);
-        assert!(back.groups[0].2[0].auto);
-        assert!(!back.groups[0].2[1].auto); // the key attaches to the nearest tab above it only
+        assert!(loose(&back)[0].auto);
+        assert!(groups(&back)[0].2[0].auto);
+        assert!(!groups(&back)[0].2[1].auto); // the key attaches to the nearest tab above it only
     }
 
     /// A newline is the one character that would actually corrupt the format: `parse` splits on
@@ -579,9 +652,9 @@ mod tests {
     #[test]
     fn sanitized_title_round_trips_through_the_config() {
         let title = sanitize_label("deploy [prod] = go");
-        let text = render(&Settings::default(), &[tab(&title, "/tmp", 0, false)], &[]);
+        let text = render(&Settings::default(), &[Item::Tabs(vec![tab(&title, "/tmp", 0, false)])]);
         let back = parse(&text);
-        assert_eq!(back.ungrouped[0].title, title);
+        assert_eq!(loose(&back)[0].title, title);
     }
 
     /// An OSC 7 cwd is as untrusted as an OSC 0/1/2 title and reaches the same unescaped file, so a
@@ -592,14 +665,16 @@ mod tests {
     fn an_injected_cwd_cannot_write_a_second_key() {
         let text = render(
             &Settings::default(),
-            &[tab("one", "/tmp/\nlock = true", 0, false), tab("two", "/tmp/\n[group]\nname = x", 0, false)],
-            &[],
+            &[Item::Tabs(vec![
+                tab("one", "/tmp/\nlock = true", 0, false),
+                tab("two", "/tmp/\n[group]\nname = x", 0, false),
+            ])],
         );
         let back = parse(&text);
-        assert_eq!(back.ungrouped.len(), 2, "an injected [group] split the tab list");
-        assert!(!back.groups.iter().any(|g| g.0 == "x"), "an injected section became a group");
-        assert!(!back.ungrouped[0].locked, "an injected lock line locked the tab");
-        assert_eq!(back.ungrouped[0].cwd, "/tmp/lock = true");
+        assert_eq!(loose(&back).len(), 2, "an injected [group] split the tab list");
+        assert!(!groups(&back).iter().any(|g| g.0 == "x"), "an injected section became a group");
+        assert!(!loose(&back)[0].locked, "an injected lock line locked the tab");
+        assert_eq!(loose(&back)[0].cwd, "/tmp/lock = true");
     }
 
     /// Everything written must come back, so a settings change survives the next launch. Goes
@@ -627,12 +702,14 @@ mod tests {
             padding: 4.0,
             opacity: 0.85,
         };
-        let ungrouped = vec![tab("Loose", "/tmp", 3, true), auto_tab("~", "/Users/me")];
-        let groups = vec![("Work".to_string(), true, vec![tab("api", "/srv", 0, false), tab("web", "", 8, false)])];
+        let items = vec![
+            Item::Tabs(vec![tab("Loose", "/tmp", 3, true), auto_tab("~", "/Users/me")]),
+            Item::Group(("Work".to_string(), true, vec![tab("api", "/srv", 0, false), tab("web", "", 8, false)])),
+        ];
 
-        let back = parse(&render(&s, &ungrouped, &groups));
+        let back = parse(&render(&s, &items));
 
-        let g = back.settings;
+        let g = &back.settings;
         assert_eq!(g.style, "Gruvbox Light");
         assert_eq!(g.font_family, "Monaco");
         assert_eq!(g.font_size, 15.0);
@@ -652,17 +729,19 @@ mod tests {
         assert_eq!(g.padding, 4.0);
         assert_eq!(g.opacity, 0.85);
 
-        assert_eq!(back.ungrouped.len(), 2);
-        assert_eq!(back.ungrouped[0].title, "Loose");
-        assert_eq!(back.ungrouped[0].cwd, "/tmp");
-        assert_eq!(back.ungrouped[0].dot, 3);
-        assert!(back.ungrouped[0].locked);
-        assert!(!back.ungrouped[0].auto); // pinned: the user named this one
-        assert_eq!(back.ungrouped[1].title, "~");
-        assert!(back.ungrouped[1].auto); // derived: the app may re-derive it
+        let loose = loose(&back);
+        assert_eq!(loose.len(), 2);
+        assert_eq!(loose[0].title, "Loose");
+        assert_eq!(loose[0].cwd, "/tmp");
+        assert_eq!(loose[0].dot, 3);
+        assert!(loose[0].locked);
+        assert!(!loose[0].auto); // pinned: the user named this one
+        assert_eq!(loose[1].title, "~");
+        assert!(loose[1].auto); // derived: the app may re-derive it
 
-        assert_eq!(back.groups.len(), 1);
-        let (name, collapsed, tabs) = &back.groups[0];
+        let groups = groups(&back);
+        assert_eq!(groups.len(), 1);
+        let (name, collapsed, tabs) = &groups[0];
         assert_eq!(name, "Work");
         assert!(collapsed);
         assert_eq!(tabs.len(), 2);
@@ -697,19 +776,48 @@ dot = 99
         assert!(l.settings.cursor_shape == CursorShape::Block, "an unknown enum name is the default");
         assert_eq!(l.settings.scrollback, MIN_SCROLLBACK, "an out-of-range number is clamped, not rejected");
         assert_eq!(l.settings.opacity, 1.0);
-        assert_eq!(l.ungrouped.len(), 1);
-        assert_eq!(l.ungrouped[0].title, "One");
-        assert_eq!(l.ungrouped[0].dot, 0, "an out-of-range dot index falls back to the default");
+        assert_eq!(loose(&l).len(), 1);
+        assert_eq!(loose(&l)[0].title, "One");
+        assert_eq!(loose(&l)[0].dot, 0, "an out-of-range dot index falls back to the default");
     }
 
     /// An empty file must still yield a terminal to show.
     #[test]
     fn empty_config_yields_one_tab() {
         let l = parse("");
-        assert_eq!(l.ungrouped.len(), 1);
+        assert_eq!(loose(&l).len(), 1);
         // Deliberately unnamed: the app names it after the directory the shell starts in.
-        assert_eq!(l.ungrouped[0].title, "");
-        assert!(l.groups.is_empty());
+        assert_eq!(loose(&l)[0].title, "");
+        assert!(groups(&l).is_empty());
         assert_eq!(l.settings.style, crate::theme::DEFAULT_NAME);
+    }
+
+    /// Groups and loose sessions share one ordered list, so the file has to carry that order and
+    /// not merely its two halves: a `[tabs]` run written between two groups has to come back
+    /// between them.
+    #[test]
+    fn interleaved_order_round_trips() {
+        let items = vec![
+            Item::Tabs(vec![tab("top", "/tmp", 0, false)]),
+            Item::Group(("Work".to_string(), false, vec![tab("api", "/srv", 0, false)])),
+            Item::Tabs(vec![tab("middle", "/tmp", 0, false)]),
+            Item::Group(("Scratch".to_string(), true, vec![])),
+            Item::Tabs(vec![tab("bottom", "/tmp", 0, false)]),
+        ];
+        let back = parse(&render(&Settings::default(), &items));
+        assert_eq!(shape(&back), vec!["top", "{Work}", "middle", "{Scratch}", "bottom"]);
+        // An empty group is still a group — it is a place to drop sessions into, and it holds a
+        // position of its own in that list.
+        assert!(groups(&back)[1].1, "the collapsed flag of an empty group survived");
+    }
+
+    /// Every config written before the two lists became one puts its single `[tabs]` section above
+    /// every group, which is exactly where those sessions were drawn — so document order restores
+    /// such a file unchanged, with no migration step.
+    #[test]
+    fn a_legacy_layout_reads_back_in_its_old_visual_order() {
+        let back = parse("[tabs]\ntab = loose\n\n[group]\nname = A\ntab = a1\n\n[group]\nname = B\ntab = b1\n");
+        assert_eq!(shape(&back), vec!["loose", "{A}", "{B}"]);
+        assert_eq!(groups(&back)[0].2[0].title, "a1");
     }
 }

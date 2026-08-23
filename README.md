@@ -15,8 +15,10 @@ self-drawn sidebar, and a dependency-free VT/ANSI core. macOS 12 or later.
 
 ## Features
 
-- **Tabs & groups** — one PTY per tab (⌘T), organized into named collapsible groups, dragged to
-  reorder. ⌘F filters the list; double-click a name to rename it.
+- **Tabs & groups** — one PTY per tab (⌘T), organized into named collapsible groups. Sessions and
+  groups share one list: drag a session anywhere, into a group or out of it, and drag a group to
+  move it — sessions and all — even in between two loose sessions. ⌘F filters the list;
+  double-click a name to rename it.
 - **Live session state** — each row's icon shows running / at a prompt / exited, and marks a
   background tab that printed something unseen or rang the bell. Click an icon to color the row.
 - **Themes** — 12 built-in, six dark and six light; the whole UI derives from the active one. Plain

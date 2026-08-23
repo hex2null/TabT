@@ -2,8 +2,10 @@
 //!
 //! A custom NSView that draws group titles and tab rows itself, and handles clicks and drags itself:
 //!   - two buttons at the top: "＋ New Terminal" and "＋ New Group";
-//!   - each group has one title row, with its tabs listed indented below; click a tab to switch,
-//!     drag a tab to another group to move it.
+//!   - one ordered list of sessions and groups: a group has a title row with its tabs listed
+//!     indented below, and a session that belongs to no group sits in the same list beside it.
+//!     Click a tab to switch; drag a tab to reorder it or move it between groups, and drag a group
+//!     title to move the whole group — including in between two loose sessions.
 //! All actions are forwarded to [`AppController`](crate::app::AppController). The view only takes
 //! keyboard focus while its search box or an in-place rename box is active (see `acceptsFirstResponder`);
 //! the rest of the time focus stays on the terminal, and a click outside the box hands it straight back.
@@ -21,7 +23,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
-use crate::app::{AppController, SessionState, Snapshot, TabSnap};
+use crate::app::{AppController, DropAt, ItemSnap, SessionState, Snapshot, TabSnap, TopItem};
 use crate::card::CARD_INSET;
 use crate::config;
 use crate::header::HEADER_H;
@@ -34,7 +36,7 @@ pub const SIDEBAR_W: f64 = 240.0;
 pub const MIN_SIDEBAR_W: f64 = 200.0;
 pub const MAX_SIDEBAR_W: f64 = 480.0;
 const ROW_H: f64 = 32.0; // session/settings row (per design spec)
-const SECTION_H: f64 = 24.0; // "Sessions" section label row above the ungrouped tabs
+const SECTION_H: f64 = 24.0; // the "Sessions" label above the list
 const BTN_H: f64 = 28.0; // action button row — the search box's height, so the two chips at the
                          // top of the card read as one size rather than nearly one
 const SEARCH_H: f64 = 28.0;
@@ -66,8 +68,24 @@ const ROW_HOVER: f64 = 0.04;
 const GAP: f64 = 10.0;
 const FROW_H: f64 = 32.0; // bottom settings row (same height as session rows)
 const FPAD: f64 = 8.0; // settings row top/bottom margin (symmetric)
-/// `group` sentinel for ungrouped tab rows (distinct from the button's usize::MAX).
+/// `group` sentinel for a session that belongs to no group (distinct from the button's usize::MAX).
 const UNGROUPED: usize = usize::MAX - 1;
+/// Left inset of a session row: one step in at the top level, another inside a group. The step is
+/// no longer decoration — with groups and loose sessions in one list, a loose session can sit
+/// directly under a group's last one, and the indent is the only thing that says which is which.
+const TAB_INDENT: f64 = 16.0;
+const GROUP_TAB_INDENT: f64 = 26.0;
+/// Left edge of the drag insertion line at the top level; a drop *into* a group indents it by the
+/// same step the rows use, so the line says which level it means rather than only where.
+const DROP_LINE_X: f64 = 8.0;
+/// The band at a group title's top edge that means "above this group" rather than "into it".
+/// Deliberately a narrow strip rather than the row's top half: filing a session into a group by
+/// dropping it on the title is the gesture that row is mostly for, and this is only the escape
+/// hatch for the one position that would otherwise be unreachable — the gap between two adjacent
+/// groups, which nothing else on screen leaves a gap for. It applies to a **collapsed** group too,
+/// which is the case that has no other way in at all: a collapsed group's sessions are not drawn,
+/// so a pair of them are two rows with no droppable row between them.
+const GROUP_EDGE_BAND: f64 = 7.0;
 /// How many ⌘Z steps the search/rename boxes keep (they hold one short line, so this is plenty).
 const UNDO_DEPTH: usize = 64;
 
@@ -180,7 +198,7 @@ enum Press {
     GroupMenu(usize), // "⋯" at the right of a group row; click to pop up the group menu
     TabMenu(u64),     // "⋯" at the right of a tab row; click to pop up the tab menu
     TabDot(u64),      // the session icon at the left of a tab row; click to pick its color
-    TabsLabel,        // "Sessions" section header above the ungrouped tabs (non-interactive)
+    TabsLabel,        // the "Sessions" label above the whole list (non-interactive)
     StyleMenu,        // bottom style row; click to pop up the color scheme menu
 }
 
@@ -196,6 +214,23 @@ struct HoverKey {
     half: u8, // dual-button row only: 0 = "Terminal" (left), 1 = "Group" (right)
 }
 
+/// One top-level item's vertical span in the drawn list: the item itself, its first row's top and
+/// its last visible row's bottom. A group covers its title and — while it is open — the sessions
+/// under it, so a drag is measured against the block a group actually occupies rather than against
+/// its title alone.
+struct Span {
+    item: TopItem,
+    top: f64,
+    bottom: f64,
+}
+
+/// What a drag draws over the list: a container highlight on the collapsed group the session would
+/// go into, or the insertion line, whose left edge says which level it means.
+enum DropMark {
+    Into { top: f64 },
+    Line { y: f64, x: f64 },
+}
+
 /// A single laid-out row.
 #[derive(Clone)]
 struct Row {
@@ -206,7 +241,6 @@ struct Row {
     kind: Press,
     selected: bool,
     collapsed: bool, // only meaningful for group rows: collapsed state
-    group: usize,    // the group this row belongs to (usize::MAX for button rows)
     dot: u8,         // tab rows: status-dot color index (0 = default/auto)
     state: SessionState, // tab rows: what the session is doing (drives the dot's form)
     activity: bool,      // tab rows: unseen output (brightens the label)
@@ -664,50 +698,55 @@ impl SidebarView {
         // uses, so a click during the animation lands on whatever is actually under the pointer.
         let slot = self.search_h();
         if slot > 0.0 {
-            rows.push(Row { top: y, h: SEARCH_H * self.reveal(), indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
+            rows.push(Row { top: y, h: SEARCH_H * self.reveal(), indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
             y += slot;
         }
 
         // Side-by-side "Terminal" and "Group" buttons, occupying one row.
-        rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
+        rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
         y += BTN_H + GAP;
 
-        // Ungrouped tabs, rendered at the top with a shallow indent.
-        let matched_ung: Vec<&TabSnap> = snap.ungrouped.iter().filter(|t| Self::matches(t, &q)).collect();
-        // The "Sessions" section label is always shown (even with no ungrouped tabs), so the session
-        // list stays anchored and remains a visible drop target. During a search it's hidden only when
-        // no session matches, matching how empty groups drop out of the filtered list.
-        if q.is_empty() || !matched_ung.is_empty() {
-            // "Sessions" section label above the tabs (matches the GROUP labels below).
-            rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
-            y += SECTION_H;
-            for t in matched_ung {
-                let selected = snap.active == Some(t.id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: t.title.clone(), kind: Press::Tab(t.id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: t.dot, locked: t.locked, state: t.state, activity: t.activity, bell: t.bell, count: 0 });
-                y += ROW_H;
-            }
-        }
+        // The list's own label. Always drawn, including a search that matches nothing: with groups
+        // and loose sessions sharing one ordered list, this is the title of the whole list rather
+        // than the header of one half of it — and it stays the anchor a drop can aim at when the
+        // list is empty.
+        rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: 0 });
+        y += SECTION_H;
 
-        for (gi, g) in snap.groups.iter().enumerate() {
-            // Filter: when the query is non-empty, keep only tabs whose title matches, and hide groups with no match.
-            let matched: Vec<&TabSnap> = g.tabs.iter().filter(|t| Self::matches(t, &q)).collect();
-            if !q.is_empty() && matched.is_empty() {
-                continue;
-            }
-            // A count only while the group is actually hiding something. During a search its
-            // matches are listed underneath it regardless of collapsed state, so a count there
-            // would contradict what is on screen.
-            let hidden = if g.collapsed && q.is_empty() { g.tabs.len() } else { 0 };
-            rows.push(Row { top: y - scroll, h: ROW_H, indent: PAD, label: g.name.clone(), kind: Press::Group(gi), selected: false, collapsed: g.collapsed, group: gi, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: hidden });
-            y += ROW_H;
-            // Hide tabs when collapsed and not in search state; while searching, always show matches (to make collapsed tabs findable).
-            if g.collapsed && q.is_empty() {
-                continue;
-            }
-            for t in matched {
-                let selected = snap.active == Some(t.id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: t.title.clone(), kind: Press::Tab(t.id, gi), selected, collapsed: false, group: gi, dot: t.dot, locked: t.locked, state: t.state, activity: t.activity, bell: t.bell, count: 0 });
-                y += ROW_H;
+        // One walk of the top level, in its own order: a loose session and a group are peers here,
+        // which is what lets a group be dragged in between two sessions.
+        for item in &snap.items {
+            match item {
+                ItemSnap::Tab(t) => {
+                    if !Self::matches(t, &q) {
+                        continue;
+                    }
+                    let selected = snap.active == Some(t.id);
+                    rows.push(Row { top: y - scroll, h: ROW_H, indent: TAB_INDENT, label: t.title.clone(), kind: Press::Tab(t.id, UNGROUPED), selected, collapsed: false, dot: t.dot, locked: t.locked, state: t.state, activity: t.activity, bell: t.bell, count: 0 });
+                    y += ROW_H;
+                }
+                ItemSnap::Group(g) => {
+                    // Filter: when the query is non-empty, keep only tabs whose title matches, and hide groups with no match.
+                    let matched: Vec<&TabSnap> = g.tabs.iter().filter(|t| Self::matches(t, &q)).collect();
+                    if !q.is_empty() && matched.is_empty() {
+                        continue;
+                    }
+                    // A count only while the group is actually hiding something. During a search its
+                    // matches are listed underneath it regardless of collapsed state, so a count there
+                    // would contradict what is on screen.
+                    let hidden = if g.collapsed && q.is_empty() { g.tabs.len() } else { 0 };
+                    rows.push(Row { top: y - scroll, h: ROW_H, indent: PAD, label: g.name.clone(), kind: Press::Group(g.index), selected: false, collapsed: g.collapsed, dot: 0, locked: false, state: SessionState::Idle, activity: false, bell: false, count: hidden });
+                    y += ROW_H;
+                    // Hide tabs when collapsed and not in search state; while searching, always show matches (to make collapsed tabs findable).
+                    if g.collapsed && q.is_empty() {
+                        continue;
+                    }
+                    for t in matched {
+                        let selected = snap.active == Some(t.id);
+                        rows.push(Row { top: y - scroll, h: ROW_H, indent: GROUP_TAB_INDENT, label: t.title.clone(), kind: Press::Tab(t.id, g.index), selected, collapsed: false, dot: t.dot, locked: t.locked, state: t.state, activity: t.activity, bell: t.bell, count: 0 });
+                        y += ROW_H;
+                    }
+                }
             }
         }
         rows
@@ -729,7 +768,7 @@ impl SidebarView {
             kind: Press::StyleMenu,
             selected: false,
             collapsed: false,
-            group: usize::MAX,
+           
             dot: 0,
             locked: false,
             state: SessionState::Idle,
@@ -836,19 +875,23 @@ impl SidebarView {
         // answer different questions — "into what" versus "between which two" — and a collapsed
         // group has no visible gap for a line to mean anything in.
         if self.ivars().dragging.get() {
-            if let Some(top) = self.drop_into_group(&snap) {
+            match self.drop_mark(&snap) {
                 // Fill only, no outline: the row is already bounded by the rows above and below it,
                 // so a ring around it just draws a second edge inside those — and the sidebar's
                 // other "this row is the one" marks (selection, hover) are all plain washes too.
-                let a = accent();
-                round_fill(rect(HPAD, top + 1.0, w - 2.0 * HPAD, ROW_H - 2.0), 7.0, &rgba(a.0, a.1, a.2, 0.22));
-            } else if let Some(y) = self.drop_indicator_y(&snap) {
+                Some(DropMark::Into { top }) => {
+                    let a = accent();
+                    round_fill(rect(HPAD, top + 1.0, w - 2.0 * HPAD, ROW_H - 2.0), 7.0, &rgba(a.0, a.1, a.2, 0.22));
+                }
                 // A 2pt bar, the weight the system's own drop indicators use: any heavier and it
                 // stops reading as a line and starts reading as a row of its own. Snapped to whole
                 // points, since the y it is given is a row top minus the scroll offset and a
                 // trackpad leaves that fractional — off the grid, a bar this thin antialiases
                 // across three device pixels and looks both thicker and blurrier than it is.
-                round_fill(rect(8.0, y.round() - 1.0, w - 16.0, 2.0), 1.0, &overlay(0.7));
+                Some(DropMark::Line { y, x }) => {
+                    round_fill(rect(x, y.round() - 1.0, (w - x - DROP_LINE_X).max(0.0), 2.0), 1.0, &overlay(0.7));
+                }
+                None => {}
             }
         }
         if let Some(c) = &ctx {
@@ -1072,124 +1115,157 @@ impl SidebarView {
         }
     }
 
-    /// Which "region" a row belongs to: None = ungrouped region, Some(gi) = a group; non-list rows return the outer None.
-    /// The "Sessions" label counts as part of the ungrouped region (just as a group title counts as part of its
-    /// group), so an empty session list is still a hit-testable drop target with a place to anchor the drop line.
-    fn row_region(row: &Row) -> Option<Option<usize>> {
-        match row.kind {
-            Press::Group(gi) => Some(Some(gi)),
-            Press::TabsLabel => Some(None),
-            Press::Tab(_, _) => Some(if row.group == UNGROUPED { None } else { Some(row.group) }),
+    /// The top level as it is currently drawn, in order. `skip` is the item being dragged, left out
+    /// so every position is measured against the list as it will be *after* the drag — which is
+    /// what the controller does too, moving by detaching and re-inserting.
+    fn top_spans(rows: &[Row], skip: Option<TopItem>) -> Vec<Span> {
+        let mut spans: Vec<Span> = Vec::new();
+        for r in rows {
+            match r.kind {
+                Press::Group(gi) => spans.push(Span { item: TopItem::Group(gi), top: r.top, bottom: r.top + r.h }),
+                Press::Tab(id, g) if g == UNGROUPED => {
+                    spans.push(Span { item: TopItem::Tab(id), top: r.top, bottom: r.top + r.h })
+                }
+                // A session inside a it extends its group's block.
+                Press::Tab(..) => {
+                    if let Some(last) = spans.last_mut() {
+                        last.bottom = r.top + r.h;
+                    }
+                }
+                _ => {}
+            }
+        }
+        spans.retain(|sp| Some(sp.item) != skip);
+        spans
+    }
+
+    /// The top-level item a drop at `y` would land *before*, or `None` for the end of the list:
+    /// the first item whose block the cursor has not yet passed the middle of.
+    fn top_anchor(spans: &[Span], y: f64) -> Option<TopItem> {
+        spans.iter().find(|sp| y < (sp.top + sp.bottom) / 2.0).map(|sp| sp.item)
+    }
+
+    /// The tab inside group `gi` that a drop at `y` would land before (`None` = the group's end),
+    /// skipping the dragged session itself so a same-group reorder measures the list without it.
+    fn group_anchor(rows: &[Row], gi: usize, y: f64, dragged: u64) -> Option<u64> {
+        rows.iter()
+            .filter_map(|r| match r.kind {
+                Press::Tab(tid, g) if g == gi && tid != dragged => Some((tid, r.top + r.h / 2.0)),
+                _ => None,
+            })
+            .find(|(_, mid)| y < *mid)
+            .map(|(tid, _)| tid)
+    }
+
+    /// Where a dragged session would land. Three answers, and the row under the cursor picks
+    /// between them:
+    ///
+    /// - a group's own session rows, or a collapsed group's title, put it **into** that group;
+    /// - a group title's [top edge](GROUP_EDGE_BAND) puts it at the top level *above* that group —
+    ///   the one position that is otherwise unreachable, since a group's block leaves no gap
+    ///   between it and the group below it;
+    /// - anything else — a loose session, the list's label, the empty space under the list — puts
+    ///   it at the top level, before the item whose middle the cursor has not passed.
+    fn tab_drop_target(&self, snap: &Snapshot, dragged: u64) -> DropAt {
+        let query = self.ivars().query.borrow().clone();
+        let rows = self.build_rows(snap, &query, self.scroll());
+        let y = self.ivars().cur_y.get();
+        let hit = rows.iter().find(|r| y >= r.top && y < r.top + r.h);
+        match hit.map(|r| (r.kind, r.top)) {
+            Some((Press::Group(gi), top)) => {
+                if y < top + GROUP_EDGE_BAND {
+                    DropAt::Top { before: Some(TopItem::Group(gi)) }
+                } else {
+                    DropAt::InGroup { gi, before: Self::group_anchor(&rows, gi, y, dragged) }
+                }
+            }
+            Some((Press::Tab(_, g), _)) if g != UNGROUPED => {
+                DropAt::InGroup { gi: g, before: Self::group_anchor(&rows, g, y, dragged) }
+            }
+            _ => DropAt::Top {
+                before: Self::top_anchor(&Self::top_spans(&rows, Some(TopItem::Tab(dragged))), y),
+            },
+        }
+    }
+
+    /// Where a dragged group would land: always a top-level position, since groups do not nest.
+    fn group_drop_target(&self, snap: &Snapshot, gi: usize) -> Option<TopItem> {
+        let rows = self.build_rows(snap, "", self.scroll());
+        let spans = Self::top_spans(&rows, Some(TopItem::Group(gi)));
+        Self::top_anchor(&spans, self.ivars().cur_y.get())
+    }
+
+    /// What the drag draws: a container highlight on a collapsed group, or an insertion line.
+    ///
+    /// They answer different questions — "into what" versus "between which two" — and a collapsed
+    /// group has no visible gap for a line to mean anything in. The line carries its own left edge,
+    /// because at the same x an insertion at the end of a group and one after that whole group are
+    /// the same picture; indented, it says which.
+    fn drop_mark(&self, snap: &Snapshot) -> Option<DropMark> {
+        let query = self.ivars().query.borrow().clone();
+        let rows = self.build_rows(snap, &query, self.scroll());
+        let list_bottom = rows
+            .iter()
+            .filter(|r| matches!(r.kind, Press::Group(_) | Press::Tab(..) | Press::TabsLabel))
+            .map(|r| r.top + r.h)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let top_line = |before: Option<TopItem>| {
+            let y = match before {
+                Some(item) => rows.iter().find(|r| Self::row_item(r) == Some(item)).map(|r| r.top)?,
+                None => list_bottom,
+            };
+            Some(DropMark::Line { y, x: DROP_LINE_X })
+        };
+        match self.ivars().press.get() {
+            Press::Group(gi) => top_line(self.group_drop_target(snap, gi)),
+            Press::Tab(dragged, _) => match self.tab_drop_target(snap, dragged) {
+                DropAt::Top { before } => top_line(before),
+                DropAt::InGroup { gi, before } => {
+                    // A collapsed group's sessions are not on screen — except during a search,
+                    // which lists its matches underneath it regardless, and there the rows are back
+                    // and a line is the honest answer again.
+                    let collapsed = rows
+                        .iter()
+                        .any(|r| matches!(r.kind, Press::Group(g) if g == gi) && r.collapsed && query.is_empty());
+                    if collapsed {
+                        return rows
+                            .iter()
+                            .find(|r| matches!(r.kind, Press::Group(g) if g == gi))
+                            .map(|r| DropMark::Into { top: r.top });
+                    }
+                    let x = DROP_LINE_X + (GROUP_TAB_INDENT - TAB_INDENT);
+                    let y = match before {
+                        Some(bid) => rows.iter().find(|r| matches!(r.kind, Press::Tab(tid, _) if tid == bid)).map(|r| r.top)?,
+                        // The end of the which is its title when
+                        // it holds nothing yet.
+                        None => rows
+                            .iter()
+                            .filter(|r| Self::row_group(r) == Some(gi))
+                            .map(|r| r.top + r.h)
+                            .fold(f64::NEG_INFINITY, f64::max),
+                    };
+                    (y.is_finite()).then_some(DropMark::Line { y, x })
+                }
+            },
             _ => None,
         }
     }
 
-    /// Tab drag drop target: returns (target region Some(group)/None(ungrouped), which tab to insert before / None = end).
-    /// Excludes the dragged tab itself during computation, to support reordering within the same region.
-    fn tab_drop_target(&self, snap: &Snapshot, dragged: u64) -> Option<(Option<usize>, Option<u64>)> {
-        let query = self.ivars().query.borrow().clone();
-        let rows = self.build_rows(snap, &query, self.scroll());
-        let y = self.ivars().cur_y.get();
-        // The region of the row that's hit is the target region.
-        let mut region = None;
-        for row in &rows {
-            if y >= row.top && y < row.top + row.h {
-                if let Some(r) = Self::row_region(row) {
-                    region = Some(r);
-                    break;
-                }
-            }
+    /// The top-level item a row *is*: a group title, or a session that belongs to no group. A
+    /// group's own session rows are part of its item, not items themselves, so they answer `None`.
+    fn row_item(row: &Row) -> Option<TopItem> {
+        match row.kind {
+            Press::Group(gi) => Some(TopItem::Group(gi)),
+            Press::Tab(id, g) if g == UNGROUPED => Some(TopItem::Tab(id)),
+            _ => None,
         }
-        let region = region.unwrap_or_else(|| {
-            // No row hit: above the first group title → ungrouped region; otherwise the last group (ungrouped region if there are no groups).
-            let first_group_top = rows.iter().find_map(|r| match r.kind {
-                Press::Group(_) => Some(r.top),
-                _ => None,
-            });
-            match first_group_top {
-                Some(gt) if y < gt => None,
-                _ => snap.groups.len().checked_sub(1).map(Some).unwrap_or(None),
-            }
-        });
-        // Insert before the first tab in the target region whose vertical midpoint is below the cursor; append if all are above.
-        let before = rows
-            .iter()
-            .filter(|r| Self::row_region(r) == Some(region) && matches!(r.kind, Press::Tab(..)))
-            .filter_map(|r| match r.kind {
-                Press::Tab(tid, _) if tid != dragged => Some((tid, r.top + r.h / 2.0)),
-                _ => None,
-            })
-            .find(|(_, mid)| y < *mid)
-            .map(|(tid, _)| tid);
-        Some((region, before))
     }
 
-    /// The row top of the collapsed group the drag is currently over, if dropping there would put
-    /// the tab *into* that group rather than between two rows.
-    ///
-    /// Only for a tab drag, and only with the search box empty: a query lists a collapsed group's
-    /// matches underneath it regardless of its state, so there the rows are on screen and the
-    /// insertion line is the honest answer again.
-    ///
-    /// The drop itself needed no change — a group row has always resolved to that group's region,
-    /// and with none of its tabs on screen the insertion lands at the end of it. What was missing
-    /// was saying so: the line drew under the group title, which reads as "after this group".
-    fn drop_into_group(&self, snap: &Snapshot) -> Option<f64> {
-        if !matches!(self.ivars().press.get(), Press::Tab(..)) {
-            return None;
-        }
-        let query = self.ivars().query.borrow().clone();
-        if !query.is_empty() {
-            return None;
-        }
-        let y = self.ivars().cur_y.get();
-        self.build_rows(snap, &query, self.scroll())
-            .into_iter()
-            .find(|r| matches!(r.kind, Press::Group(_)) && r.collapsed && y >= r.top && y < r.top + r.h)
-            .map(|r| r.top)
-    }
-
-    /// The y (insertion position) the drag placeholder line should snap to; None means don't draw it.
-    /// Kept consistent with `on_up`'s drop decision, so the preview line faithfully reflects the final drop position.
-    fn drop_indicator_y(&self, snap: &Snapshot) -> Option<f64> {
-        let query = self.ivars().query.borrow().clone();
-        let rows = self.build_rows(snap, &query, self.scroll());
-        let list_bottom = rows.last().map(|r| r.top + r.h).unwrap_or(0.0);
-        let y = self.ivars().cur_y.get();
-        match self.ivars().press.get() {
-            // Group: the line snaps to the top edge of the target-th group title; past the end, snaps to the list bottom.
-            Press::Group(_) => {
-                let heads: Vec<f64> = rows
-                    .iter()
-                    .filter_map(|r| match r.kind {
-                        Press::Group(_) => Some(r.top),
-                        _ => None,
-                    })
-                    .collect();
-                let mut target = 0usize;
-                for (i, top) in heads.iter().enumerate() {
-                    let bottom = heads.get(i + 1).copied().unwrap_or(list_bottom);
-                    if (top + bottom) / 2.0 < y {
-                        target += 1;
-                    }
-                }
-                Some(heads.get(target).copied().unwrap_or(list_bottom))
-            }
-            // Tab: the line snaps to the insertion position — the top edge of the `before` tab, or the bottom edge of the target region's last row.
-            Press::Tab(dragged, _) => {
-                let (region, before) = self.tab_drop_target(snap, dragged)?;
-                match before {
-                    Some(bid) => rows
-                        .iter()
-                        .find(|r| matches!(r.kind, Press::Tab(tid, _) if tid == bid))
-                        .map(|r| r.top),
-                    None => rows
-                        .iter()
-                        .filter(|r| Self::row_region(r) == Some(region))
-                        .map(|r| r.top + r.h)
-                        .fold(None, |acc: Option<f64>, b| Some(acc.map_or(b, |a: f64| a.max(b)))),
-                }
-            }
+    /// The group a row belongs to: its title row or one of its sessions. `None` for everything else.
+    fn row_group(row: &Row) -> Option<usize> {
+        match row.kind {
+            Press::Group(gi) => Some(gi),
+            Press::Tab(_, g) if g != UNGROUPED => Some(g),
             _ => None,
         }
     }
@@ -1296,10 +1372,10 @@ impl SidebarView {
         let query = self.ivars().query.borrow().clone();
         // Outside search, a collapsed group hides its tabs entirely: expand it so the active row exists.
         if query.is_empty() {
-            let holder = snap
-                .groups
-                .iter()
-                .position(|g| g.collapsed && g.tabs.iter().any(|t| t.id == active));
+            let holder = snap.items.iter().find_map(|i| match i {
+                ItemSnap::Group(g) if g.collapsed && g.tabs.iter().any(|t| t.id == active) => Some(g.index),
+                _ => None,
+            });
             if let Some(gi) = holder {
                 ctrl.toggle_group_collapsed(gi);
             }
@@ -1423,31 +1499,15 @@ impl SidebarView {
             match press {
                 Press::Tab(id, _) => {
                     let snap = ctrl.snapshot();
-                    if let Some((g, before)) = self.tab_drop_target(&snap, id) {
-                        ctrl.move_tab_to(id, g, before);
-                    }
+                    let at = self.tab_drop_target(&snap, id);
+                    ctrl.move_tab(id, at);
                 }
                 Press::Group(gi) => {
-                    // The new insertion index is how many group vertical midpoints the drop position crossed.
+                    // A group lands in the same list its sessions do, so it is placed the same way:
+                    // before the top-level item the cursor has not passed the middle of.
                     let snap = ctrl.snapshot();
-                    let rows = self.build_rows(&snap, "", self.scroll());
-                    let heads: Vec<f64> = rows
-                        .iter()
-                        .filter_map(|r| match r.kind {
-                            Press::Group(_) => Some(r.top),
-                            _ => None,
-                        })
-                        .collect();
-                    let list_bottom = rows.last().map(|r| r.top + r.h).unwrap_or(0.0);
-                    let y = self.ivars().cur_y.get();
-                    let mut target = 0usize;
-                    for (i, top) in heads.iter().enumerate() {
-                        let bottom = heads.get(i + 1).copied().unwrap_or(list_bottom);
-                        if (top + bottom) / 2.0 < y {
-                            target += 1;
-                        }
-                    }
-                    ctrl.move_group(gi, target);
+                    let before = self.group_drop_target(&snap, gi);
+                    ctrl.move_group(gi, before);
                 }
                 _ => {}
             }
@@ -2185,4 +2245,99 @@ fn rgba(r: f64, g: f64, b: f64, a: f64) -> Retained<NSColor> {
 extern "C" fn search_anim_tick(ctx: *mut c_void) {
     let view = unsafe { &*(ctx as *const SidebarView) };
     view.step_search_anim();
+}
+
+/// The drag arithmetic, which is the one part of this file that is plain data: rows in, an
+/// insertion point out. Everything around it needs a window, so this is where a regression in
+/// where a drop *lands* can actually be caught.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(kind: Press, top: f64) -> Row {
+        Row {
+            top,
+            h: ROW_H,
+            indent: 0.0,
+            label: String::new(),
+            kind,
+            selected: false,
+            collapsed: false,
+            dot: 0,
+            state: SessionState::Idle,
+            activity: false,
+            bell: false,
+            count: 0,
+            locked: false,
+        }
+    }
+
+    /// A loose session, then a group of two, then another loose session — the arrangement the whole
+    /// change exists for, and the one the old two-list model could not express.
+    fn rows() -> Vec<Row> {
+        let mut y = 0.0;
+        let mut out = Vec::new();
+        for kind in [
+            Press::TabsLabel,
+            Press::Tab(1, UNGROUPED),
+            Press::Group(0),
+            Press::Tab(2, 0),
+            Press::Tab(3, 0),
+            Press::Tab(4, UNGROUPED),
+        ] {
+            out.push(row(kind, y));
+            y += ROW_H;
+        }
+        out
+    }
+
+    /// A group's block is its title *and* the sessions under it: a drag is measured against what
+    /// the group occupies on screen, or its midpoint would sit inside its own first session.
+    #[test]
+    fn a_group_spans_its_open_sessions() {
+        let rows = rows();
+        let spans = SidebarView::top_spans(&rows, None);
+        assert_eq!(spans.len(), 3, "three top-level items: a session, a group, a session");
+        assert!(matches!(spans[1].item, TopItem::Group(0)));
+        assert_eq!(spans[1].top, ROW_H * 2.0);
+        assert_eq!(spans[1].bottom, ROW_H * 5.0, "the group ends below its last session");
+    }
+
+    /// The anchor is the item the drop lands *before*; past the last one it is `None`, meaning the
+    /// end of the list.
+    #[test]
+    fn a_drop_lands_before_the_item_it_has_not_passed() {
+        let rows = rows();
+        let spans = SidebarView::top_spans(&rows, None);
+        // In the label, above everything.
+        assert!(matches!(SidebarView::top_anchor(&spans, 0.0), Some(TopItem::Tab(1))));
+        // Below the first session's middle, above the group's: between the two.
+        assert!(matches!(SidebarView::top_anchor(&spans, ROW_H * 1.9), Some(TopItem::Group(0))));
+        // Below the group's middle but above the last session's: between the group and it.
+        assert!(matches!(SidebarView::top_anchor(&spans, ROW_H * 4.0), Some(TopItem::Tab(4))));
+        assert!(SidebarView::top_anchor(&spans, ROW_H * 6.0).is_none(), "past the end of the list");
+    }
+
+    /// A group is dragged against the list as it will be once it is out of it — otherwise its own
+    /// block is in the way and a short drag resolves to where it already is.
+    #[test]
+    fn the_dragged_item_is_left_out_of_its_own_measurement() {
+        let rows = rows();
+        let spans = SidebarView::top_spans(&rows, Some(TopItem::Group(0)));
+        assert_eq!(spans.len(), 2);
+        // With the group gone the two loose sessions are adjacent, so a drop just under the first
+        // one lands before the second rather than back inside the group's old block.
+        assert!(matches!(SidebarView::top_anchor(&spans, ROW_H * 1.9), Some(TopItem::Tab(4))));
+    }
+
+    /// Inside a group the anchor is a session of that group, and the dragged one is skipped so a
+    /// reorder measures the list without it.
+    #[test]
+    fn a_session_dropped_in_a_group_lands_between_its_sessions() {
+        let rows = rows();
+        assert_eq!(SidebarView::group_anchor(&rows, 0, ROW_H * 3.1, 9), Some(2), "the top half of a session row is above it");
+        assert_eq!(SidebarView::group_anchor(&rows, 0, ROW_H * 3.6, 9), Some(3), "its bottom half is below it");
+        assert_eq!(SidebarView::group_anchor(&rows, 0, ROW_H * 4.9, 9), None, "past its last session");
+        assert_eq!(SidebarView::group_anchor(&rows, 0, ROW_H * 3.1, 2), Some(3), "the dragged one does not anchor itself");
+    }
 }

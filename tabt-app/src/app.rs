@@ -197,12 +197,167 @@ struct Group {
     tabs: Vec<u64>,  // ordered tab ids
 }
 
+/// One entry of the sidebar's top level: a session belonging to no group, or a group.
+///
+/// The two share **one ordered list** rather than a loose-sessions list drawn above a list of
+/// groups. That is the whole of what lets a group be dragged between two loose sessions instead of
+/// only against other groups — and it is why a group is identified everywhere else by its
+/// *ordinal* among the groups (see [`Model::groups`]) rather than by an index into this list.
+enum Node {
+    Tab(u64),
+    Group(Group),
+}
+
 struct Model {
-    ungrouped: Vec<u64>, // ids of tabs not belonging to any group (ordered, rendered at the top of the list)
-    groups: Vec<Group>,
+    /// The top level, in the order the sidebar draws it: loose sessions and groups interleaved.
+    items: Vec<Node>,
     tabs: Vec<Tab>,
     active: Option<u64>,
     next_id: u64,
+}
+
+impl Model {
+    /// Every group, in list order. A group's position in *this* sequence — its ordinal — is the
+    /// `gi` the rest of the app speaks in (`Press::Group`, the group menus, `rename_group`,
+    /// `layout.conf`'s section order), so nothing outside this block had to learn about item
+    /// positions when the two lists became one.
+    fn groups(&self) -> impl Iterator<Item = &Group> {
+        self.items.iter().filter_map(|n| match n {
+            Node::Group(g) => Some(g),
+            Node::Tab(_) => None,
+        })
+    }
+
+    fn groups_mut(&mut self) -> impl Iterator<Item = &mut Group> {
+        self.items.iter_mut().filter_map(|n| match n {
+            Node::Group(g) => Some(g),
+            Node::Tab(_) => None,
+        })
+    }
+
+    fn group_count(&self) -> usize {
+        self.groups().count()
+    }
+
+    fn group(&self, gi: usize) -> Option<&Group> {
+        self.groups().nth(gi)
+    }
+
+    fn group_mut(&mut self, gi: usize) -> Option<&mut Group> {
+        self.groups_mut().nth(gi)
+    }
+
+    /// Where the `gi`-th group sits in `items`.
+    fn group_pos(&self, gi: usize) -> Option<usize> {
+        self.items.iter().enumerate().filter(|(_, n)| matches!(n, Node::Group(_))).map(|(i, _)| i).nth(gi)
+    }
+
+    /// The ordinal of the group holding `id`, if it is in one at all.
+    fn group_of(&self, id: u64) -> Option<usize> {
+        self.groups().position(|g| g.tabs.contains(&id))
+    }
+
+    /// Where a top-level item currently sits in `items`; `None` once it is gone.
+    fn item_pos(&self, item: TopItem) -> Option<usize> {
+        match item {
+            TopItem::Tab(id) => self.items.iter().position(|n| matches!(n, Node::Tab(t) if *t == id)),
+            TopItem::Group(gi) => self.group_pos(gi),
+        }
+    }
+
+    /// Take a tab out of wherever it is — the top level or any group — leaving it registered in
+    /// `tabs`. The removal half of every move, and of a close.
+    fn detach_tab(&mut self, id: u64) {
+        self.items.retain(|n| !matches!(n, Node::Tab(t) if *t == id));
+        for g in self.groups_mut() {
+            g.tabs.retain(|&t| t != id);
+        }
+    }
+
+    /// Put tab `id` where a drop says, taking it out of wherever it is first.
+    ///
+    /// The anchor is resolved **after** that removal, which is what makes it safe: pulling one tab
+    /// out changes neither another tab's id nor any group's ordinal, so the position named by the
+    /// sidebar still names the same place.
+    fn place_tab(&mut self, id: u64, at: DropAt) {
+        self.detach_tab(id);
+        match at {
+            DropAt::InGroup { gi, before } => {
+                let filed = match self.group_mut(gi) {
+                    Some(g) => {
+                        let pos = before.and_then(|b| g.tabs.iter().position(|&t| t == b)).unwrap_or(g.tabs.len());
+                        g.tabs.insert(pos, id);
+                        true
+                    }
+                    None => false,
+                };
+                // The group went away between the press and the drop. The tab is already detached,
+                // so it has to land somewhere: the end of the top level, where it can at least be
+                // seen and dragged again.
+                if !filed {
+                    self.items.push(Node::Tab(id));
+                }
+            }
+            DropAt::Top { before } => {
+                let pos = before.and_then(|b| self.item_pos(b)).unwrap_or(self.items.len());
+                let pos = pos.min(self.items.len());
+                self.items.insert(pos, Node::Tab(id));
+            }
+        }
+    }
+
+    /// Move the `gi`-th group so it sits before top-level item `before` (`None` = the end).
+    ///
+    /// The mirror image of [`Self::place_tab`]: here the anchor is resolved **before** the removal,
+    /// because a group ordinal names a position among the groups and taking one out renumbers every
+    /// group after it — and the index it resolves to is then shifted by the hole that removal left.
+    fn reorder_group(&mut self, gi: usize, before: Option<TopItem>) {
+        let from = match self.group_pos(gi) {
+            Some(p) => p,
+            None => return,
+        };
+        let anchor = match before {
+            Some(b) => self.item_pos(b).unwrap_or(self.items.len()),
+            None => self.items.len(),
+        };
+        let node = self.items.remove(from);
+        let at = if anchor > from { anchor - 1 } else { anchor };
+        let at = at.min(self.items.len());
+        self.items.insert(at, node);
+    }
+
+    /// Every tab id in visual order: the top level walked in order, each group contributing its own
+    /// tabs where it sits. A collapsed group's tabs are included — a hidden row is still a session,
+    /// and this is what "the tab next to the one just closed" is computed from.
+    fn order(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for n in &self.items {
+            match n {
+                Node::Tab(id) => out.push(*id),
+                Node::Group(g) => out.extend(g.tabs.iter().copied()),
+            }
+        }
+        out
+    }
+}
+
+/// A top-level item, named by what it **is** rather than by where it sits. The sidebar resolves a
+/// drop into one of these and the controller looks its position up at the moment it moves
+/// something: an index handed across that boundary would already be stale, the drag's own removal
+/// having renumbered the list it was measured against.
+#[derive(Clone, Copy, PartialEq)]
+pub enum TopItem {
+    Tab(u64),
+    Group(usize),
+}
+
+/// Where a dragged session lands.
+#[derive(Clone, Copy, PartialEq)]
+pub enum DropAt {
+    /// Inside group `gi`, before tab `before` (`None` = at its end).
+    InGroup { gi: usize, before: Option<u64> },
+    /// At the top level, before item `before` (`None` = at the end of the list).
+    Top { before: Option<TopItem> },
 }
 
 /// One tab, as the sidebar sees it. A struct rather than the tuple this used to be: the sidebar
@@ -223,15 +378,26 @@ pub struct TabSnap {
 
 /// Group snapshot used by the sidebar for drawing.
 pub struct GroupSnap {
+    /// This group's ordinal — the `gi` every call back into the controller names it by. Carried
+    /// rather than recomputed from the item's position, which counts loose sessions too.
+    pub index: usize,
     pub name: String,
     pub collapsed: bool,
     pub tabs: Vec<TabSnap>,
 }
 
+/// One top-level entry, as the sidebar sees it: a loose session or a group, in list order.
+pub enum ItemSnap {
+    Tab(TabSnap),
+    Group(GroupSnap),
+}
+
 /// Read-only snapshot used by the sidebar for drawing (does not expose internal details like Retained).
 pub struct Snapshot {
-    pub ungrouped: Vec<TabSnap>, // tabs belonging to no group, rendered at the top
-    pub groups: Vec<GroupSnap>,
+    /// The top level in draw order. Positions here are the model's own item positions, but the
+    /// sidebar still names a drop target by identity ([`TopItem`]) rather than by index — see the
+    /// note there.
+    pub items: Vec<ItemSnap>,
     pub active: Option<u64>,
     pub style: usize,
 }
@@ -323,7 +489,7 @@ impl AppController {
             );
         }
         let c = Rc::new(AppController {
-            model: RefCell::new(Model { ungrouped: Vec::new(), groups: Vec::new(), tabs: Vec::new(), active: None, next_id: 1 }),
+            model: RefCell::new(Model { items: Vec::new(), tabs: Vec::new(), active: None, next_id: 1 }),
             window,
             sidebar,
             card,
@@ -842,7 +1008,7 @@ impl AppController {
             _ => None,
         });
         self.relayout();
-        // Restore ungrouped tabs first (rendered at the top), then each group. **None of them gets
+        // Restore the sidebar's top level in stored order. **None of them gets
         // a shell here.** A restored tab comes back `Dormant` — row, title, cwd and grid, but no
         // fork — and `select` is what starts one (`start_tab_session`). So a saved layout of twenty
         // sessions costs one login shell at launch rather than twenty, all of them racing through
@@ -853,17 +1019,26 @@ impl AppController {
         // `auto` says the stored title was derived and may be re-derived; its absence means the
         // user chose it. A config written before that key existed therefore restores pinned, which
         // is what keeps every rename made by an older version.
-        for t in layout.ungrouped {
-            self.dormant_tab(None, t.title, !t.auto, &t.cwd, t.dot, t.locked);
-        }
-        for (name, collapsed, tabs) in layout.groups {
-            let gi = {
-                let mut m = self.model.borrow_mut();
-                m.groups.push(Group { name, collapsed, tabs: Vec::new() });
-                m.groups.len() - 1
-            };
-            for t in tabs {
-                self.dormant_tab(Some(gi), t.title, !t.auto, &t.cwd, t.dot, t.locked);
+        // In stored order, which is the sidebar's: a run of loose sessions saved between two
+        // groups comes back between them. `dormant_tab(None, ..)` appends to the top level and
+        // `dormant_tab(Some(gi), ..)` to that group, so walking the file in order rebuilds it.
+        for item in layout.items {
+            match item {
+                config::Item::Tabs(tabs) => {
+                    for t in tabs {
+                        self.dormant_tab(None, t.title, !t.auto, &t.cwd, t.dot, t.locked);
+                    }
+                }
+                config::Item::Group((name, collapsed, tabs)) => {
+                    let gi = {
+                        let mut m = self.model.borrow_mut();
+                        m.items.push(Node::Group(Group { name, collapsed, tabs: Vec::new() }));
+                        m.group_count() - 1
+                    };
+                    for t in tabs {
+                        self.dormant_tab(Some(gi), t.title, !t.auto, &t.cwd, t.dot, t.locked);
+                    }
+                }
             }
         }
         let first = self.model.borrow().tabs.first().map(|t| t.id);
@@ -903,7 +1078,7 @@ impl AppController {
     }
 
     /// Create a new tab (without switching to it): spawn a PTY + TermView + reader in `cwd`
-    /// (for session restore, may be empty). When `group` is None it goes into the ungrouped list. Registered into the model.
+    /// (for session restore, may be empty). When `group` is None it joins the top level. Registered into the model.
     /// Returns `None` if the PTY/process itself couldn't be spawned (e.g. out of file
     /// descriptors) — the caller must skip creating this one tab without disturbing any others.
     fn spawn_tab(&self, group: Option<usize>, title: String, pinned: bool, cwd: &str, dot: u8, locked: bool) -> Option<u64> {
@@ -988,9 +1163,17 @@ impl AppController {
             // it will eventually be spawned in, and what `save` writes back all come from here.
             spawn_cwd: if cwd.is_empty() { std::env::var("HOME").unwrap_or_default() } else { cwd.to_string() },
         });
-        match group {
-            Some(gi) if gi < m.groups.len() => m.groups[gi].tabs.push(id),
-            _ => m.ungrouped.push(id),
+        let filed = match group.and_then(|gi| m.group_mut(gi)) {
+            Some(g) => {
+                g.tabs.push(id);
+                true
+            }
+            None => false,
+        };
+        // No group asked for, or one that has since gone: the tab joins the top level, at its end.
+        // `place_tab_after` is what moves it next to its origin when there is one.
+        if !filed {
+            m.items.push(Node::Tab(id));
         }
         id
     }
@@ -1018,8 +1201,10 @@ impl AppController {
             // the sidebar and keystrokes would go to a terminal nothing marks as selected. The rule
             // lives here rather than at the callers because every path that activates a tab — new
             // tab, sidebar click, restoring the persisted selection — goes through this one.
-            if let Some(g) = m.groups.iter_mut().find(|g| g.tabs.contains(&id)) {
-                g.collapsed = false;
+            if let Some(gi) = m.group_of(id) {
+                if let Some(g) = m.group_mut(gi) {
+                    g.collapsed = false;
+                }
             }
         }
         // A restored tab has no shell until it is looked at, and this is the moment it is. Deliberately
@@ -1126,8 +1311,8 @@ impl AppController {
     }
 
     /// New tab. When a tab is selected, the new tab inherits its working directory and is inserted
-    /// immediately after it within the same group/list. With no selection, it lands in the ungrouped
-    /// list (rendered at the top) in the home directory; it can be dragged into a group when needed.
+    /// immediately after it, in the same group or at the same top level. With no selection, it lands
+    /// at the end of the top level in the home directory; it can be dragged into a group when needed.
     pub fn add_tab_default(&self) {
         // Snapshot the selected tab's cwd + group under a single borrow, before spawning.
         let anchor = {
@@ -1136,7 +1321,7 @@ impl AppController {
                 let cwd = m.tabs.iter().find(|t| t.id == a).map(Tab::cwd)?;
                 // The new tab stays in the active tab's group even when that group is collapsed —
                 // it is expanded below, so the tab is never created hidden.
-                let group = m.groups.iter().position(|g| g.tabs.contains(&a));
+                let group = m.group_of(a);
                 Some((a, group, cwd))
             })
         };
@@ -1161,7 +1346,7 @@ impl AppController {
     /// Inherits the active tab's cwd when there is one, otherwise the default shell directory.
     /// `spawn_tab` appends the new tab to the group's end.
     pub fn add_tab_in_group(&self, gi: usize) {
-        if gi >= self.model.borrow().groups.len() {
+        if gi >= self.model.borrow().group_count() {
             return;
         }
         let cwd = {
@@ -1183,23 +1368,22 @@ impl AppController {
         }
     }
 
-    /// Move `id` to sit immediately after `anchor` within `group`'s ordered list (both must already be
-    /// in that same list — `spawn_tab` appended `id` to its end). Keeps a new tab next to its origin.
+    /// Move `id` to sit immediately after `anchor` — inside `group`'s ordered tabs, or among the
+    /// top-level items when there is no group (both must already be in that same list; `spawn_tab`
+    /// appended `id` to its end). Keeps a new tab next to its origin.
     fn place_tab_after(&self, group: Option<usize>, id: u64, anchor: u64) {
         let mut m = self.model.borrow_mut();
-        let list: &mut Vec<u64> = match group {
-            Some(gi) if gi < m.groups.len() => &mut m.groups[gi].tabs,
-            _ => &mut m.ungrouped,
-        };
-        if let Some(p) = list.iter().position(|&t| t == id) {
-            list.remove(p);
+        if let Some(g) = group.and_then(|gi| m.group_mut(gi)) {
+            if let Some(p) = g.tabs.iter().position(|&t| t == id) {
+                g.tabs.remove(p);
+            }
+            let pos = g.tabs.iter().position(|&t| t == anchor).map(|p| p + 1).unwrap_or(g.tabs.len());
+            g.tabs.insert(pos, id);
+            return;
         }
-        let pos = list
-            .iter()
-            .position(|&t| t == anchor)
-            .map(|p| p + 1)
-            .unwrap_or(list.len());
-        list.insert(pos, id);
+        m.items.retain(|n| !matches!(n, Node::Tab(t) if *t == id));
+        let pos = m.item_pos(TopItem::Tab(anchor)).map(|p| p + 1).unwrap_or(m.items.len());
+        m.items.insert(pos, Node::Tab(id));
     }
 
     /// Shown when a new tab's PTY/process couldn't be created (e.g. out of file descriptors).
@@ -1225,59 +1409,43 @@ impl AppController {
     }
 
     pub fn add_group_default(&self) {
-        let n = self.model.borrow().groups.len() + 1;
-        self.model.borrow_mut().groups.push(Group { name: format!("Group {}", n), collapsed: false, tabs: Vec::new() });
+        let n = self.model.borrow().group_count() + 1;
+        self.model
+            .borrow_mut()
+            .items
+            .push(Node::Group(Group { name: format!("Group {}", n), collapsed: false, tabs: Vec::new() }));
         self.save();
         self.refresh_sidebar();
         // The new group is appended at the end of the list; scroll the sidebar to the bottom to make it visible.
         self.sidebar.scroll_to_bottom();
     }
 
-    /// Drag to move a tab: move to `to_group`, inserting before tab `before` (None = append to the end).
-    /// Supports both in-group reordering and cross-group moves.
-    /// Drag to move a tab: target `to` is Some(group index) or None (ungrouped list), inserting before tab
-    /// `before` (None = append). Supports same-group / cross-group / in-and-out of the ungrouped area.
-    pub fn move_tab_to(&self, id: u64, to: Option<usize>, before: Option<u64>) {
+    /// Drag to move a session: into a group, or to a position among the top-level items. Covers
+    /// same-group and cross-group reordering, and moving a session in or out of a group entirely.
+    ///
+    /// The target names the item the session goes *before* rather than an index; [`Model::place_tab`]
+    /// is where that is resolved, and why it is resolved when it is.
+    pub fn move_tab(&self, id: u64, at: DropAt) {
         {
             let mut m = self.model.borrow_mut();
-            if let Some(gi) = to {
-                if gi >= m.groups.len() {
-                    return;
-                }
+            if !m.tabs.iter().any(|t| t.id == id) {
+                return;
             }
-            // First remove from the ungrouped list + all groups, then locate the insertion point by `before`.
-            m.ungrouped.retain(|&t| t != id);
-            for g in &mut m.groups {
-                g.tabs.retain(|&t| t != id);
-            }
-            let list = match to {
-                Some(gi) => &mut m.groups[gi].tabs,
-                None => &mut m.ungrouped,
-            };
-            let pos = match before {
-                Some(bid) => list.iter().position(|&t| t == bid).unwrap_or(list.len()),
-                None => list.len(),
-            };
-            list.insert(pos, id);
+            m.place_tab(id, at);
         }
         self.save();
         self.refresh_sidebar();
     }
 
-    /// Drag to reorder groups: move group index `from` to insertion position `target` (0..=len, meaning
-    /// "insert before the target-th element of the original array", so when target>from subtract 1 first to offset the removal).
-    pub fn move_group(&self, from: usize, mut target: usize) {
+    /// Drag to reorder a group: move the `gi`-th group so it sits before top-level item `before`
+    /// (`None` = the end of the list). A group can land anywhere in that list, loose sessions
+    /// included — the two are one list precisely so it can.
+    ///
+    /// [`Model::reorder_group`] is the arithmetic, which is not the same as a tab's — see it for
+    /// why the anchor has to be resolved before the removal rather than after.
+    pub fn move_group(&self, gi: usize, before: Option<TopItem>) {
         {
-            let mut m = self.model.borrow_mut();
-            if from >= m.groups.len() {
-                return;
-            }
-            if target > from {
-                target -= 1;
-            }
-            let g = m.groups.remove(from);
-            let target = target.min(m.groups.len());
-            m.groups.insert(target, g);
+            self.model.borrow_mut().reorder_group(gi, before);
         }
         self.save();
         self.refresh_sidebar();
@@ -1287,7 +1455,7 @@ impl AppController {
     pub fn toggle_group_collapsed(&self, gi: usize) {
         {
             let mut m = self.model.borrow_mut();
-            match m.groups.get_mut(gi) {
+            match m.group_mut(gi) {
                 Some(g) => g.collapsed = !g.collapsed,
                 None => return,
             }
@@ -1298,7 +1466,7 @@ impl AppController {
 
     /// Delete an entire group. If the group contains tabs, show a confirmation dialog first.
     pub fn delete_group(&self, gi: usize) {
-        let (name, ids): (String, Vec<u64>) = match self.model.borrow().groups.get(gi) {
+        let (name, ids): (String, Vec<u64>) = match self.model.borrow().group(gi) {
             Some(g) => (g.name.clone(), g.tabs.clone()),
             None => return,
         };
@@ -1309,8 +1477,8 @@ impl AppController {
         // would be written back to the config and "revived" on the next launch.
         {
             let mut m = self.model.borrow_mut();
-            if gi < m.groups.len() {
-                m.groups.remove(gi);
+            if let Some(p) = m.group_pos(gi) {
+                m.items.remove(p);
             }
         }
         // Tear down each tab one by one (without persisting per tab). Deleting a group is an
@@ -1358,10 +1526,7 @@ impl AppController {
                 Some(i) => i,
                 None => return false,
             };
-            m.ungrouped.retain(|&t| t != id);
-            for g in &mut m.groups {
-                g.tabs.retain(|&t| t != id);
-            }
+            m.detach_tab(id);
             if m.active == Some(id) {
                 m.active = None;
             }
@@ -1381,15 +1546,12 @@ impl AppController {
         true
     }
 
-    /// The tab adjacent to `id` in visual order (ungrouped first, followed by each group): prefer the
-    /// preceding one, falling back to the next when closing the very first tab. Used to move focus to a
-    /// neighbor after closing the active tab.
+    /// The tab adjacent to `id` in visual order (the top level walked in order, each group
+    /// contributing its tabs where it sits): prefer the preceding one, falling back to the next when
+    /// closing the very first tab. Used to move focus to a neighbor after closing the active tab.
     fn adjacent_tab(&self, id: u64) -> Option<u64> {
         let m = self.model.borrow();
-        let mut order: Vec<u64> = m.ungrouped.clone();
-        for g in &m.groups {
-            order.extend(g.tabs.iter().copied());
-        }
+        let order = m.order();
         let pos = order.iter().position(|&t| t == id)?;
         pos.checked_sub(1)
             .and_then(|p| order.get(p).copied())
@@ -1675,12 +1837,12 @@ impl AppController {
 
     /// Whether a group is collapsed (its tabs hidden in the sidebar).
     pub fn group_collapsed(&self, gi: usize) -> bool {
-        self.model.borrow().groups.get(gi).map(|g| g.collapsed).unwrap_or(false)
+        self.model.borrow().group(gi).map(|g| g.collapsed).unwrap_or(false)
     }
 
     /// A group's current name, as the rename box should seed itself with.
     pub fn group_name(&self, gi: usize) -> String {
-        self.model.borrow().groups.get(gi).map(|g| g.name.clone()).unwrap_or_default()
+        self.model.borrow().group(gi).map(|g| g.name.clone()).unwrap_or_default()
     }
 
     /// Set a tab's color (index into sidebar::dot_colors; 0 = default/auto).
@@ -1700,7 +1862,7 @@ impl AppController {
     pub fn rename_group(&self, gi: usize, name: String) {
         {
             let mut m = self.model.borrow_mut();
-            match m.groups.get_mut(gi) {
+            match m.group_mut(gi) {
                 Some(g) => g.name = name,
                 None => return,
             }
@@ -1726,16 +1888,23 @@ impl AppController {
                     cwd: t.cwd(),
                 })
         };
-        let ungrouped = m.ungrouped.iter().filter_map(snap_of).collect();
-        let groups = m
-            .groups
+        let mut gi = 0usize;
+        let items = m
+            .items
             .iter()
-            .map(|g| {
-                let tabs = g.tabs.iter().filter_map(snap_of).collect();
-                GroupSnap { name: g.name.clone(), collapsed: g.collapsed, tabs }
+            .filter_map(|n| match n {
+                Node::Tab(id) => snap_of(id).map(ItemSnap::Tab),
+                Node::Group(g) => {
+                    // Counted over every group, not over the ones that produced a snapshot, so the
+                    // ordinal the sidebar sends back always names the same group the model knows.
+                    let index = gi;
+                    gi += 1;
+                    let tabs = g.tabs.iter().filter_map(snap_of).collect();
+                    Some(ItemSnap::Group(GroupSnap { index, name: g.name.clone(), collapsed: g.collapsed, tabs }))
+                }
             })
             .collect();
-        Snapshot { ungrouped, groups, active: m.active, style: self.style.get() }
+        Snapshot { items, active: m.active, style: self.style.get() }
     }
 
     /// Switch the global color theme: immediately redraw the current terminal and sidebar, and persist.
@@ -2271,15 +2440,25 @@ impl AppController {
                 auto: !t.pinned,
             })
         };
-        let ungrouped: Vec<config::SavedTab> = m.ungrouped.iter().filter_map(tab_state).collect();
-        let groups: Vec<config::SavedGroup> = m
-            .groups
-            .iter()
-            .map(|g| {
-                let tabs = g.tabs.iter().filter_map(tab_state).collect();
-                (g.name.clone(), g.collapsed, tabs)
-            })
-            .collect();
+        // The top level in order. Adjacent loose sessions are coalesced into one `[tabs]` run —
+        // the file's own unit for them — so a list with no groups renders exactly as it always did.
+        let mut items: Vec<config::SavedItem> = Vec::new();
+        for n in &m.items {
+            match n {
+                Node::Tab(id) => {
+                    if let Some(t) = tab_state(id) {
+                        match items.last_mut() {
+                            Some(config::Item::Tabs(run)) => run.push(t),
+                            _ => items.push(config::Item::Tabs(vec![t])),
+                        }
+                    }
+                }
+                Node::Group(g) => {
+                    let tabs = g.tabs.iter().filter_map(tab_state).collect();
+                    items.push(config::Item::Group((g.name.clone(), g.collapsed, tabs)));
+                }
+            }
+        }
         drop(m);
         let (window_w, window_h) = self.window_size();
         // Read at save time rather than tracked as the window moves: `windowDidMove:` fires per
@@ -2307,8 +2486,7 @@ impl AppController {
                 toolbar_hidden: settings::toolbar_hidden(),
                 toolbar_order: settings::toolbar_order(),
             },
-            &ungrouped,
-            &groups,
+            &items,
         );
     }
 }
@@ -2354,3 +2532,102 @@ fn toggle_cb(ctx: *const c_void) {
     ctrl.toggle_sidebar();
 }
 
+
+/// The ordering arithmetic behind a drag. `Model` holds AppKit objects only in its `tabs` vector,
+/// which these leave empty — so where a dropped session or a dragged group actually *lands* is
+/// testable, and it is the half of the drag no GUI harness here can exercise (mouse gestures cannot
+/// be synthesized; see `.claude/skills/run-tabt`).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A model of the top level alone: `"a"` is a loose session named by its id, `"G:x,y"` a group
+    /// holding those sessions. Ids are the numbers; groups are named after their index.
+    fn model(sketch: &[&str]) -> Model {
+        let items = sketch
+            .iter()
+            .map(|s| match s.strip_prefix("G:") {
+                Some(tabs) => Node::Group(Group {
+                    name: s.to_string(),
+                    collapsed: false,
+                    tabs: tabs.split(',').filter(|t| !t.is_empty()).map(|t| t.parse().unwrap()).collect(),
+                }),
+                None => Node::Tab(s.parse().unwrap()),
+            })
+            .collect();
+        Model { items, tabs: Vec::new(), active: None, next_id: 99 }
+    }
+
+    /// The same sketch back out, so a move reads as one string.
+    fn shape(m: &Model) -> Vec<String> {
+        m.items
+            .iter()
+            .map(|n| match n {
+                Node::Tab(id) => id.to_string(),
+                Node::Group(g) => {
+                    format!("G:{}", g.tabs.iter().map(u64::to_string).collect::<Vec<_>>().join(","))
+                }
+            })
+            .collect()
+    }
+
+    /// The move the one-list model exists for: a group dropped between two loose sessions.
+    #[test]
+    fn a_group_moves_in_among_loose_sessions() {
+        let mut m = model(&["1", "2", "G:3,4"]);
+        m.reorder_group(0, Some(TopItem::Tab(2)));
+        assert_eq!(shape(&m), ["1", "G:3,4", "2"]);
+    }
+
+    /// Downward is the direction the arithmetic differs in: the group is pulled out first, so an
+    /// anchor that sat below it has moved up one by the time it is used.
+    #[test]
+    fn a_group_dragged_down_lands_before_its_anchor_not_after_it() {
+        let mut m = model(&["G:1", "2", "3"]);
+        m.reorder_group(0, Some(TopItem::Tab(3)));
+        assert_eq!(shape(&m), ["2", "G:1", "3"]);
+        m.reorder_group(0, None);
+        assert_eq!(shape(&m), ["2", "3", "G:1"], "no anchor is the end of the list");
+    }
+
+    /// A group ordinal is a position among the *groups*, so an anchor naming one has to survive the
+    /// renumbering that pulling another group out causes.
+    #[test]
+    fn a_group_anchored_on_another_group_survives_the_renumbering() {
+        let mut m = model(&["G:1", "G:2", "G:3"]);
+        // Move the first group before what is currently the third: the ordinals shift under it.
+        m.reorder_group(0, Some(TopItem::Group(2)));
+        assert_eq!(shape(&m), ["G:2", "G:1", "G:3"]);
+    }
+
+    /// A session leaves whatever held it, wherever it lands — the failure mode being a tab that
+    /// exists twice, once in its old group and once at its destination.
+    #[test]
+    fn a_session_is_only_ever_in_one_place() {
+        let mut m = model(&["1", "G:2,3"]);
+        m.place_tab(1, DropAt::InGroup { gi: 0, before: Some(3) });
+        assert_eq!(shape(&m), ["G:2,1,3"]);
+        m.place_tab(1, DropAt::Top { before: None });
+        assert_eq!(shape(&m), ["G:2,3", "1"]);
+        m.place_tab(2, DropAt::Top { before: Some(TopItem::Group(0)) });
+        assert_eq!(shape(&m), ["2", "G:3", "1"]);
+    }
+
+    /// A drop into a group that has gone must not lose the session: it is already detached by then.
+    #[test]
+    fn a_session_dropped_into_a_vanished_group_still_lands() {
+        let mut m = model(&["1"]);
+        m.place_tab(1, DropAt::InGroup { gi: 7, before: None });
+        assert_eq!(shape(&m), ["1"]);
+    }
+
+    /// Closing and reordering both walk the top level, so the visual order has to include a
+    /// collapsed group's sessions and the loose ones around it, in the one order the sidebar draws.
+    #[test]
+    fn visual_order_is_the_top_level_walked_in_place() {
+        let m = model(&["1", "G:2,3", "4"]);
+        assert_eq!(m.order(), vec![1, 2, 3, 4]);
+        assert_eq!(m.group_of(3), Some(0));
+        assert_eq!(m.group_of(4), None);
+    }
+}
