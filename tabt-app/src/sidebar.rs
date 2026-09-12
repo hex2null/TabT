@@ -93,6 +93,8 @@ const UNDO_DEPTH: usize = 64;
 /// where the status dot used to as well, and it is now the row's one interactive mark.
 const ICON_W: f64 = 15.0;
 const ICON_H: f64 = 14.0;
+/// Diameter of the running pip badged onto a colored session's icon (see `draw_session_icon`).
+const PIP: f64 = 6.0;
 
 /// The symbol the session icon draws, resolved once.
 ///
@@ -1049,7 +1051,31 @@ impl SidebarView {
             // and marking it would advertise an implementation detail as a state worth reading.
             (None, SessionState::Idle | SessionState::Dormant) => fg,
         };
-        draw_symbol(tab_symbol(), rect(row.indent, y, ICON_W, ICON_H), hue);
+        let icon = rect(row.indent, y, ICON_W, ICON_H);
+        draw_symbol(tab_symbol(), icon, hue);
+        // The running pip: the second channel, and only for the tabs whose first one is spoken for.
+        //
+        // Hue says "working" — but the user's own tab color is drawn on top of it, so the moment a
+        // tab is colored the state has nowhere left to go and a long-running job on it looks exactly
+        // like a prompt. That is the one thing this list is watched for, so a colored session keeps
+        // its color *and* gets a small green disc badged onto the icon's corner.
+        //
+        // A default-colored tab deliberately gets no pip: its glyph is already green, and a badge
+        // beside it re-creates the icon-plus-dot pair that was collapsed into one mark to begin with.
+        // The pip is the fallback for the channel that is taken, not a second mark for everyone.
+        //
+        // Unlike the bell and the activity dot it is drawn on the selected row too: those are unseen
+        // *events*, cleared by looking, while this is a standing fact about the session — and the row
+        // the user is sitting on is the one whose job they are most likely waiting on.
+        if row.state == SessionState::Running && explicit.is_some() {
+            let (bx, by) = (icon.origin.x + ICON_W - PIP + 1.0, y - 1.0);
+            // A halo in the card's own surface first: the disc sits on the glyph's top-right
+            // stroke (this view is flipped, so `y - 1` is above), and without that gap the two
+            // merge into one blob of the tab's color.
+            let card = theme::current().card_bg();
+            round_fill(rect(bx - 1.0, by - 1.0, PIP + 2.0, PIP + 2.0), (PIP + 2.0) / 2.0, &ns_color(card));
+            round_fill(rect(bx, by, PIP, PIP), PIP / 2.0, &ns_color(dot_running()));
+        }
     }
 
     /// The row of side-by-side "Terminal" and "Group" buttons.
