@@ -11,8 +11,8 @@
     <key>CFBundleExecutable</key>        <string>__EXEC__</string>
     <key>CFBundleIconFile</key>          <string>AppIcon</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
-    <key>CFBundleVersion</key>           <string>0.4.2</string>
-    <key>CFBundleShortVersionString</key><string>0.4.2</string>
+    <key>CFBundleVersion</key>           <string>0.4.3</string>
+    <key>CFBundleShortVersionString</key><string>0.4.3</string>
     <!-- Shown by the standard About panel under the version; the repository link lives next to it
          in Resources/Credits.rtf. -->
     <key>NSHumanReadableCopyright</key>  <string>MIT License · Copyright © 2026 hex2null</string>
