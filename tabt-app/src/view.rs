@@ -510,13 +510,11 @@ declare_class!(
 
         #[method(selectedRange)]
         fn selected_range(&self) -> NSRange {
-            // Caret at the end of the preedit; no live selection to report otherwise.
+            // Caret at the end of the preedit, or at 0 when not composing. Never NSNotFound: that
+            // reads as "no insertion point": WeChat's fn voice input asks this before it starts
+            // and, told there is none, never sends a single setMarkedText:/insertText:.
             let n = self.ivars().marked_text.borrow().chars().count();
-            if n == 0 {
-                NSRange::new(NS_NOT_FOUND, 0)
-            } else {
-                NSRange::new(n, 0)
-            }
+            NSRange::new(n, 0)
         }
 
         // We don't back the composition with a document, so there is no substring to hand back.
