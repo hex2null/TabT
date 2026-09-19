@@ -1181,8 +1181,8 @@ impl TermView {
                 // Text: a run of pure whitespace need not draw glyphs. Wide-char trailer cells hold
                 // '\0' (the lead cell's glyph already spans both columns) — filter them out. The run
                 // always breaks at a wide char (its trailer carries WIDE_TRAILER, a distinct attr set),
-                // so each wide glyph is drawn on its own, positioned at its exact cell origin.
-                let text: String = (start..c)
+                // so each wide glyph is drawn on its own, centered in its two-column slot.
+                let mut text: String = (start..c)
                     .map(|i| grid.view_cell(i, r).ch)
                     .filter(|&ch| ch != '\0')
                     .collect();
@@ -1190,8 +1190,20 @@ impl TermView {
                     let font = if flags & BOLD != 0 { &font_bold } else { &font };
                     let color = ns_color(fg);
                     let attrs = make_attrs(font, Some(&color));
+                    // The wide lead is the run's last cell: split it off so the narrow cells before it
+                    // keep their grid positions and the wide glyph gets its own centered placement.
+                    // Checked against the char itself: a narrow char printed over a wide lead leaves the
+                    // old trailer behind (Grid::print doesn't clear it), and must keep its own cell.
+                    let wide = if trailing && text.chars().last().is_some_and(|ch| char_width(ch) == 2) {
+                        text.pop()
+                    } else {
+                        None
+                    };
                     let ns = NSString::from_str(&text);
                     unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(run_x, y + LINE_GAP / 2.0), Some(&attrs)) };
+                    if let Some(ch) = wide {
+                        draw_wide(ch, pad() + (c - 1) as f64 * cw, y, cw, &attrs);
+                    }
                 }
 
                 // Underline: fill a 1pt foreground-color line at the bottom of the run (avoids the NSNumber attribute).
@@ -1228,8 +1240,12 @@ impl TermView {
                         if cell.ch != ' ' {
                             let color = ns_color(bg);
                             let attrs = make_attrs(&font, Some(&color));
-                            let ns = NSString::from_str(&cell.ch.to_string());
-                            unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(x, y + LINE_GAP / 2.0), Some(&attrs)) };
+                            if cur_w > cw {
+                                draw_wide(cell.ch, x, y, cw, &attrs);
+                            } else {
+                                let ns = NSString::from_str(&cell.ch.to_string());
+                                unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(x, y + LINE_GAP / 2.0), Some(&attrs)) };
+                            }
                         }
                     }
                     // The view is flipped, so the cell's bottom edge is its largest y.
@@ -1253,16 +1269,17 @@ impl TermView {
             if cc < cols && cr < rows {
                 let x = pad() + cc as f64 * cw;
                 let y = pad() + cr as f64 * lh;
-                let n = marked.chars().count();
-                // Clamp the width to the row's remaining cells so it can't overflow the view.
-                let w = (n as f64 * cw).min((cols - cc) as f64 * cw);
+                let color = ns_color(t.fg);
+                let attrs = make_attrs(&font, Some(&color));
+                let ns = NSString::from_str(&marked);
+                // The preedit is drawn as one string at its natural width (not on the grid), so size
+                // the background and underline by that — a char count × cw undercounts CJK, whose
+                // glyphs are ~1em against a ~0.6em cell. Clamped to the row's remaining cells.
+                let w = unsafe { ns.sizeWithAttributes(Some(&attrs)).width }.min((cols - cc) as f64 * cw);
                 unsafe {
                     // Opaque background so the preedit stays readable over whatever was underneath.
                     ns_color(default_bg).set();
                     NSRectFill(rect(x, y, w, lh));
-                    let color = ns_color(t.fg);
-                    let attrs = make_attrs(&font, Some(&color));
-                    let ns = NSString::from_str(&marked);
                     ns.drawAtPoint_withAttributes(NSPoint::new(x, y + LINE_GAP / 2.0), Some(&attrs));
                     // Underline marks the run as composing (not yet committed) text.
                     ns_color(t.fg).set();
@@ -1270,6 +1287,20 @@ impl TermView {
                 }
             }
         }
+    }
+}
+
+/// Draw a wide (two-column) glyph centered in its slot starting at `x`. CJK comes from a fallback
+/// font whose glyphs are ~1em wide, while two cells of a 0.6em monospace font are 1.2em; drawn
+/// left-aligned, all of that slack lands to the right of every character and a line of CJK reads as
+/// letter-spaced. A glyph wider than the slot (some emoji) stays left-aligned rather than spilling
+/// into the previous cell.
+fn draw_wide(ch: char, x: f64, y: f64, cw: f64, attrs: &NSMutableDictionary<NSString, AnyObject>) {
+    let ns = NSString::from_str(ch.encode_utf8(&mut [0; 4]));
+    unsafe {
+        let gw = ns.sizeWithAttributes(Some(attrs)).width;
+        let dx = ((2.0 * cw - gw) / 2.0).max(0.0);
+        ns.drawAtPoint_withAttributes(NSPoint::new(x + dx, y + LINE_GAP / 2.0), Some(attrs));
     }
 }
 
