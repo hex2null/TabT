@@ -428,23 +428,27 @@ declare_class!(
             let s = unsafe {
                 NSPasteboard::generalPasteboard().stringForType(NSPasteboardTypeString)
             };
-            if let Some(s) = s {
-                let bytes = s.to_string().into_bytes();
-                if !bytes.is_empty() {
-                    let fd = self.ivars().master_fd.get();
-                    // Bracketed paste (DECSET 2004): wrap the paste so the program can tell it
-                    // apart from typed keystrokes, e.g. a shell won't try to execute each
-                    // newline-terminated line of a multi-line paste immediately.
-                    if self.ivars().grid.borrow().bracketed_paste() {
-                        unsafe {
-                            write_all(fd, b"\x1b[200~");
-                            write_all(fd, &bytes);
-                            write_all(fd, b"\x1b[201~");
-                        }
-                    } else {
-                        unsafe { write_all(fd, &bytes) };
-                    }
+            let bytes = s.map(|s| s.to_string().into_bytes()).unwrap_or_default();
+            let fd = self.ivars().master_fd.get();
+            // Nothing textual on the pasteboard — a screenshot, say. ⌘V would do nothing at all,
+            // so hand the chord to the program as ⌃V instead: that is the key TUIs which read the
+            // clipboard themselves (Claude Code's image paste) listen for. Raw, not bracketed:
+            // it is a keystroke, not a paste.
+            if bytes.is_empty() {
+                unsafe { write_all(fd, b"\x16") };
+                return;
+            }
+            // Bracketed paste (DECSET 2004): wrap the paste so the program can tell it
+            // apart from typed keystrokes, e.g. a shell won't try to execute each
+            // newline-terminated line of a multi-line paste immediately.
+            if self.ivars().grid.borrow().bracketed_paste() {
+                unsafe {
+                    write_all(fd, b"\x1b[200~");
+                    write_all(fd, &bytes);
+                    write_all(fd, b"\x1b[201~");
                 }
+            } else {
+                unsafe { write_all(fd, &bytes) };
             }
         }
 
