@@ -235,6 +235,17 @@ declare_class!(
                     }
                     return;
                 }
+                // fn+C / fn+V stand in for ⌃C / ⌃V. Only these two: other fn+letter chords belong to
+                // the system (fn+E emoji picker, fn+F full screen, …) and must keep reaching it.
+                if flags.contains(NSEventModifierFlags::NSEventModifierFlagFunction) {
+                    let key = unsafe { event.charactersIgnoringModifiers() }
+                        .map(|s| s.to_string().to_ascii_lowercase());
+                    match key.as_deref() {
+                        Some("c") => return unsafe { write_all(fd, b"\x03") },
+                        Some("v") => return unsafe { write_all(fd, b"\x16") },
+                        _ => {}
+                    }
+                }
             }
 
             // Plain text and IME composition flow through the macOS text input system: committed text
